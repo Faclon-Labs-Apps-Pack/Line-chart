@@ -76,16 +76,27 @@ interface LineChartConfigurationProps {
 
 const VARIABLE_REGEX = /^\{\{(.+)\}\}$/;
 
-// Walk uiConfig and emit { key, topic } for every {{topic}} string found.
-// Per Bindable.md: bracket notation for arrays (series[0].dataSource).
-function buildDynamicBindingPathList(uiConfig: unknown): Array<{ key: string; topic: string }> {
-  const paths: Array<{ key: string; topic: string }> = [];
+// Walk uiConfig and emit BindingEntry for every {{topic}} string found.
+// seriesKeys: explicit dot-paths that get type:'series' — all others are scalar.
+function buildDynamicBindingPathList(
+  uiConfig: unknown,
+  seriesKeys: string[] = [],
+): Array<{ key: string; topic: string; type?: 'series' }> {
+  const seriesKeySet = new Set(seriesKeys);
+  const paths: Array<{ key: string; topic: string; type?: 'series' }> = [];
 
   function walk(obj: unknown, currentPath: string): void {
     if (obj === null || obj === undefined) return;
     if (typeof obj === 'string') {
       const match = VARIABLE_REGEX.exec(obj.trim());
-      if (match) paths.push({ key: currentPath, topic: match[1] });
+      if (match) {
+        const entry: { key: string; topic: string; type?: 'series' } = {
+          key: currentPath,
+          topic: match[1],
+        };
+        if (seriesKeySet.has(currentPath)) entry.type = 'series';
+        paths.push(entry);
+      }
       return;
     }
     if (Array.isArray(obj)) {
@@ -188,15 +199,25 @@ function normalizeStyling(raw: unknown): LineChartStyling {
 function buildEnvelope(
   existing: LineChartEnvelope | undefined,
   uiConfig: LineChartUIConfig,
-  timeConfig?: TimeTabUIConfig,
+  timeTabConfig?: TimeTabUIConfig,
 ): LineChartEnvelope {
+  // timeTabConfig = full TimeTabConfiguration UI state (for re-hydration).
+  // timeConfig    = same value; mini-engine reads this to compute the time window.
+  // Both must always be in sync — never emit one without the other.
+  const tc = timeTabConfig ?? existing?.timeTabConfig ?? existing?.timeConfig ?? DEFAULT_TIME_CONFIG;
   return {
     _id: existing?._id ?? `linechart_${Date.now()}`,
     type: 'LineChart',
     general: existing?.general ?? { title: '' },
-    timeConfig: timeConfig ?? existing?.timeConfig ?? DEFAULT_TIME_CONFIG,
+    timeConfig: tc,
+    timeTabConfig: tc,
     uiConfig,
-    dynamicBindingPathList: buildDynamicBindingPathList(uiConfig),
+    dynamicBindingPathList: buildDynamicBindingPathList(
+      uiConfig,
+      uiConfig.charts.flatMap((chart, ci) =>
+        chart.series.map((_s, si) => `charts[${ci}].series[${si}].dataSource`),
+      ),
+    ),
   };
 }
 
@@ -398,9 +419,10 @@ export function LineChartConfiguration({
   // Data Table config (widget-level).
   const [dataTable, setDataTable] = useState<DataTableConfig>(initialUiConfig.dataTable);
 
-  // Time tab config.
-  const [timeConfig, setTimeConfig] = useState<TimeTabUIConfig>(
-    config?.timeConfig ?? DEFAULT_TIME_CONFIG,
+  // Full TimeTabConfiguration state — prefer timeTabConfig for re-hydration so the
+  // component restores its exact UI state; fall back to timeConfig for older envelopes.
+  const [timeTabConfig, setTimeTabConfig] = useState<TimeTabUIConfig>(
+    config?.timeTabConfig ?? config?.timeConfig ?? DEFAULT_TIME_CONFIG,
   );
 
   // Pending delete (modal) — keyed by section so a single modal can serve all.
@@ -422,7 +444,7 @@ export function LineChartConfiguration({
       setActiveChartId(next.activeChartId);
       setStyling(next.style);
       setDataTable(next.dataTable);
-      setTimeConfig(config.timeConfig ?? DEFAULT_TIME_CONFIG);
+      setTimeTabConfig(config.timeTabConfig ?? config.timeConfig ?? DEFAULT_TIME_CONFIG);
       setChartEditMode(false);
       setNewChartDraft(false);
     }
@@ -445,7 +467,7 @@ export function LineChartConfiguration({
       activeChartId: string | null;
       styling: LineChartStyling;
       dataTable: DataTableConfig;
-      timeConfig: TimeTabUIConfig;
+      timeTabConfig: TimeTabUIConfig;
     }>,
   ) {
     const resolvedCharts = overrides?.charts ?? charts;
@@ -461,7 +483,7 @@ export function LineChartConfiguration({
       style: overrides?.styling ?? styling,
     };
 
-    onChange(buildEnvelope(config, uiConfig, overrides?.timeConfig ?? timeConfig));
+    onChange(buildEnvelope(config, uiConfig, overrides?.timeTabConfig ?? timeTabConfig));
   }
 
   // Update one field across the active chart, persisting downstream.
@@ -479,7 +501,7 @@ export function LineChartConfiguration({
             dataTable,
             style: styling,
           },
-          timeConfig,
+          timeTabConfig,
         ),
       );
       return next;
@@ -815,8 +837,8 @@ export function LineChartConfiguration({
 
   // ---- Time tab mutator ----------------------------------------------------
   function handleTimeConfigChange(next: TimeTabUIConfig) {
-    setTimeConfig(next);
-    emit({ timeConfig: next });
+    setTimeTabConfig(next);
+    emit({ timeTabConfig: next });
   }
 
   // ---- Styling mutator -----------------------------------------------------
@@ -1043,7 +1065,7 @@ export function LineChartConfiguration({
             {topTab === 'Time' && (
               <div className="lc-config__time-tab">
                 <TimeTabConfiguration
-                  value={timeConfig}
+                  value={timeTabConfig}
                   onChange={(v) => handleTimeConfigChange(v as TimeTabUIConfig)}
                 />
               </div>
@@ -1596,7 +1618,6 @@ function ChartSettingsDisplayMode({
             isOpen={chartDropdownOpen}
             onOpenChange={setChartDropdownOpen}
             onClick={() => setChartDropdownOpen((o) => !o)}
-            necessityIndicator="required"
           >
             <DropdownMenu>
               {charts.map((c) => (
@@ -2184,8 +2205,9 @@ function DataSourceEditor({
           <Info size={14} color="var(--text-default-tertiary, #768ea7)" />
         </div>
         <Switch
+          accessibilityLabel="Toggle real time"
           isChecked={realTime}
-          onChange={({ isChecked }: { isChecked: boolean }) => setRealTime(isChecked)}
+          onChange={({ isChecked }) => setRealTime(isChecked)}
         />
       </div>
 
@@ -2253,8 +2275,9 @@ function DataSourceEditor({
       <div className="lc-config__ds-row lc-config__ds-row--toggle">
         <span className="BodySmallSemibold">Advance Parameters</span>
         <Switch
+          accessibilityLabel="Toggle advance parameters"
           isChecked={advanceParameters}
-          onChange={({ isChecked }: { isChecked: boolean }) => setAdvanceParameters(isChecked)}
+          onChange={({ isChecked }) => setAdvanceParameters(isChecked)}
         />
       </div>
 
@@ -2281,7 +2304,7 @@ function DataSourceEditor({
       {/* Add Source as Tooltip */}
       <Checkbox
         isChecked={addAsTooltip}
-        onChange={({ isChecked }: { isChecked: boolean }) => setAddAsTooltip(isChecked)}
+        onChange={(e) => setAddAsTooltip(e.target.checked)}
       >
         Add Source as Tooltip
       </Checkbox>
@@ -3367,20 +3390,11 @@ function AnomalyEditor({
         necessityIndicator="required"
         onChange={({ value }: { name: string; value: string }) => setName(value)}
       />
-      <TextInput
-        label="Color"
-        labelPosition="top"
-        placeholder="#ef4444"
+      <ColorInput
+        label="Color *"
+        placeholder="Select color"
         value={color}
-        necessityIndicator="required"
-        onChange={({ value }: { name: string; value: string }) => setColor(value)}
-        trailingIcon={
-          <span
-            className="lc-config__editor-swatch"
-            style={{ background: color || 'transparent' }}
-            aria-hidden
-          />
-        }
+        onChange={(hex: string) => setColor(hex)}
       />
 
       <SelectInput
@@ -3437,7 +3451,7 @@ function AnomalyEditor({
         name="anomaly-label-mode"
         value={labelMode}
         onChange={({ value }) => setLabelMode(value as AnomalyLabelMode)}
-        orientation="Vertical"
+        orientation="Horizontal"
       >
         <Radio label="Existing" value="Existing" />
         <Radio label="New Source" value="NewSource" />

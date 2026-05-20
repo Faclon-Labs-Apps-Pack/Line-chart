@@ -146,14 +146,88 @@ dynamicBindingPathList: [
 
 ---
 
+## 3a. Series Bindings — Annotating Time-Series Fields
+
+Some bindings return time-series slot data instead of a single scalar value. These are annotated with `type: "series"` in `dynamicBindingPathList`. The `{{topic}}` syntax in `uiConfig` is identical — only the binding entry is annotated.
+
+Pass the dot-paths of series fields as the second argument to `buildDynamicBindingPathList`:
+
+```typescript
+function buildDynamicBindingPathList(
+  uiConfig: unknown,
+  seriesKeys: string[] = [],   // dot-paths that get type: "series" — all others are scalar
+): Array<BindingEntry> {
+  const seriesKeySet = new Set(seriesKeys);
+  const paths: BindingEntry[] = [];
+
+  function walk(obj: unknown, currentPath: string): void {
+    if (obj === null || obj === undefined) return;
+    if (typeof obj === 'string') {
+      const match = VARIABLE_REGEX.exec(obj.trim());
+      if (match) {
+        const topic = match[1];
+        if (seriesKeySet.has(currentPath)) {
+          paths.push({ key: currentPath, topic, type: 'series' });
+        } else {
+          paths.push({ key: currentPath, topic });
+        }
+      }
+      return;
+    }
+    if (Array.isArray(obj)) {
+      obj.forEach((item, index) => walk(item, `${currentPath}[${index}]`));
+      return;
+    }
+    if (typeof obj === 'object') {
+      Object.entries(obj as Record<string, unknown>).forEach(([key, val]) => {
+        walk(val, currentPath ? `${currentPath}.${key}` : key);
+      });
+    }
+  }
+
+  walk(uiConfig, '');
+  return paths;
+}
+```
+
+**Rules:**
+- `seriesKeys` lists paths that **already have `{{topic}}`** in `uiConfig` — it only annotates type, it does not inject new entries.
+- Calling with no second argument is identical to existing behavior — backward compatible.
+- Each widget type knows at build time which of its bindable fields are series — hard-code the array in `buildEnvelope`.
+
+**Example — column chart configurator with multiple series:**
+```typescript
+const uiConfig = {
+  series: [
+    { unsPath: '{{uns:ws_abc://iosense/plant1/voltage:last}}', label: 'Voltage' },
+    { unsPath: '{{uns:ws_abc://iosense/plant1/current:last}}', label: 'Current' },
+  ],
+  style: { card: { wrapInCard: true } },
+};
+
+const dynamicBindingPathList = buildDynamicBindingPathList(
+  uiConfig,
+  ['series[0].unsPath', 'series[1].unsPath'],
+);
+// Result:
+// [
+//   { key: 'series[0].unsPath', topic: 'uns:ws_abc://iosense/plant1/voltage:last', type: 'series' },
+//   { key: 'series[1].unsPath', topic: 'uns:ws_abc://iosense/plant1/current:last', type: 'series' },
+// ]
+// style.card.wrapInCard = true  → not included (boolean, never bindable)
+// series[0].label = 'Voltage'   → not included (no {{}} wrapper)
+```
+
+---
+
 ## 4. Complete Configurator Save Contract
 
 > Full envelope interface: see **Envelope.md §2** — `WidgetConfigEnvelope`.
 
 **Rules:**
 - `dynamicBindingPathList` is **always present** — even if empty array `[]` when no `{{}}` bindings
-- Each entry has **both `key` and `topic`**: `key` is the uiConfig dot-path, `topic` is the UNS topic **without** `{{}}`
-- It is built by scanning `uiConfig` for `{{...}}` patterns at save time — `buildDynamicBindingPathList(uiConfig)`
+- Each entry is a `BindingEntry`: scalar shape `{ key, topic }` or series shape `{ key, topic, type: 'series' }`
+- It is built by scanning `uiConfig` for `{{...}}` patterns at save time — `buildDynamicBindingPathList(uiConfig, seriesKeys?)`
 - It contains **only fields with `{{}}` wrapper** — static string values are excluded
 - Paths use **bracket notation for arrays**: `series[0].dataSource` not `series.0.dataSource`
 - `apiConfig` does **not** exist in this envelope — all data resolution goes through `resolveAndCompute`
@@ -162,44 +236,62 @@ dynamicBindingPathList: [
 
 ## 5. How Widget Consumes the `data` Prop
 
-The mini-engine reads `dynamicBindingPathList`, calls `resolveAndCompute` with the topics, gets back `{ key, value }` pairs, and passes them as `DataEntry[]` to the widget.
+The mini-engine reads `dynamicBindingPathList`, calls `resolveAndCompute`, and passes results as `DataEntry[]` to the widget. `DataEntry.value` is `string | number | null` for scalar bindings and `SeriesPayload` for series bindings.
+
+### Scalar bindings — use `getValue()`
 
 ```typescript
-// uiConfig saved by configurator — {{}} wrapper intact
-config.variable = "{{iosense/plant1/.../voltage/lastdp}}"
+// uiConfig stored value — {{}} wrapper intact
+config.variable = "{{uns:ws_abc123://iosense/plant1/voltage:last}}"
 
-// dynamicBindingPathList extracted from uiConfig
-dynamicBindingPathList = [
-  { key: "variable", topic: "iosense/plant1/.../voltage/lastdp" },  // topic = stripped {{}}
-]
+// mini-engine resolves → DataEntry
+data = [{ key: "variable", value: "436" }]
 
-// mini-engine resolves → widget's data prop
-data = [
-  { key: "variable", value: "436" },  // resolved from UNS
-]
+// Widget reads:
+const rawValue = getValue('variable', config, data);   // → "436"
 ```
 
-Widget always reads bindable values via `getValue()` — never directly from `config`:
+```typescript
+function getValue(key: string, config: any, data: DataEntry[]): string | number | null {
+  const entry = data.find(d => d.key === key);
+  if (entry !== undefined) {
+    const v = entry.value;
+    if (v !== null && typeof v === 'object') return null; // series — use getSeriesData() instead
+    return v as string | number | null;
+  }
+  return getValueAtPath(config, key) as string | number | null;
+}
+```
+
+### Series bindings — use `getSeriesData()`
 
 ```typescript
-function getValue(key: string, config: any, data: DataEntry[]): any {
-  const entry = data.find(d => d.key === key);
-  return entry !== undefined ? entry.value : getValueAtPath(config, key);
-}
+import { getSeriesData } from '../iosense-sdk/mini-engine';
 
-function getValueAtPath(obj: any, path: string): any {
-  return path
-    .replace(/\[(\d+)\]/g, '.$1')
-    .split('.')
-    .reduce((acc, k) => acc?.[k], obj);
-}
+// mini-engine resolves → DataEntry with SeriesPayload as value
+data = [{ key: "series[0].unsPath", value: { __type: "series", slots: [...], meta: {...}, range: {...} } }]
 
-// Usage in widget
-const rawValue = getValue('variable', config, data);   // "436" from data
-const minVal   = getValue('gaugeConfig.min', config, data);
+// Widget reads:
+const series = getSeriesData('series[0].unsPath', data);
+if (!series) return <WidgetSkeleton config={config} />;
 
-// Loading state — data is [] until mini-engine resolves first binding
+const categories = series.slots.map(s => s.label);        // X-axis labels e.g. ["17:00","18:00",...]
+const values     = series.slots.map(s => s.value ?? 0);   // Y-axis values
+const unit       = series.meta.unit;                       // "V", "kWh", etc.
+// series.slots[n].from / .to  — epoch ms bounds per slot
+// series.slots[n].isPartial   — true when slot covers an incomplete period
+// series.range                — { from, to } overall resolved window
+```
+
+### Loading state
+
+```typescript
+// Scalar widgets: data is [] until mini-engine resolves
 if (data.length === 0) return <WidgetSkeleton config={config} />;
+
+// Series widgets: data may be non-empty but slots may be empty (valid API response)
+const series = getSeriesData('series[0].unsPath', data);
+if (!series || series.slots.length === 0) return <WidgetSkeleton config={config} />;
 ```
 
 ---
@@ -258,19 +350,30 @@ const DataPointConfiguration = () => {
 - [ ] Bindable field state is typed as `string`
 - [ ] Bindable field placeholder shows an example `{{topic}}` value
 - [ ] Non-bindable fields use appropriate input: `<select>` for chartType, color picker for colors, toggle for booleans
-- [ ] `onSave()` calls `buildDynamicBindingPathList(uiConfig)` — scanner finds `{{}}` and extracts topics
-- [ ] Each entry in `dynamicBindingPathList` uses `{ key, topic }` — NOT `{ key, value }`
+- [ ] `onSave()` calls `buildDynamicBindingPathList(uiConfig, seriesKeys?)` — scanner finds `{{}}` and extracts topics
+- [ ] Series fields are listed in the `seriesKeys` array argument — e.g. `['series[0].unsPath']`
+- [ ] Each entry in `dynamicBindingPathList` uses `{ key, topic }` for scalar or `{ key, topic, type: 'series' }` for series
 - [ ] `topic` in `dynamicBindingPathList` has NO `{{}}` braces — they are stripped by the scanner
 - [ ] Static values (no `{{}}`) are excluded from `dynamicBindingPathList`
 - [ ] `dynamicBindingPathList` is always present — even `[]` when no bindings
 - [ ] `apiConfig` is NOT in the envelope — never add it
 - [ ] Configurator emits envelope with: `_id`, `type`, `general`, `uiConfig`, `dynamicBindingPathList`
+- [ ] Widget reads series keys via `getSeriesData(key, data)` imported from `iosense-sdk/mini-engine`
+- [ ] Widget reads scalar keys via `getValue(key, config, data)` — never `getSeriesData()` for scalar keys
 
 ---
 
 ## 8. What NOT to Do
 
 ```tsx
+// ❌ WRONG — using getValue() on a series key (returns null, not the series payload)
+const rawValue = getValue('series[0].unsPath', config, data);  // ← returns null for series
+const series   = getSeriesData('series[0].unsPath', data);     // ← correct
+
+// ❌ WRONG — omitting seriesKeys for a series field (binding sent as scalar, no slots returned)
+buildDynamicBindingPathList(uiConfig)                             // ← series field treated as scalar
+buildDynamicBindingPathList(uiConfig, ['series[0].unsPath'])      // ← correct
+
 // ❌ WRONG — storing value instead of topic in dynamicBindingPathList (old architecture)
 paths.push({ key: currentPath, value: obj.trim() });  // ← wrong
 paths.push({ key: currentPath, topic: match[1] });    // ← correct

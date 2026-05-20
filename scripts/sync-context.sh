@@ -22,7 +22,10 @@ FILES=(
   "tsconfig.json"
   "src/iosense-sdk/useUNSTree.ts"
   "src/iosense-sdk/api.ts"
+  "src/iosense-sdk/mini-engine.ts"
+  "src/iosense-sdk/types.ts"
   "src/design-sdk-extra.d.ts"
+  "scripts/pre-deploy-review.sh"
 )
 
 for FILE in "${FILES[@]}"; do
@@ -33,5 +36,5 @@ done
 
 echo ""
 echo "Done. Commit the updated files:"
-echo "  git add CLAUDE.md .claude/skills/ tsconfig.json src/iosense-sdk/useUNSTree.ts src/iosense-sdk/api.ts src/design-sdk-extra.d.ts"
+echo "  git add CLAUDE.md .claude/skills/ tsconfig.json src/iosense-sdk/ src/design-sdk-extra.d.ts"
 echo "  git commit -m 'sync: update context + SDK from iolens-widget-template'"

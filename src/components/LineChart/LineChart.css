@@ -136,6 +136,16 @@
   background: transparent;
 }
 
+/* ----- Date Time Picker row (between header and chart) ---------------- */
+.line-chart__datetime-row {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--spacing-03);
+  flex-shrink: 0;
+  margin-bottom: var(--spacing-03);
+  width: 100%;
+}
+
 .line-chart__chart {
   flex: 1;
   min-height: 0;

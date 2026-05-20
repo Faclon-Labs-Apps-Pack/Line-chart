@@ -54,6 +54,27 @@ Contains everything the widget needs to render its UI. Topic strings may appear 
 
 `DataEntry[]` resolved by the mini-engine via `resolveAndCompute`. Empty array `[]` while loading — widget must show a skeleton in this state.
 
+```typescript
+interface DataEntry {
+  key: string;
+  value: string | number | null | SeriesPayload;
+  // value is string|number|null for scalar bindings
+  // value is SeriesPayload for series bindings — detected via value.__type === 'series'
+}
+```
+
+Use `getValue(key, config, data)` for scalar keys, `getSeriesData(key, data)` for series keys.
+
+### 1c. `BindingEntry` — Binding Index Entry Types
+
+```typescript
+interface ScalarBinding { key: string; topic: string; }
+interface SeriesBinding  { key: string; topic: string; type: 'series'; }
+type BindingEntry = ScalarBinding | SeriesBinding;
+```
+
+`dynamicBindingPathList` is `Array<BindingEntry>`. All existing `{ key, topic }` entries remain valid as `ScalarBinding`. Series fields add `type: 'series'`.
+
 ### 1c. `onEvent` Prop — Emitting Events
 
 ```typescript
@@ -97,7 +118,7 @@ interface WidgetConfigEnvelope {
   general: { title: string };
   timeConfig?: TimeConfig;       // Optional — time window settings
   uiConfig: UIConfig;            // Render config — widget reads this
-  dynamicBindingPathList: Array<{ key: string; topic: string }>; // binding index
+  dynamicBindingPathList: Array<BindingEntry>; // { key, topic } scalar or { key, topic, type: 'series' }
 }
 ```
 
@@ -153,15 +174,23 @@ onChange({
 The binding index. Each entry maps a uiConfig dot-path to a UNS topic. The mini-engine uses this to call `resolveAndCompute`.
 
 ```typescript
-// Example
+// Scalar-only example
 dynamicBindingPathList = [
   { key: "sources[0].unsPath", topic: "uns:ws_abc123://iosense/plant1/voltage:last" },
   { key: "rangeMin",           topic: "uns:ws_abc123://iosense/plant1/voltage:min" },
+]
+
+// Mixed scalar + series example (column chart)
+dynamicBindingPathList = [
+  { key: "title",             topic: "uns:ws_abc123://iosense/plant1/name:last" },
+  { key: "series[0].unsPath", topic: "uns:ws_abc123://iosense/plant1/voltage:last", type: "series" },
+  { key: "series[1].unsPath", topic: "uns:ws_abc123://iosense/plant1/current:last", type: "series" },
 ]
 ```
 
 - `key` — dot-path into `uiConfig`, bracket notation for arrays: `series[0].dataSource`
 - `topic` — full UNS topic path; the operator is encoded in the topic suffix (e.g. `/lastdp`, `/min`, `/max`)
+- `type` — optional; `'series'` triggers slot-array response from UNS API; absent means scalar
 - Always present — even `[]` when no topics configured
 
 ### 2c. `uiConfig`
@@ -183,8 +212,9 @@ interface DataPointUIConfig {
 
 ---
 
-## 3. Complete Envelope Example
+## 3. Complete Envelope Examples
 
+### Scalar (DataPoint widget)
 ```json
 {
   "_id": "dp_1777216384057",
@@ -196,7 +226,25 @@ interface DataPointUIConfig {
     "style": { "card": { "wrapInCard": true } }
   },
   "dynamicBindingPathList": [
-    { "key": "sources[0].unsPath", "topic": "uns:ws_abc123://iosense/plant1/voltage:last" }
+    { "key": "variable", "topic": "uns:ws_abc123://iosense/plant1/voltage:last" }
+  ]
+}
+```
+
+### Series (ColumnChart widget)
+```json
+{
+  "_id": "cc_1778847450000",
+  "type": "ColumnChart",
+  "general": { "title": "Voltage Over Time" },
+  "uiConfig": {
+    "series": [
+      { "unsPath": "{{uns:ws_abc123://iosense/plant1/voltage:last}}", "label": "Voltage" }
+    ],
+    "style": { "card": { "wrapInCard": true } }
+  },
+  "dynamicBindingPathList": [
+    { "key": "series[0].unsPath", "topic": "uns:ws_abc123://iosense/plant1/voltage:last", "type": "series" }
   ]
 }
 ```

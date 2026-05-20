@@ -48,24 +48,40 @@ Content-Type: application/json
 {
   "graph": "iosense_test_uns",
   "config": [
-    { "key": "sources[0].unsPath", "topic": "uns:ws_abc123://iosense/plant1/voltage:last" }
+    { "key": "variable",           "topic": "uns:ws_abc123://iosense/plant1/voltage:last" },
+    { "key": "series[0].unsPath",  "topic": "uns:ws_abc123://iosense/plant1/voltage:last", "type": "series" }
   ],
   "startTime": 1777141800000,
   "endTime":   1777206690000
 }
 ```
 
-Response shape:
+Scalar response item (no `type` field or `type: "scalar"`):
+```json
+{ "key": "variable", "value": "436" }
+```
+
+Series response item (`type: "series"`):
 ```json
 {
-  "success": true,
-  "data": [
-    { "key": "variable", "value": "436" }
+  "key": "series[0].unsPath",
+  "path": "voltage",
+  "meta": {
+    "type": "device", "key": "series[0].unsPath", "unit": "V", "dataPrecision": null,
+    "aggregation": { "operator": "lastDP", "downscale": 30, "resolution": "hour" },
+    "devID": "INEM_DEMO", "sensor": "VOLTS1"
+  },
+  "range": { "from": 1778847450854, "to": 1778933850854 },
+  "slots": [
+    { "from": 1778847450000, "to": 1778848230000, "label": "17:00", "value": 228.22, "quality": "good", "isPartial": true },
+    { "from": 1778848230000, "to": 1778851830000, "label": "18:00", "value": 227.74, "quality": "good" }
   ]
 }
 ```
 
-Map `json.data[]` → `DataEntry[]` directly: `{ key: item.key, value: item.value }`.
+The SDK discriminates response items by the presence of a `slots` array. Scalar items map to `{ key, value: string|number|null }`. Series items map to `{ key, value: SeriesPayload }` where `SeriesPayload` carries `__type: 'series'` as a SDK-injected discriminant (not present in the raw API response).
+
+Map `json.data[]` → `DataEntry[]`: scalar items map directly; series items wrap into `SeriesPayload`.
 
 Constants (defined in `api.ts`):
 - `GRAPH = 'iosense_test_uns'` — hardcoded per env
@@ -90,10 +106,16 @@ export async function resolve(
   try {
     const items = await resolveAndCompute(
       ctx.authentication,
-      bindings.map(({ key, topic }) => ({ key, topic })),
+      // Preserve type: "series" for series bindings — pass through, not stripped.
+      validBindings.map((binding) =>
+        'type' in binding && binding.type === 'series'
+          ? { key: binding.key, topic: binding.topic, type: 'series' as const }
+          : { key: binding.key, topic: binding.topic }
+      ),
       startTime,
       endTime,
     );
+    // item.value is string|number|null for scalar, SeriesPayload for series — DataEntry accepts both.
     const data: DataEntry[] = items.map((item) => ({ key: item.key, value: item.value }));
     return { config: envelope.uiConfig, data };
   } catch {
@@ -101,6 +123,34 @@ export async function resolve(
   }
 }
 ```
+
+---
+
+## getSeriesData() Helper
+
+Use this instead of `getValue()` when reading a series binding in a widget.
+
+```typescript
+import { getSeriesData } from '../iosense-sdk/mini-engine';
+
+// In widget render:
+const series = getSeriesData('series[0].unsPath', data);
+if (!series) return <WidgetSkeleton config={config} />;
+
+// series.slots  — array of { from, to, label, value, quality, isPartial? }
+// series.meta   — { unit, devID, sensor, aggregation, ... }
+// series.range  — { from, to } epoch ms bounds of the resolved window
+
+const categories = series.slots.map((s) => s.label);          // X-axis
+const values     = series.slots.map((s) => s.value ?? 0);     // Y-axis
+const unit       = series.meta.unit;                           // "V", "kWh", etc.
+```
+
+`getSeriesData()` returns `null` when:
+- The key is not in `data` yet (mini-engine hasn't resolved)
+- The key resolved to a scalar value (wrong function — use `getValue()` for scalars)
+
+**Never use `getValue()` for series keys** — it returns `null` for objects, not the series payload.
 
 ### Topic Format Guard
 
@@ -154,22 +204,36 @@ export async function resolveAndCompute(
 
 ---
 
-## Concrete Example
+## Concrete Examples
 
+### Scalar binding
 ```typescript
-// dynamicBindingPathList saved by configurator
-dynamicBindingPathList = [
-  { key: "sources[0].unsPath", topic: "uns:ws_abc123://iosense/plant1/voltage:last" },
-]
+// dynamicBindingPathList entry
+{ key: "variable", topic: "uns:ws_abc123://iosense/plant1/voltage:last" }
 
-// resolve() sends to resolveAndCompute:
-config = [{ key: "sources[0].unsPath", topic: "uns:ws_abc123://iosense/plant1/voltage:last" }]
+// API response item
+{ key: "variable", value: "436" }
 
-// API response:
-{ success: true, data: [{ key: "variable", value: "436" }] }
+// DataEntry in widget's data prop
+{ key: "variable", value: "436" }
 
-// buildDataEntries output → widget's data prop
-data = [{ key: "variable", value: "436" }]
+// Widget reads via:
+getValue('variable', config, data)  // → "436"
+```
+
+### Series binding
+```typescript
+// dynamicBindingPathList entry
+{ key: "series[0].unsPath", topic: "uns:ws_abc123://iosense/plant1/voltage:last", type: "series" }
+
+// API response item (slots array present)
+{ key: "series[0].unsPath", path: "voltage", meta: {...}, range: {...}, slots: [{...}, {...}] }
+
+// DataEntry in widget's data prop — value is SeriesPayload, not a scalar
+{ key: "series[0].unsPath", value: { __type: "series", path: "voltage", meta: {...}, range: {...}, slots: [...] } }
+
+// Widget reads via:
+getSeriesData('series[0].unsPath', data)  // → SeriesPayload | null
 ```
 
 ---
@@ -220,9 +284,11 @@ Widget reads all bindable values via `getValue()` — never directly from `confi
 - If `resolveAndCompute` throws, return `data: []` — widget shows loading skeleton
 - `data` is `[]` if `dynamicBindingPathList` is empty — widget shows loading skeleton
 - The `key` in every `DataEntry` must exactly match the `key` in `dynamicBindingPathList`
-- There is **no** per-apiConfig fetch loop — one `resolveAndCompute` call covers all bindings
+- There is **no** per-apiConfig fetch loop — one `resolveAndCompute` call covers all bindings (scalar and series together)
 - `item.value` is the resolved field from the response — NOT `item.data`
 - `timeTabConfig` in the envelope is for UI re-hydration only — mini-engine reads `timeConfig`, never `timeTabConfig`
+- Series entries carry `__type: 'series'` in `DataEntry.value` — use `getSeriesData()`, never `getValue()`
+- The binding map step must preserve `type: "series"` when passing bindings to `resolveAndCompute` — do not strip the `type` field
 
 ---
 
@@ -235,3 +301,5 @@ Widget reads all bindable values via `getValue()` — never directly from `confi
 - [ ] Failed fetch → `data: []` — not a thrown error
 - [ ] `dynamicBindingPathList` missing or empty → `data: []` → widget shows skeleton
 - [ ] `GRAPH` and `STAGING_BASE` are constants in `api.ts` — not hardcoded in `resolve()`
+- [ ] Series bindings in `dynamicBindingPathList` carry `type: 'series'` — binding map must preserve this field
+- [ ] Widgets read series data via `getSeriesData(key, data)` imported from `mini-engine.ts`

@@ -83,7 +83,7 @@ export default function App() {
       <div className="app__widget">
         {envelope ? (
           <div className="app__widget-frame" style={sizing}>
-            <LineChart config={envelope.uiConfig} data={data} onEvent={handleEvent} />
+            <LineChart config={envelope.uiConfig} data={data} onEvent={handleEvent} timeConfig={envelope.timeConfig} />
           </div>
         ) : (
           <div className="app__empty">

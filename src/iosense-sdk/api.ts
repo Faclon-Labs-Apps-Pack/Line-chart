@@ -1,5 +1,11 @@
+import { BindingEntry, SeriesPayload, SeriesMeta, SeriesSlot } from './types';
+
 const STAGING_BASE = 'https://stagingsv.iosense.io/api';
 const GRAPH = 'iosense_test_uns';
+
+function isRawSeriesItem(item: Record<string, unknown>): boolean {
+  return Array.isArray(item.slots);
+}
 
 export async function validateSSOToken(ssoToken: string): Promise<string> {
   const res = await fetch(`${STAGING_BASE}/account/validateSSO`, {
@@ -13,10 +19,10 @@ export async function validateSSOToken(ssoToken: string): Promise<string> {
 
 export async function resolveAndCompute(
   authentication: string,
-  config: Array<{ key: string; topic: string }>,
+  config: Array<BindingEntry>,
   startTime: number,
   endTime: number,
-): Promise<Array<{ key: string; value: string | number | null }>> {
+): Promise<Array<{ key: string; value: string | number | null | SeriesPayload }>> {
   const res = await fetch(`${STAGING_BASE}/account/uns/resolveAndCompute`, {
     method: 'POST',
     headers: {
@@ -26,7 +32,22 @@ export async function resolveAndCompute(
     body: JSON.stringify({ graph: GRAPH, config, startTime, endTime }),
   });
   const json = await res.json();
-  return (json?.data ?? []) as Array<{ key: string; value: string | number | null }>;
+  const rawItems: Record<string, unknown>[] = json?.data ?? [];
+  return rawItems.map((item) => {
+    if (isRawSeriesItem(item)) {
+      return {
+        key: item.key as string,
+        value: {
+          __type: 'series' as const,
+          path: item.path as string,
+          meta: item.meta as SeriesMeta,
+          range: item.range as { from: number; to: number },
+          slots: item.slots as SeriesSlot[],
+        } satisfies SeriesPayload,
+      };
+    }
+    return { key: item.key as string, value: item.value as string | number | null };
+  });
 }
 
 export async function fetchUNSNodes(

@@ -115,3 +115,71 @@ import { Button } from '@faclon-labs/design-sdk/Button';
 - `positionX` / `positionY` are viewport-absolute px values — always derive from `getBoundingClientRect()`.
 - `e.stopPropagation()` on every trigger that lives inside an accordion header or other click handler.
 - Reset all form state in `handleClose` **and** at the end of `handleSubmit`.
+
+---
+
+## UNS Injection Pattern
+
+Use this pattern in **every configurator** that has bindable fields. No need to re-explain it — follow this recipe exactly.
+
+Angular injects `unsTree`, `onLoadWorkspaces`, and `resolveUNSValue` at runtime. The dev harness falls back to the `useUNSTree` hook. The configurator must support both paths.
+
+### 1. Props interface additions
+
+```tsx
+// All-or-none: Angular injects all three or none
+unsTree?: UNSTree;
+isLoadingTree?: boolean;
+onLoadWorkspaces?: () => void;
+resolveUNSValue?: (rawValue: string) => string;
+```
+
+### 2. Injection detection + hook wiring
+
+Add inside the component, before `return`. The hook is always called (Rules of Hooks).
+
+```tsx
+const hasInjectedUNS =
+  props.unsTree !== undefined &&
+  props.onLoadWorkspaces !== undefined &&
+  props.resolveUNSValue !== undefined;
+
+const hookResult = useUNSTree(hasInjectedUNS ? undefined : authentication);
+const unsTree         = hasInjectedUNS ? props.unsTree!              : hookResult.unsTree;
+const isLoadingTree   = hasInjectedUNS ? (props.isLoadingTree ?? false) : hookResult.isLoadingTree;
+const loadWorkspaces  = hasInjectedUNS ? props.onLoadWorkspaces!     : hookResult.loadWorkspaces;
+const resolveUNSValue = hasInjectedUNS ? props.resolveUNSValue!      : hookResult.resolveUNSValue;
+```
+
+### 3. UNSPathInput for every bindable field
+
+Replace any raw `<input>` on a bindable field with:
+
+```tsx
+<UNSPathInput
+  label="..."
+  placeholder="Type / to browse UNS or paste {{topic}} directly"
+  value={myField}
+  tree={unsTree}
+  isLoading={isLoadingTree}
+  onChange={(v: string) => {
+    const r = resolveUNSValue(v);
+    setMyField(r);
+    emit({ myField: r });
+  }}
+  onOpen={() => loadWorkspaces()}
+/>
+```
+
+### 4. Imports
+
+```tsx
+import { useUNSTree, UNSTree } from '../../iosense-sdk/useUNSTree';
+import { UNSPathInput } from '@faclon-labs/design-sdk/UNSPathInput';
+```
+
+### Rules
+
+- `useUNSTree` is always called unconditionally — pass `undefined` as auth when injection is active.
+- Never pass `unsTree` / `onLoadWorkspaces` / `resolveUNSValue` down to the widget renderer — configurator-only.
+- Every bindable field must use `UNSPathInput`, not a raw `<input>`.
