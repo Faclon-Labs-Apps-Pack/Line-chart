@@ -1,14 +1,14 @@
 import { useState, useEffect } from 'react';
-import { WidgetTemplate } from './components/WidgetTemplate/WidgetTemplate';
-import { WidgetTemplateConfiguration } from './components/WidgetTemplateConfiguration/WidgetTemplateConfiguration';
-import { WidgetTemplateEnvelope, DataEntry, WidgetEvent } from './iosense-sdk/types';
+import { LineChart } from './components/LineChart/LineChart';
+import { LineChartConfiguration } from './components/LineChartConfiguration/LineChartConfiguration';
+import { LineChartEnvelope, DataEntry, WidgetEvent } from './iosense-sdk/types';
 import { validateSSOToken } from './iosense-sdk/api';
 import { resolve } from './iosense-sdk/mini-engine';
 import '@faclon-labs/design-sdk/styles.css';
 import './App.css';
 
 export default function App() {
-  const [envelope, setEnvelope] = useState<WidgetTemplateEnvelope | undefined>(undefined);
+  const [envelope, setEnvelope] = useState<LineChartEnvelope | undefined>(undefined);
   const [data, setData] = useState<DataEntry[]>([]);
   const [auth, setAuth] = useState<string>(localStorage.getItem('bearer_token') ?? '');
   const [timeOverride, setTimeOverride] = useState<{ startTime: number; endTime: number } | undefined>(undefined);
@@ -50,14 +50,41 @@ export default function App() {
     }
   }
 
+  // Compute the widget's preview size from styling.size (Custom uses
+  // customWidth/customHeight; presets use fixed dimensions). Capped to 100%
+  // so the preview never exceeds its container.
+  const sizing = (() => {
+    const s = envelope?.uiConfig?.style;
+    if (!s || typeof s !== 'object' || !('size' in s)) return undefined;
+    const size = (s as { size?: { preset?: string; customWidth?: number; customHeight?: number } }).size;
+    if (!size) return undefined;
+    const presetDims: Record<string, { w?: number; h?: number }> = {
+      Small: { w: 580, h: 400 },
+      Medium: { w: 880, h: 400 },
+      Large: { w: 1780, h: 400 },
+    };
+    const dims =
+      size.preset === 'Custom'
+        ? { w: size.customWidth, h: size.customHeight }
+        : presetDims[size.preset ?? 'Medium'] ?? presetDims.Medium;
+    return {
+      width: typeof dims.w === 'number' ? `${dims.w}px` : undefined,
+      height: typeof dims.h === 'number' ? `${dims.h}px` : undefined,
+      maxWidth: '100%',
+      maxHeight: '100%',
+    };
+  })();
+
   return (
     <div className="app">
       <div className="app__config">
-        <WidgetTemplateConfiguration config={envelope} authentication={auth} onChange={setEnvelope} />
+        <LineChartConfiguration config={envelope} authentication={auth} onChange={setEnvelope} />
       </div>
       <div className="app__widget">
         {envelope ? (
-          <WidgetTemplate config={envelope.uiConfig} data={data} onEvent={handleEvent} />
+          <div className="app__widget-frame" style={sizing}>
+            <LineChart config={envelope.uiConfig} data={data} onEvent={handleEvent} />
+          </div>
         ) : (
           <div className="app__empty">
             <p className="BodyMediumRegular">Configure the widget in the left panel to preview it here.</p>

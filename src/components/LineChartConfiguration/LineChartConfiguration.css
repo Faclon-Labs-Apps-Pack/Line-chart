@@ -1,0 +1,672 @@
+/* LineChartConfiguration — design-sdk tokens + BEM only.
+   Two-column shell: Column 1 (accordion list) + Column 2 (sliding Add/Edit). */
+
+.lc-config {
+  display: flex;
+  flex-direction: column;
+  background: var(--background-default-intense);
+}
+
+/* ----- Shell (flex row containing Column 1 + optional Column 2) ----------- */
+.lc-config__shell {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--spacing-03);
+  /* Page background shows through the gap between the two panels */
+  background: var(--background-default-subtle, #f0f2f4);
+  min-height: 100%;
+}
+
+/* ===========================================================================
+   Column 1 — section accordion list
+   =========================================================================== */
+.lc-config__col1 {
+  display: flex;
+  flex-direction: column;
+  width: 280px;
+  min-width: 280px;
+  flex-shrink: 0;
+  height: 100vh;
+  overflow: hidden;
+  border: var(--fds-border-default);
+  border-radius: var(--global-border-radius-large, 8px);
+  background: var(--background-default-intense);
+  position: sticky;
+  top: 0;
+}
+
+/* Sticky header */
+.lc-config__col1-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--spacing-04) var(--spacing-04);
+  border-bottom: var(--fds-border-default);
+  flex-shrink: 0;
+  background: var(--background-default-intense);
+}
+
+.lc-config__col1-header-title {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-02);
+}
+
+.lc-config__title {
+  color: var(--text-default-primary);
+}
+
+/* Tabs row */
+.lc-config__col1-tabs {
+  padding: var(--spacing-03) var(--spacing-04) 0;
+  border-bottom: var(--fds-border-subtle);
+  flex-shrink: 0;
+  background: var(--background-default-intense);
+}
+
+/* Scrollable body */
+.lc-config__col1-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* Sticky footer */
+.lc-config__col1-footer {
+  padding: var(--spacing-04) var(--spacing-04);
+  border-top: var(--fds-border-default);
+  background: var(--background-default-intense);
+  flex-shrink: 0;
+}
+
+/* ----- Accordion list ------------------------------------------------------ */
+.lc-config__accordion {
+  display: flex;
+  flex-direction: column;
+}
+
+.lc-config__accordion-row {
+  display: flex;
+  flex-direction: column;
+  border-bottom: var(--fds-border-subtle);
+}
+
+.lc-config__accordion-row-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-02);
+  padding: var(--spacing-03) var(--spacing-04);
+  min-height: 40px;
+}
+
+.lc-config__accordion-row-label-btn {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-02);
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+  flex: 1;
+  min-width: 0;
+  color: var(--text-default-primary);
+  font-family: inherit;
+}
+
+.lc-config__accordion-row-label {
+  color: var(--text-default-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lc-config__accordion-row-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  min-width: 22px;
+  height: 20px;
+  padding: 0 var(--spacing-03);
+  margin-left: var(--spacing-02);
+  background: var(--background-default-subtle);
+  color: var(--text-default-secondary);
+  border-radius: var(--global-border-radius-max);
+  font-variant-numeric: tabular-nums;
+}
+
+.lc-config__accordion-row--expanded .lc-config__accordion-row-label {
+  color: var(--text-brand-default);
+}
+
+.lc-config__accordion-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-01);
+  flex-shrink: 0;
+}
+
+.lc-config__accordion-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-04);
+  padding: var(--spacing-05);
+}
+
+.lc-config__accordion-body--inline {
+  gap: var(--spacing-03);
+  padding-top: var(--spacing-02);
+  padding-bottom: var(--spacing-04);
+}
+
+.lc-config__empty {
+  color: var(--text-default-tertiary);
+  padding: var(--spacing-03);
+  text-align: center;
+}
+
+/* ----- Item card (inside expanded accordion bodies) ------------------------ */
+.lc-config__item-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-03);
+  padding: var(--spacing-04);
+  border: 1px solid var(--border-gray-muted, rgba(67, 75, 81, 0.16));
+  border-radius: 4px;
+  background: var(--background-default-intense, #fff);
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+
+.lc-config__item-card:hover {
+  background: var(--background-secondary-default, rgba(67, 75, 81, 0.08));
+}
+
+.lc-config__item-card--active {
+  background: var(--background-secondary-default, rgba(67, 75, 81, 0.08));
+}
+
+.lc-config__item-card-main {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-03);
+  min-width: 0;
+  flex: 1;
+}
+
+.lc-config__item-card-swatch {
+  width: 16px;
+  height: 16px;
+  border-radius: 3.2px;
+  border: 0.8px solid rgba(47, 64, 80, 0.18);
+  flex-shrink: 0;
+}
+
+.lc-config__item-card-title {
+  color: var(--text-default-primary, #050505);
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 20px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.lc-config__item-card-action {
+  flex-shrink: 0;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+.lc-config__item-card:hover .lc-config__item-card-action,
+.lc-config__item-card--active .lc-config__item-card-action {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* ===========================================================================
+   Column 2 — sliding Add/Edit panel
+   =========================================================================== */
+.lc-config__col2 {
+  display: flex;
+  flex-direction: column;
+  width: 280px;
+  min-width: 280px;
+  flex-shrink: 0;
+  /* Anchors to top, only as tall as content (up to viewport height) */
+  position: sticky;
+  top: 0;
+  height: auto;
+  max-height: 100vh;
+  overflow: hidden;
+  background: var(--background-default-intense);
+  border: var(--fds-border-default);
+  border-radius: var(--global-border-radius-large, 8px);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.10);
+  animation: lc-config__col2-slide-in 200ms ease;
+}
+
+@keyframes lc-config__col2-slide-in {
+  from {
+    transform: translateX(20px);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+.lc-config__col2-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--spacing-04) var(--spacing-04);
+  border-bottom: var(--fds-border-default);
+  flex-shrink: 0;
+  background: var(--background-default-intense);
+}
+
+.lc-config__col2-header-title {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-02);
+  color: var(--text-default-primary);
+}
+
+.lc-config__col2-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-default-secondary);
+}
+
+.lc-config__col2-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--spacing-04);
+}
+
+.lc-config__col2-footer {
+  padding: var(--spacing-04);
+  border-top: var(--fds-border-default);
+  background: var(--background-default-intense);
+  flex-shrink: 0;
+}
+
+/* ----- Editor body --------------------------------------------------------- */
+.lc-config__editor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-04);
+}
+
+.lc-config__editor-swatch {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border-radius: var(--global-border-radius-small);
+  border: var(--fds-border-subtle);
+  vertical-align: middle;
+}
+
+/* Data Source editor layout helpers */
+.lc-config__ds-row {
+  display: flex;
+  align-items: center;
+}
+
+.lc-config__ds-row--halves {
+  gap: var(--spacing-03);
+}
+
+.lc-config__ds-row--halves > * {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.lc-config__ds-row--toggle {
+  justify-content: space-between;
+  min-height: 24px;
+}
+
+.lc-config__ds-toggle-label {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-02);
+  color: var(--text-default-secondary);
+}
+
+/* ----- Hint (used by old form inline empty states inside Col-2) ------------ */
+.lc-config__hint {
+  color: var(--text-default-tertiary);
+  padding: var(--spacing-03);
+  background: var(--background-default-subtle);
+  border-radius: var(--global-border-radius-medium);
+}
+
+/* ----- Sub-block grouping inside editor forms ----------------------------- */
+.lc-config__sub-block {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-03);
+  padding: var(--spacing-03);
+  border: var(--fds-border-subtle);
+  border-radius: var(--global-border-radius-medium);
+  background: var(--background-default-subtle);
+}
+
+.lc-config__sub-block-title {
+  color: var(--text-default-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin: 0;
+}
+
+.lc-config__periodicity-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: var(--spacing-02);
+  align-items: end;
+}
+
+.lc-config__date-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--spacing-03);
+  min-width: 0;
+}
+.lc-config__date-row > * {
+  min-width: 0;
+  width: 100%;
+}
+
+/* SPC Duration Settings: simple heading + stacked full-width date pickers, no surrounding box. */
+.lc-config__duration-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-03, 8px);
+}
+.lc-config__duration-group__title {
+  color: var(--text-default-primary);
+  margin: 0;
+}
+.lc-config__duration-group__fields {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-04, 12px);
+}
+
+/* Stretch DatePicker (defaults to width: max-content in design-sdk) to fill the column. */
+.lc-config__duration-group__fields .fds-datepicker,
+.lc-config__duration-group__fields .fds-datepicker__trigger-row {
+  width: 100%;
+  max-width: 100%;
+}
+
+/* SPC editor: per Figma 742:18020, body container gap is --spacing/5 (16px) between top-level fields. */
+.lc-config__editor--spc {
+  gap: var(--spacing-05, 16px);
+}
+
+/* Stack the three ProductAccordionItems with the same 16px rhythm as the rest of the body. */
+.lc-config__spc-accordions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-05, 16px);
+}
+
+/* SPC editor: add red required-asterisk to labels on inputs that don't expose `necessityIndicator`
+   (SelectInput, DatePicker, ColorInput). TextInputs use the prop directly. */
+.lc-config__editor--spc .fds-select-input .fds-field-header__label::after,
+.lc-config__editor--spc .fds-datepicker .fds-field-header__label::after,
+.lc-config__editor--spc .fds-color-input .fds-field-header__label::after {
+  content: '*';
+  color: var(--text-error-default);
+  margin-left: 2px;
+}
+
+/* ----- SPC accordion section body ----------------------------------------- */
+.lc-config__spc-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-03, 8px);
+  padding-top: var(--spacing-02, 4px);
+}
+
+.lc-config__required {
+  color: var(--text-error-default, #d92d20);
+}
+
+/* ----- Sigma checkbox grid ------------------------------------------------ */
+.lc-config__sigma-label {
+  color: var(--text-default-secondary);
+  margin: 0;
+}
+
+.lc-config__sigma-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--spacing-02);
+}
+
+.lc-config__sigma-item {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-02);
+}
+
+/* ----- Switch row (label + switch) ---------------------------------------- */
+.lc-config__switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-03);
+  padding: var(--spacing-03);
+  border: var(--fds-border-subtle);
+  border-radius: var(--global-border-radius-medium);
+  background: var(--background-default-intense);
+}
+
+.lc-config__switch-label {
+  color: var(--text-default-primary);
+}
+
+/* ----- Time tab panel ----------------------------------------------------- */
+.lc-config__time-tab {
+  padding: var(--spacing-04);
+  overflow-y: auto;
+}
+
+/* ----- Style tab ---------------------------------------------------------- */
+.lc-config__style-tab {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-04);
+  padding: var(--spacing-04);
+}
+
+.lc-config__section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-04);
+}
+
+.lc-config__style-tab__row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-02);
+}
+
+.lc-config__style-tab__size-row {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: end;
+  gap: var(--spacing-02);
+}
+
+.lc-config__style-tab__lock {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding-bottom: var(--spacing-01);
+}
+
+.lc-config__style-tab__switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-03);
+  padding: var(--spacing-02) 0;
+}
+
+.lc-config__style-tab__switch-label {
+  color: var(--text-default-primary);
+}
+
+.lc-config__style-tab__block {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-03);
+  padding-top: var(--spacing-02);
+}
+
+.lc-config__style-tab__block-title {
+  color: var(--text-default-primary);
+  margin-top: var(--spacing-02);
+}
+
+.lc-config__style-tab__checkbox-col {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-02);
+}
+
+.lc-config__style-tab__color-row {
+  display: block;
+}
+
+.lc-config__style-tab__swatch {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border-radius: var(--global-border-radius-small);
+  border: var(--fds-border-subtle);
+  vertical-align: middle;
+}
+
+/* ===========================================================================
+   Chart Settings — 4-state block
+   =========================================================================== */
+.lc-config__chart-settings {
+  display: flex;
+  flex-direction: column;
+  border-bottom: var(--fds-border-subtle);
+  padding: var(--spacing-05);
+  gap: var(--spacing-05);
+}
+
+.lc-config__chart-settings--editing {
+  background: var(--background-default-subtle);
+}
+
+.lc-config__chart-settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-02);
+  color: var(--text-default-primary);
+}
+
+.lc-config__chart-settings-header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-03);
+}
+
+/* The trash icon in edit mode — recoloured to negative.
+   IconButton has no `color` prop in design-sdk@0.5.6, so we override the
+   inherited text color directly on the wrapper. */
+.lc-config__chart-settings-trash button,
+.lc-config__chart-settings-trash button:hover,
+.lc-config__chart-settings-trash button svg {
+  color: var(--text-negative-default, var(--text-negative-primary, #d92d20));
+}
+
+.lc-config__chart-settings-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-05);
+}
+
+/* Read-only display field (State 2/4 — chart display mode) */
+.lc-config__ro-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.lc-config__ro-field-label {
+  color: var(--text-default-secondary, #292f32);
+  display: flex;
+  align-items: baseline;
+  gap: 2px;
+}
+
+.lc-config__ro-field-required {
+  color: var(--text-error-default, #d01e11);
+}
+
+.lc-config__ro-field-input {
+  background: var(--background-default-intense, #ffffff);
+  border: 1px solid var(--border-gray-default, #c8cdd0);
+  border-radius: var(--global-border-radius-medium, 4px);
+  height: 36px;
+  display: flex;
+  align-items: center;
+  padding: 0 var(--spacing-04, 12px);
+  overflow: hidden;
+}
+
+.lc-config__ro-field-value {
+  color: var(--text-default-secondary, #292f32);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lc-config__ro-field-placeholder {
+  color: var(--text-default-tertiary, #768ea7);
+}
+
+.lc-config__chart-settings-save-inline {
+  display: flex;
+  margin-top: var(--spacing-02);
+}
+
+.lc-config__chart-settings-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--spacing-02);
+  margin-top: var(--spacing-02);
+}
+
+
+/* Disabled section row (chart not present or chart-settings in edit mode) */
+.lc-config__section--disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+/* Footer with Add Chart disabled state */
+.lc-config__col1-footer--disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}

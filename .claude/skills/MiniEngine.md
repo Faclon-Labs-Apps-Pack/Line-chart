@@ -48,7 +48,7 @@ Content-Type: application/json
 {
   "graph": "iosense_test_uns",
   "config": [
-    { "key": "variable", "topic": "iosense/plant1/energy/line1/panelA/TACEM_A4/analytics/voltage/lastdp" }
+    { "key": "sources[0].unsPath", "topic": "uns:ws_abc123://iosense/plant1/voltage:last" }
   ],
   "startTime": 1777141800000,
   "endTime":   1777206690000
@@ -75,11 +75,82 @@ Constants (defined in `api.ts`):
 
 ## resolve() Implementation
 
-> See `src/iosense-sdk/mini-engine.ts` lines 9–30.
+```typescript
+import { resolveAndCompute } from './api';
+
+export async function resolve(
+  envelope: DataPointEnvelope,
+  ctx: MiniEngineCtx,
+): Promise<{ config: DataPointUIConfig; data: DataEntry[] }> {
+  const { startTime, endTime } = computeWindow(envelope, ctx.override);
+  const bindings = envelope.dynamicBindingPathList ?? [];
+
+  if (bindings.length === 0) return { config: envelope.uiConfig, data: [] };
+
+  try {
+    const items = await resolveAndCompute(
+      ctx.authentication,
+      bindings.map(({ key, topic }) => ({ key, topic })),
+      startTime,
+      endTime,
+    );
+    const data: DataEntry[] = items.map((item) => ({ key: item.key, value: item.value }));
+    return { config: envelope.uiConfig, data };
+  } catch {
+    return { config: envelope.uiConfig, data: [] };
+  }
+}
+```
+
+### Topic Format Guard
+
+Before passing bindings to `resolveAndCompute`, validate topic format. Any topic not matching `uns:wsId://` is silently skipped with a console error — this prevents bad API calls and surfaces Angular injection issues clearly:
+
+```typescript
+const UNS_TOPIC_RE = /^uns:[^/]+:\/\//;
+
+const validBindings = bindings.filter(({ topic }) => {
+  if (!UNS_TOPIC_RE.test(topic)) {
+    console.error(
+      `[MiniEngine] Invalid topic format: "${topic}". ` +
+      `Expected "uns:wsId://path". ` +
+      `Check that Angular's resolveUNSValue injects {{uns:wsId://path}} format ` +
+      `and that this.meta is keyed by workspace NAME.`
+    );
+    return false;
+  }
+  return true;
+});
+// use validBindings instead of bindings in resolveAndCompute call
+```
+
+---
 
 ### resolveAndCompute in api.ts
 
-> See `src/iosense-sdk/api.ts` lines 14–30.
+```typescript
+const GRAPH = 'iosense_test_uns';
+const STAGING_BASE = 'https://stagingsv.iosense.io/api';
+
+export async function resolveAndCompute(
+  authentication: string,
+  config: Array<{ key: string; topic: string }>,
+  startTime: number,
+  endTime: number,
+): Promise<Array<{ key: string; value: string | number | null }>> {
+  const res = await fetch(`${STAGING_BASE}/account/uns/resolveAndCompute`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${authentication}`,
+    },
+    body: JSON.stringify({ graph: GRAPH, config, startTime, endTime }),
+  });
+  const json = await res.json();
+  // Response shape: { success, data: [{ key, value }] }
+  return (json?.data ?? []) as Array<{ key: string; value: string | number | null }>;
+}
+```
 
 ---
 
@@ -88,11 +159,11 @@ Constants (defined in `api.ts`):
 ```typescript
 // dynamicBindingPathList saved by configurator
 dynamicBindingPathList = [
-  { key: "variable", topic: "iosense/plant1/energy/line1/panelA/TACEM_A4/analytics/voltage/lastdp" },
+  { key: "sources[0].unsPath", topic: "uns:ws_abc123://iosense/plant1/voltage:last" },
 ]
 
 // resolve() sends to resolveAndCompute:
-config = [{ key: "variable", topic: "iosense/.../lastdp" }]
+config = [{ key: "sources[0].unsPath", topic: "uns:ws_abc123://iosense/plant1/voltage:last" }]
 
 // API response:
 { success: true, data: [{ key: "variable", value: "436" }] }
@@ -105,9 +176,23 @@ data = [{ key: "variable", value: "436" }]
 
 ## computeWindow Helper
 
-> See `src/iosense-sdk/mini-engine.ts` lines 32–46.
-
-Priority order: `override` → `fixed` timeConfig → `defaultDuration` preset → default 24 h window.
+```typescript
+function computeWindow(
+  envelope: DataPointEnvelope,
+  override?: { startTime: number; endTime: number },
+): { startTime: number; endTime: number } {
+  if (override) return { startTime: override.startTime, endTime: override.endTime };
+  const { timeConfig } = envelope;
+  if (!timeConfig) return { startTime: Date.now() - 86_400_000, endTime: Date.now() };
+  if (timeConfig.type === 'fixed' && timeConfig.startTime && timeConfig.endTime) {
+    return { startTime: timeConfig.startTime, endTime: timeConfig.endTime };
+  }
+  const now = Date.now();
+  const dur = timeConfig.allDurations?.find(d => d.id === timeConfig.defaultDurationId);
+  if (dur) return { startTime: computePresetStart(dur, now), endTime: now };
+  return { startTime: now - 86_400_000, endTime: now };
+}
+```
 
 ---
 
@@ -137,6 +222,7 @@ Widget reads all bindable values via `getValue()` — never directly from `confi
 - The `key` in every `DataEntry` must exactly match the `key` in `dynamicBindingPathList`
 - There is **no** per-apiConfig fetch loop — one `resolveAndCompute` call covers all bindings
 - `item.value` is the resolved field from the response — NOT `item.data`
+- `timeTabConfig` in the envelope is for UI re-hydration only — mini-engine reads `timeConfig`, never `timeTabConfig`
 
 ---
 

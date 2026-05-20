@@ -54,13 +54,15 @@ A bindable field is any `uiConfig` field whose value comes from a live device/se
 
 Bindable fields use a **plain `<input type="text">`** or the design-sdk `TextInput`. The user types the UNS topic path wrapped in `{{}}`.
 
+> **Prefer `UNSPathInput` over `TextInput` for all bindable fields.** `UNSPathInput` (from `@faclon-labs/design-sdk/UNSPathInput`) adds a `/`-triggered tree browser that resolves workspace names to `{{uns:wsId://path}}` format automatically. Only use bare `TextInput` for fields where UNS browsing is not appropriate. See **UNSPathInput.md** for the full pattern.
+
 The placeholder must always show an example `{{topic}}` value.
 
 ```tsx
 // ✅ CORRECT — bindable field, user types {{topic}} syntax
 <TextInput
   label="Variable"
-  placeholder="e.g. {{iosense/plant1/energy/line1/panelA/DEVICE/analytics/voltage/lastdp}}"
+  placeholder="e.g. {{uns:wsId://iosense/plant1/voltage:last}} or type / to browse"
   value={variable}
   onChange={({ value }) => setVariable(value)}
 />
@@ -85,17 +87,56 @@ const [minTopic, setMinTopic] = useState<string>('');
 
 When the configurator saves, it must walk the `uiConfig` it just built, find every field matching `{{...}}`, extract the topic inside (strip the braces), and write `{ key, topic }` entries into `dynamicBindingPathList`.
 
-> Implementation: see `src/components/WidgetTemplateConfiguration/WidgetTemplateConfiguration.tsx` — `buildDynamicBindingPathList()` (lines 11–36) and `buildEnvelope()` (lines 38–49).
+```typescript
+const VARIABLE_REGEX = /^\{\{(.+)\}\}$/;
+
+function buildDynamicBindingPathList(uiConfig: UIConfig): Array<{ key: string; topic: string }> {
+  const paths: Array<{ key: string; topic: string }> = [];
+
+  function walk(obj: any, currentPath: string): void {
+    if (obj === null || obj === undefined) return;
+    if (typeof obj === 'string') {
+      const match = VARIABLE_REGEX.exec(obj.trim());
+      if (match) paths.push({ key: currentPath, topic: match[1] }); // match[1] = topic without {{ }}
+      return;
+    }
+    if (Array.isArray(obj)) {
+      obj.forEach((item, index) => walk(item, `${currentPath}[${index}]`));
+      return;
+    }
+    if (typeof obj === 'object') {
+      Object.entries(obj).forEach(([key, val]) => {
+        walk(val, currentPath ? `${currentPath}.${key}` : key);
+      });
+    }
+  }
+
+  walk(uiConfig, '');
+  return paths;
+}
+
+// Usage in configurator's save handler
+function buildEnvelope(existing, variable, sources, style): WidgetEnvelope {
+  const uiConfig = { variable, sources, style };
+  return {
+    _id: existing?._id ?? `widget_${Date.now()}`,
+    type: 'WidgetType',
+    general: existing?.general ?? { title: '' },
+    uiConfig,
+    dynamicBindingPathList: buildDynamicBindingPathList(uiConfig),
+  };
+}
+```
 
 ### What the output looks like
 
 ```typescript
 // User typed "{{iosense/plant1/.../voltage/lastdp}}" in the variable field
-uiConfig.variable = "{{iosense/plant1/energy/line1/panelA/TACEM_A4/analytics/voltage/lastdp}}"
+uiConfig.variable = "{{uns:ws_abc123://iosense/plant1/voltage:last}}"
 
 // buildDynamicBindingPathList extracts the topic (strips {{ }})
 dynamicBindingPathList: [
-  { key: "variable", topic: "iosense/plant1/energy/line1/panelA/TACEM_A4/analytics/voltage/lastdp" },
+  { key: "sources[0].unsPath", topic: "uns:ws_abc123://iosense/plant1/voltage:last" },
 ]
 
 // Static fields (no {{}}) are NOT in the list
@@ -141,7 +182,19 @@ data = [
 Widget always reads bindable values via `getValue()` — never directly from `config`:
 
 ```typescript
-// Implementation: see src/components/WidgetTemplate/WidgetTemplate.tsx:17-28
+function getValue(key: string, config: any, data: DataEntry[]): any {
+  const entry = data.find(d => d.key === key);
+  return entry !== undefined ? entry.value : getValueAtPath(config, key);
+}
+
+function getValueAtPath(obj: any, path: string): any {
+  return path
+    .replace(/\[(\d+)\]/g, '.$1')
+    .split('.')
+    .reduce((acc, k) => acc?.[k], obj);
+}
+
+// Usage in widget
 const rawValue = getValue('variable', config, data);   // "436" from data
 const minVal   = getValue('gaugeConfig.min', config, data);
 
@@ -151,7 +204,55 @@ if (data.length === 0) return <WidgetSkeleton config={config} />;
 
 ---
 
-## 6. Checklist Before Submitting Any Configurator
+## 6. Concrete Example — DataPoint Widget Configurator
+
+```tsx
+const VARIABLE_REGEX = /^\{\{(.+)\}\}$/;
+
+function buildDynamicBindingPathList(uiConfig) {
+  const paths = [];
+  function walk(obj, path) {
+    if (typeof obj === 'string') {
+      const match = VARIABLE_REGEX.exec(obj.trim());
+      if (match) paths.push({ key: path, topic: match[1] });
+    } else if (Array.isArray(obj)) {
+      obj.forEach((item, i) => walk(item, `${path}[${i}]`));
+    } else if (obj && typeof obj === 'object') {
+      Object.entries(obj).forEach(([k, v]) => walk(v, path ? `${path}.${k}` : k));
+    }
+  }
+  walk(uiConfig, '');
+  return paths;
+}
+
+const DataPointConfiguration = () => {
+  const [variable, setVariable] = useState<string>('');  // user types {{topic}} here
+
+  function buildEnvelope(): WidgetConfigEnvelope {
+    const uiConfig = { variable, sources, style };
+    return {
+      _id: existing?._id ?? `dp_${Date.now()}`,
+      type: 'DataPoint',
+      general: { title: '' },
+      uiConfig,
+      dynamicBindingPathList: buildDynamicBindingPathList(uiConfig),
+    };
+  }
+
+  return (
+    <TextInput
+      label="Variable"
+      placeholder="e.g. {{uns:wsId://iosense/plant1/voltage:last}} or type / to browse"
+      value={variable}
+      onChange={({ value }) => { setVariable(value); emit(value, sources, style); }}
+    />
+  );
+};
+```
+
+---
+
+## 7. Checklist Before Submitting Any Configurator
 
 - [ ] Every bindable field is a plain text input — user types `{{iosense/...}}` syntax
 - [ ] Bindable field state is typed as `string`
@@ -178,8 +279,14 @@ paths.push({ key: currentPath, topic: match[1] });    // ← correct
 const [variable, setVariable] = useState('{{API1.data}}');
 
 // ❌ WRONG — topic still has {{ }} braces
-{ key: "variable", topic: "{{iosense/plant1/.../lastdp}}" }  // ← braces not stripped
-{ key: "variable", topic: "iosense/plant1/.../lastdp" }      // ← correct
+{ key: "sources[0].unsPath", topic: "{{uns:ws_abc://iosense/plant1/voltage:last}}" }   // ← braces not stripped
+{ key: "sources[0].unsPath", topic: "uns:ws_abc://iosense/plant1/voltage:last" }       // ← correct
+
+// ❌ WRONG — workspace name format (resolveUNSValue was not called or returned unchanged)
+{ key: "sources[0].unsPath", topic: "Akash - Test/Voltage/:last" }  // ← display name leaked through
+
+// ✅ CORRECT — workspace ID format
+{ key: "sources[0].unsPath", topic: "uns:ws_abc123://iosense/plant1/voltage:last" }
 
 // ❌ WRONG — apiConfig in envelope
 return { timeConfig, apiConfig, uiConfig, dynamicBindingPathList };  // ← apiConfig must not exist

@@ -6,8 +6,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const COMPONENTS = {
-  WidgetTemplate: './src/components/WidgetTemplate/index.ts',
-  WidgetTemplateConfiguration: './src/components/WidgetTemplateConfiguration/index.ts',
+  LineChart: './src/components/LineChart/index.ts',
+  LineChartConfiguration: './src/components/LineChartConfiguration/index.ts',
 };
 
 export default (env, argv) => {
@@ -35,6 +35,14 @@ export default (env, argv) => {
     resolve: { extensions: ['.tsx', '.ts', '.js'] },
     module: {
       rules: [
+        // Disable strict ESM "fullySpecified" resolution for .js files in
+        // node_modules — needed because @faclon-labs/design-sdk publishes ESM
+        // that performs extension-less deep imports (e.g. into
+        // @table-library/react-table-library/select).
+        {
+          test: /\.m?js$/,
+          resolve: { fullySpecified: false },
+        },
         {
           test: /\.(ts|tsx)$/,
           exclude: /node_modules/,

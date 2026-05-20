@@ -29,3 +29,89 @@ Read the four skill files below **before touching any widget code**. They are th
 4. Implement the widget renderer in `src/components/YourWidgetName/`
 5. Run `npm start` — dev harness shows live preview at `http://localhost:3000`
 6. Authenticate once: visit `http://localhost:3000/?token=<SSO_TOKEN>`
+
+---
+
+## Configurator Overlay Pattern
+
+Use this pattern whenever a configurator needs an "add / edit" modal (e.g. Add Data Source, Add Alert, Add Rule). No need to re-explain it — follow this recipe exactly.
+
+### 1. Ref + position state
+
+Attach a `ref` to the root configurator `<div>` and compute the modal position when the trigger is clicked:
+
+```tsx
+const configRef = useRef<HTMLDivElement>(null);
+const [modalX, setModalX] = useState(0);
+const [modalY, setModalY] = useState(0);
+
+function openModal(e: React.MouseEvent) {
+  e.stopPropagation();                              // prevent parent handlers (e.g. accordion)
+  if (configRef.current) {
+    const rect = configRef.current.getBoundingClientRect();
+    setModalX(rect.right + 30);                     // 30 px gap to the right of config panel
+    setModalY(rect.top);                            // top-aligned with config panel
+  }
+  setIsOpen(true);
+}
+```
+
+Apply the ref to the configurator root:
+```tsx
+<div className="dp-config" ref={configRef}>
+```
+
+### 2. Modal JSX
+
+```tsx
+<Modal
+  {...({ transparent: true } as any)}              // transparent backdrop (undocumented runtime prop)
+  isOpen={isOpen}
+  positionX={modalX}
+  positionY={modalY}
+  className="dp-<name>-modal"                      // scoped class for width override
+  onClose={handleClose}
+  header={<ModalHeader title="Add …" onClose={handleClose} />}
+  footer={
+    <ModalFooter
+      primaryAction={<Button variant="Primary" label="Add …" onClick={handleSubmit} />}
+    />
+  }
+>
+  <ModalBody>
+    <div className="dp-<name>-modal__body">
+      {/* form fields stacked flex-column */}
+    </div>
+  </ModalBody>
+</Modal>
+```
+
+### 3. CSS (width + body layout)
+
+`Modal.size` only accepts Small/Medium/Large — override width via the scoped class:
+
+```css
+.dp-<name>-modal .fds-modal {
+  width: 280px;                                     /* or whatever width is required */
+}
+
+.dp-<name>-modal__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-04, 12px);
+}
+```
+
+### 4. Imports
+
+```tsx
+import { Modal, ModalHeader, ModalBody, ModalFooter } from '@faclon-labs/design-sdk/Modal';
+import { Button } from '@faclon-labs/design-sdk/Button';
+```
+
+### Rules
+
+- `transparent: true` is not in the `.d.ts` — always cast via `{...({ transparent: true } as any)}`.
+- `positionX` / `positionY` are viewport-absolute px values — always derive from `getBoundingClientRect()`.
+- `e.stopPropagation()` on every trigger that lives inside an accordion header or other click handler.
+- Reset all form state in `handleClose` **and** at the end of `handleSubmit`.

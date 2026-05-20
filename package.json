@@ -1,5 +1,5 @@
 {
-  "name": "iosense-widget-template",
+  "name": "iosense-linechart-widget",
   "version": "1.0.0",
   "private": true,
   "type": "module",
@@ -10,7 +10,9 @@
     "deploy": "claude /deploy-review"
   },
   "dependencies": {
-    "@faclon-labs/design-sdk": "latest",
+    "@faclon-labs/design-sdk": "^0.5.12",
+    "highcharts": "^12",
+    "highcharts-react-official": "^3",
     "react": "18.2.0",
     "react-dom": "18.2.0",
     "react-feather": "^2.0.10"

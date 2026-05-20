@@ -1,4 +1,10 @@
-import { WidgetTemplateEnvelope, WidgetTemplateUIConfig, DataEntry, Duration } from './types';
+import {
+  LineChartEnvelope,
+  LineChartUIConfig,
+  DataEntry,
+  GTPPreset,
+  TimeTabUIConfig,
+} from './types';
 import { resolveAndCompute } from './api';
 
 interface MiniEngineCtx {
@@ -7,9 +13,9 @@ interface MiniEngineCtx {
 }
 
 export async function resolve(
-  envelope: WidgetTemplateEnvelope,
+  envelope: LineChartEnvelope,
   ctx: MiniEngineCtx,
-): Promise<{ config: WidgetTemplateUIConfig; data: DataEntry[] }> {
+): Promise<{ config: LineChartUIConfig; data: DataEntry[] }> {
   const { startTime, endTime } = computeWindow(envelope, ctx.override);
   const bindings = envelope.dynamicBindingPathList ?? [];
 
@@ -30,30 +36,76 @@ export async function resolve(
 }
 
 function computeWindow(
-  envelope: WidgetTemplateEnvelope,
+  envelope: LineChartEnvelope,
   override?: { startTime: number; endTime: number },
 ): { startTime: number; endTime: number } {
   if (override) return override;
-  const { timeConfig } = envelope;
-  if (!timeConfig) return { startTime: Date.now() - 86_400_000, endTime: Date.now() };
-  if (timeConfig.type === 'fixed' && timeConfig.startTime && timeConfig.endTime) {
-    return { startTime: timeConfig.startTime, endTime: timeConfig.endTime };
+  const tc: TimeTabUIConfig | undefined = envelope.timeConfig;
+  if (!tc) return { startTime: Date.now() - 86_400_000, endTime: Date.now() };
+
+  if (tc.timeType === 'fixed' && tc.fixedStart && tc.fixedEnd) {
+    return { startTime: tc.fixedStart, endTime: tc.fixedEnd };
   }
+
   const now = Date.now();
-  const dur = timeConfig.allDurations?.find((d) => d.id === timeConfig.defaultDuration);
+  const dur = tc.allDurations?.find((d) => d.id === tc.defaultDurationId);
   if (dur) return { startTime: computePresetStart(dur, now), endTime: now };
   return { startTime: now - 86_400_000, endTime: now };
 }
 
-function computePresetStart(dur: Duration, now: number): number {
-  const x = dur.x ?? 1;
-  const periodMs: Record<string, number> = {
-    minute: 60_000,
-    hour: 3_600_000,
-    day: 86_400_000,
-    week: 7 * 86_400_000,
-    month: 30 * 86_400_000,
-    year: 365 * 86_400_000,
-  };
-  return now - x * (periodMs[dur.xPeriod] ?? 86_400_000);
+// Compute a preset's start time relative to `now`.
+// Supports the `x + xPeriod` rolling-window shape, plus a small subset of
+// `calendarType` values. Unsupported calendar types fall back to `now - 24h`
+// rather than throwing — we never silently break the widget.
+function computePresetStart(dur: GTPPreset, now: number): number {
+  if (dur.calendarType) {
+    const d = new Date(now);
+    switch (dur.calendarType) {
+      case 'today': {
+        d.setHours(0, 0, 0, 0);
+        return d.getTime();
+      }
+      case 'yesterday': {
+        d.setHours(0, 0, 0, 0);
+        return d.getTime() - 86_400_000;
+      }
+      case 'current_week': {
+        d.setHours(0, 0, 0, 0);
+        const dow = d.getDay(); // 0=Sun
+        return d.getTime() - dow * 86_400_000;
+      }
+      case 'previous_week': {
+        d.setHours(0, 0, 0, 0);
+        const dow = d.getDay();
+        return d.getTime() - (dow + 7) * 86_400_000;
+      }
+      case 'current_month': {
+        d.setDate(1);
+        d.setHours(0, 0, 0, 0);
+        return d.getTime();
+      }
+      case 'previous_month': {
+        d.setDate(1);
+        d.setHours(0, 0, 0, 0);
+        d.setMonth(d.getMonth() - 1);
+        return d.getTime();
+      }
+      default:
+        return now - 86_400_000;
+    }
+  }
+
+  if (typeof dur.x === 'number' && dur.xPeriod) {
+    const periodMs: Record<string, number> = {
+      minute: 60_000,
+      hour: 3_600_000,
+      day: 86_400_000,
+      week: 7 * 86_400_000,
+      month: 30 * 86_400_000,
+      year: 365 * 86_400_000,
+    };
+    return now - dur.x * (periodMs[dur.xPeriod] ?? 86_400_000);
+  }
+
+  return now - 86_400_000;
 }

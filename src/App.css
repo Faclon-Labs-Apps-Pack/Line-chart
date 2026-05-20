@@ -17,18 +17,37 @@ body {
 }
 
 .app__config {
-  width: 280px;
+  /* Col1 (280px) + gap (8px) + optional Col2 (280px).
+     flex-shrink: 0 keeps the widget area from squeezing this. */
   flex-shrink: 0;
-  background: var(--background-default-intense, #fff);
-  border: var(--fds-border-default, 1px solid #e0e0e0);
-  border-radius: var(--global-border-radius-large, 8px);
-  overflow: hidden;
+  display: flex;
+  align-items: flex-start;
+  /* overflow:visible lets col2's box-shadow render outside the container */
+  overflow: visible;
+  /* Match viewport height so sticky children work */
+  height: 100vh;
+}
+
+.app__config > * {
+  flex: 1;
+  min-width: 0;
 }
 
 .app__widget {
   flex: 1;
   min-width: 0;
   height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+}
+
+.app__widget-frame {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
 }
 
 .app__empty {

@@ -95,7 +95,7 @@ interface WidgetConfigEnvelope {
   _id: string;
   type: string;                  // Widget type e.g. "DataPoint"
   general: { title: string };
-  timeConfig?: TimeTabUIConfig;  // Optional — time window settings (from TimeConfiguration component)
+  timeConfig?: TimeConfig;       // Optional — time window settings
   uiConfig: UIConfig;            // Render config — widget reads this
   dynamicBindingPathList: Array<{ key: string; topic: string }>; // binding index
 }
@@ -107,66 +107,46 @@ interface WidgetConfigEnvelope {
 
 Used by the mini-engine to compute `startTime`/`endTime` for the `resolveAndCompute` call.
 
-**This object is produced automatically by the `TimeConfiguration` component from `@faclon-labs/design-sdk`.** Never hand-construct it — mount `<TimeConfiguration />` in the configurator and it emits the correct shape via its `onChange` callback.
-
 ```typescript
-export interface GTPPreset {
-  id: string;
-  label: string;
-  x?: number;
-  xPeriod?: 'minute' | 'hour' | 'day' | 'week' | 'month' | 'year';
-  calendarType?: 'today' | 'yesterday' | 'current_week' | 'previous_week' | 'current_month' | 'previous_month';
-  isBuiltIn?: boolean;
-  navigation?: string;
-  xEvent?: string;
-  y?: number;
-  yPeriod?: 'minute' | 'hour' | 'day' | 'week' | 'month' | 'year';
-  yEvent?: string;
-  periodicities?: string[];
-}
-
-export interface GTPShift {
-  id: string;
-  name: string;
-  startTime: string;
-  endTime: string;
-  color: string;
-}
-
-export interface GTPCycleTimeConfig {
-  identifier: 'start' | 'end';
-  hour: string;
-  minute: string;
-  dayOfWeek: number | null;
-  date: string;
-  month: string;
-  year: string;
-}
-
-export type GTPTimeType = 'fixed' | 'local' | 'global';
-
-export interface GTPGlobalTimepicker {
-  id: string;
-  name: string;
-}
-
-// This is the shape stored in envelope.timeConfig
-export interface TimeTabUIConfig {
+interface TimeConfig {
   timezone: string;                    // IANA e.g. "Asia/Kolkata"
-  timeType?: GTPTimeType;
-  globalTimepickerId?: string;
-  defaultDurationId: string;           // ID reference → allDurations[n].id
-  allDurations: GTPPreset[];
-  defaultPeriodicity: 'minute' | 'hourly' | 'daily' | 'weekly' | 'monthly';
-  disablePeriodicities?: boolean;
-  comparisonMode?: boolean;
-  disableTimeSelection?: boolean;
-  futureDaysAllowed?: string;
-  shifts?: GTPShift[];
-  shiftAggregator?: string;
-  cycleTime?: GTPCycleTimeConfig;
+  type: "local" | "fixed" | string;
+  startTime: number | null;            // ms epoch, used when type = "fixed"
+  endTime: number | null;
+  defaultDurationId: string;          // ID reference → allDurations[n].id
+  allDurations: Duration[];
+  defaultPeriodicity: "minute" | "hourly" | "daily" | "weekly" | "monthly";
+}
+
+interface Duration {
+  id: string;
+  label?: string;
+  x?: number;
+  xPeriod: string;   // "minute" | "hour" | "day" | "week" | "month" | "year"
 }
 ```
+
+### 2a.1. `timeTabConfig` (optional, UI re-hydration only)
+
+Stored alongside `timeConfig` for the design-sdk `TimeTabConfiguration` component to restore its UI state on re-load. **The mini-engine never reads this.** Only the configurator reads it on mount.
+
+```typescript
+// In the configurator's useEffect sync:
+if (config.timeTabConfig) setTimeTabConfig(config.timeTabConfig);
+
+// In the onChange payload — BOTH fields must be emitted:
+onChange({
+  ...envelope,
+  timeConfig: buildTimeConfig(timeTabConfig),   // mini-engine reads this
+  timeTabConfig: timeTabConfig,                 // TimeTabConfiguration re-hydration
+});
+```
+
+`buildTimeConfig(ttc: Partial<TimeTabUIConfig>): TimeConfig | undefined` maps the design-sdk's `TimeTabUIConfig` → the engine-facing `TimeConfig`. Returns `undefined` if `ttc` is empty.
+
+> **Rule:** never emit `timeTabConfig` WITHOUT also emitting `timeConfig`. The deploy-review C1.6 check enforces this.
+
+---
 
 ### 2b. `dynamicBindingPathList`
 
@@ -175,8 +155,8 @@ The binding index. Each entry maps a uiConfig dot-path to a UNS topic. The mini-
 ```typescript
 // Example
 dynamicBindingPathList = [
-  { key: "variable",         topic: "iosense/plant1/energy/line1/panelA/TACEM_A4/analytics/voltage/lastdp" },
-  { key: "gaugeConfig.min",  topic: "iosense/plant1/energy/line1/panelA/TACEM_A4/analytics/voltage/min" },
+  { key: "sources[0].unsPath", topic: "uns:ws_abc123://iosense/plant1/voltage:last" },
+  { key: "rangeMin",           topic: "uns:ws_abc123://iosense/plant1/voltage:min" },
 ]
 ```
 
@@ -211,17 +191,17 @@ interface DataPointUIConfig {
   "type": "DataPoint",
   "general": { "title": "" },
   "uiConfig": {
-    "variable": "{{iosense/plant1/energy/line1/panelA/TACEM_A4/analytics/voltage/lastdp}}",
+    "variable": "{{uns:ws_abc123://iosense/plant1/voltage:last}}",
     "sources": [{ "_id": "src_abc", "label": "Voltage", "unit": "V" }],
     "style": { "card": { "wrapInCard": true } }
   },
   "dynamicBindingPathList": [
-    { "key": "variable", "topic": "iosense/plant1/energy/line1/panelA/TACEM_A4/analytics/voltage/lastdp" }
+    { "key": "sources[0].unsPath", "topic": "uns:ws_abc123://iosense/plant1/voltage:last" }
   ]
 }
 ```
 
-Note: `uiConfig.variable` stores the `{{topic}}` string with braces — this is the bindable field marker. `dynamicBindingPathList.topic` stores the topic **without** braces — extracted by the scanner.
+Note: `uiConfig` bindable fields store `{{uns:wsId://nodePath}}` with braces intact — this is the binding marker. `dynamicBindingPathList.topic` stores the topic **without** braces: `uns:wsId://nodePath`. The UNS topic format is always `uns:workspaceId://absoluteNodePath` — never a raw path or workspace name. Topics arriving in any other format will be rejected by the mini-engine topic guard.
 ```
 
 ---
@@ -253,7 +233,18 @@ The configurator produces the envelope. It must have:
 2. **Time Settings** → fills `timeConfig` (optional)
 3. **Appearance** → fills `uiConfig` (labels, styling)
 
-> Implementation: see `src/components/WidgetTemplateConfiguration/WidgetTemplateConfiguration.tsx` lines 38–49. Full contract in **Bindable.md §3**.
+```typescript
+function buildEnvelope(existing, variable, sources, style): WidgetConfigEnvelope {
+  const uiConfig = { variable, sources, style };
+  return {
+    _id: existing?._id ?? `dp_${Date.now()}`,
+    type: 'DataPoint',
+    general: existing?.general ?? { title: '' },
+    uiConfig,
+    dynamicBindingPathList: buildDynamicBindingPathList(uiConfig), // scans for {{}} → extracts topics
+  };
+}
+```
 
 `buildDynamicBindingPathList` walks `uiConfig`, finds every field matching `{{...}}`, and produces `{ key: dotPath, topic: contentInsideBraces }`. See Bindable.md for the full implementation.
 ```
