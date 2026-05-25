@@ -178,6 +178,20 @@
   gap: var(--spacing-02);
 }
 
+/* Wraps the icon + title + subtitle inside a card that ALSO renders the
+ * filters row above. Takes the remaining flex space so the message stays
+ * vertically centered below the filters. */
+.line-chart__state-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: var(--spacing-02);
+}
+
 .line-chart__empty-icon {
   color: var(--text-default-tertiary);
   margin-bottom: var(--spacing-02);

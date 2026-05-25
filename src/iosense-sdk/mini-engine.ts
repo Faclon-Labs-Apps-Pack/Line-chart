@@ -4,25 +4,36 @@ import { resolveAndCompute } from './api';
 interface MiniEngineCtx {
   authentication: string;
   override?: { startTime: number; endTime: number };
+  /** Periodicity override from the widget's periodicity dropdown.
+   *  Sent to backend so all series aggregate at the picked granularity. */
+  periodicity?: string;
+}
+
+export interface MiniEngineResult {
+  config: LineChartUIConfig;
+  data: DataEntry[];
+  /** Populated when resolution failed (network, auth, malformed binding). UI may render an error state. */
+  error?: string;
 }
 
 export async function resolve(
   envelope: LineChartEnvelope,
   ctx: MiniEngineCtx,
-): Promise<{ config: LineChartUIConfig; data: DataEntry[] }> {
+): Promise<MiniEngineResult> {
   const { startTime, endTime } = computeWindow(envelope, ctx.override);
   const bindings = envelope.dynamicBindingPathList ?? [];
 
   if (bindings.length === 0) return { config: envelope.uiConfig, data: [] };
 
   const UNS_TOPIC_RE = /^uns:[^/]+:\/\//;
+  const invalidTopics: string[] = [];
   const validBindings = bindings.filter(({ topic }) => {
     if (!UNS_TOPIC_RE.test(topic)) {
+      invalidTopics.push(topic);
       console.error(
         `[MiniEngine] Invalid topic format: "${topic}". ` +
-        `Expected "uns:wsId://path". ` +
-        `Check that Angular's resolveUNSValue returns {{uns:wsId://path}} ` +
-        `and that this.meta is keyed by workspace NAME.`
+          `Expected "uns:wsId://path". ` +
+          `Check that resolveUNSValue returned a resolved topic — it logs a warning on cache miss.`,
       );
       return false;
     }
@@ -30,24 +41,45 @@ export async function resolve(
   });
 
   if (validBindings.length === 0 && bindings.length > 0) {
-    return { config: envelope.uiConfig, data: [] };
+    return {
+      config: envelope.uiConfig,
+      data: [],
+      error: `All ${bindings.length} binding(s) had invalid topic format. ` +
+        `First invalid: "${invalidTopics[0]}". See console for details.`,
+    };
   }
 
   try {
+    const periodicity =
+      ctx.periodicity ?? envelope.timeConfig?.defaultPeriodicity ?? envelope.timeTabConfig?.defaultPeriodicity;
+    const resolution = periodicityToResolution(periodicity);
     const items = await resolveAndCompute(
       ctx.authentication,
-      validBindings.map((binding) =>
-        'type' in binding && binding.type === 'series'
-          ? { key: binding.key, topic: binding.topic, type: 'series' as const }
-          : { key: binding.key, topic: binding.topic }
-      ),
+      validBindings.map((binding) => {
+        const base =
+          'type' in binding && binding.type === 'series'
+            ? { key: binding.key, topic: binding.topic, type: 'series' as const }
+            : { key: binding.key, topic: binding.topic };
+        // Per-binding aggregation override — backend's SeriesAggregation pattern.
+        // Only attached to series bindings; scalars don't aggregate.
+        if (resolution && 'type' in base && base.type === 'series') {
+          return {
+            ...base,
+            aggregation: { operator: 'mean', downscale: 1, resolution },
+          };
+        }
+        return base;
+      }),
       startTime,
       endTime,
+      resolution,
     );
     const data: DataEntry[] = items.map((item) => ({ key: item.key, value: item.value }));
     return { config: envelope.uiConfig, data };
-  } catch {
-    return { config: envelope.uiConfig, data: [] };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error('[MiniEngine] resolveAndCompute failed:', err);
+    return { config: envelope.uiConfig, data: [], error: message };
   }
 }
 
@@ -72,6 +104,20 @@ function computeWindow(
   const dur = timeConfig.allDurations?.find((d) => d.id === timeConfig.defaultDurationId);
   if (dur) return { startTime: computePresetStart(dur, now), endTime: now };
   return { startTime: now - 86_400_000, endTime: now };
+}
+
+// Map the widget's periodicity vocabulary to the backend's resolution vocabulary.
+// `getWidgetData` examples use 'hour' / 'day' / 'month' (singular, no '-ly').
+function periodicityToResolution(p?: string): string | undefined {
+  if (!p) return undefined;
+  switch (p.toLowerCase()) {
+    case 'minute':  return 'minute';
+    case 'hourly':  return 'hour';
+    case 'daily':   return 'day';
+    case 'weekly':  return 'week';
+    case 'monthly': return 'month';
+    default:        return p; // already in backend vocab
+  }
 }
 
 function computePresetStart(dur: GTPPreset, now: number): number {

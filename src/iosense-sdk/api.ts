@@ -22,15 +22,30 @@ export async function resolveAndCompute(
   config: Array<BindingEntry>,
   startTime: number,
   endTime: number,
+  /** Backend resolution value (e.g. 'hour', 'day') — mapped from widget periodicity in the mini-engine. */
+  resolution?: string,
 ): Promise<Array<{ key: string; value: string | number | null | SeriesPayload }>> {
+  const body: Record<string, unknown> = { graph: GRAPH, config, startTime, endTime };
+  if (resolution) {
+    // Send under multiple field names so whichever the backend accepts wins.
+    // `timeFrame` matches getWidgetData; `resolution` matches SeriesAggregation.
+    body.timeFrame = resolution;
+    body.resolution = resolution;
+  }
   const res = await fetch(`${STAGING_BASE}/account/uns/resolveAndCompute`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${authentication}`,
     },
-    body: JSON.stringify({ graph: GRAPH, config, startTime, endTime }),
+    body: JSON.stringify(body),
   });
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(
+      `resolveAndCompute HTTP ${res.status} ${res.statusText}${body ? ` — ${body.slice(0, 300)}` : ''}`,
+    );
+  }
   const json = await res.json();
   const rawItems: Record<string, unknown>[] = json?.data ?? [];
   return rawItems.map((item) => {

@@ -1,11 +1,14 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import { fetchUNSNodes } from './api';
+import type { UNSTree } from '@faclon-labs/design-sdk/UNSPathInput';
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
-export type UNSTree = { [key: string]: UNSTree | null };
+// Re-exported so existing imports (`import { UNSTree } from './useUNSTree'`)
+// keep working — single source of truth is the design-sdk.
+export type { UNSTree };
 
 export interface UseUNSTreeResult {
   /** Pass to UNSPathInput `tree` prop. */
@@ -170,8 +173,17 @@ export function useUNSTree(authentication?: string): UseUNSTreeResult {
 
   function resolveUNSValue(rawValue: string): string {
     if (rawValue.startsWith('{{') && rawValue.endsWith('}}')) {
-      const meta = _cache.meta.get(rawValue.slice(2, -2));
+      const inner = rawValue.slice(2, -2);
+      const meta = _cache.meta.get(inner);
       if (meta) return `{{uns:${meta.wsId}://${meta.nodePath}}}`;
+      // Already-resolved value (e.g. user pasted {{uns:...}} directly) — no warning needed.
+      if (inner.startsWith('uns:')) return rawValue;
+      console.warn(
+        `[UNS] resolveUNSValue cache miss for "${inner}". ` +
+          `The workspace's nodes likely haven't loaded yet — expand the workspace in ` +
+          `the UNS dropdown before selecting, or the value will be stored as-is and ` +
+          `rejected by the mini-engine.`,
+      );
     }
     return rawValue;
   }

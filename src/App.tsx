@@ -10,8 +10,10 @@ import './App.css';
 export default function App() {
   const [envelope, setEnvelope] = useState<LineChartEnvelope | undefined>(undefined);
   const [data, setData] = useState<DataEntry[]>([]);
+  const [resolveError, setResolveError] = useState<string | undefined>(undefined);
   const [auth, setAuth] = useState<string>(localStorage.getItem('bearer_token') ?? '');
   const [timeOverride, setTimeOverride] = useState<{ startTime: number; endTime: number } | undefined>(undefined);
+  const [periodicityOverride, setPeriodicityOverride] = useState<string | undefined>(undefined);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -33,12 +35,22 @@ export default function App() {
 
   useEffect(() => {
     if (!envelope || !auth) return;
-    console.log('[App] resolving envelope:', envelope.dynamicBindingPathList, 'override:', timeOverride);
-    resolve(envelope, { authentication: auth, override: timeOverride }).then(({ data: resolved }) => {
-      console.log('[App] resolved data:', resolved);
+    console.log(
+      '[App] resolving envelope:',
+      envelope.dynamicBindingPathList,
+      'timeOverride:', timeOverride,
+      'periodicityOverride:', periodicityOverride,
+    );
+    resolve(envelope, {
+      authentication: auth,
+      override: timeOverride,
+      periodicity: periodicityOverride,
+    }).then(({ data: resolved, error }) => {
+      console.log('[App] resolved data:', resolved, 'error:', error);
       setData(resolved);
+      setResolveError(error);
     });
-  }, [envelope, auth, timeOverride]);
+  }, [envelope, auth, timeOverride, periodicityOverride]);
 
   function handleEvent(event: WidgetEvent) {
     console.log('[Widget Event]', event);
@@ -47,6 +59,9 @@ export default function App() {
         startTime: Number(event.payload.startTime),
         endTime: Number(event.payload.endTime),
       });
+      if (event.payload.periodicity) {
+        setPeriodicityOverride(event.payload.periodicity);
+      }
     }
   }
 
@@ -83,7 +98,7 @@ export default function App() {
       <div className="app__widget">
         {envelope ? (
           <div className="app__widget-frame" style={sizing}>
-            <LineChart config={envelope.uiConfig} data={data} onEvent={handleEvent} timeConfig={envelope.timeConfig} />
+            <LineChart config={envelope.uiConfig} data={data} onEvent={handleEvent} timeConfig={envelope.timeConfig} error={resolveError} />
           </div>
         ) : (
           <div className="app__empty">

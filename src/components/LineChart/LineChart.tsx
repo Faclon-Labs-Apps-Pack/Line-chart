@@ -26,6 +26,8 @@ interface LineChartProps {
   data: DataEntry[];
   onEvent: (event: WidgetEvent) => void;
   timeConfig?: TimeTabUIConfig;
+  /** Surfaced from the mini-engine (network, auth, invalid topic). When set, renders an error state. */
+  error?: string;
 }
 
 const PERIODICITY_OPTIONS = [
@@ -36,8 +38,56 @@ const PERIODICITY_OPTIONS = [
   { label: 'Monthly', value: 'monthly' },
 ];
 
+function startOfDay(d: Date): Date {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+}
+function endOfDay(d: Date): Date {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999);
+}
+
 function computeRangeFromPreset(dur: GTPPreset): { start: Date; end: Date } {
   const now = new Date();
+
+  // Calendar-based presets (today, yesterday, current/previous week|month).
+  // Required because GTPPreset.xPeriod is undefined for these.
+  if (dur.calendarType) {
+    switch (dur.calendarType) {
+      case 'today':
+        return { start: startOfDay(now), end: now };
+      case 'yesterday': {
+        const y = new Date(now);
+        y.setDate(y.getDate() - 1);
+        return { start: startOfDay(y), end: endOfDay(y) };
+      }
+      case 'current_week': {
+        // Week starts Sunday (getDay() === 0).
+        const start = startOfDay(now);
+        start.setDate(start.getDate() - now.getDay());
+        return { start, end: now };
+      }
+      case 'previous_week': {
+        const prevStart = startOfDay(now);
+        prevStart.setDate(prevStart.getDate() - now.getDay() - 7);
+        const prevEnd = new Date(prevStart);
+        prevEnd.setDate(prevStart.getDate() + 6);
+        return { start: prevStart, end: endOfDay(prevEnd) };
+      }
+      case 'current_month':
+        return { start: new Date(now.getFullYear(), now.getMonth(), 1), end: now };
+      case 'previous_month': {
+        const firstOfThisMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+        const lastOfPrevMonth = new Date(firstOfThisMonth.getTime() - 1);
+        const firstOfPrevMonth = new Date(
+          lastOfPrevMonth.getFullYear(),
+          lastOfPrevMonth.getMonth(),
+          1,
+        );
+        return { start: firstOfPrevMonth, end: endOfDay(lastOfPrevMonth) };
+      }
+    }
+  }
+
+  // Relative presets ({x} {xPeriod} ago → now).
   const x = dur.x ?? 1;
   let start = new Date(now);
   switch (dur.xPeriod) {
@@ -66,16 +116,41 @@ function activeChartIndex(config: LineChartUIConfig): number {
   return idx >= 0 ? idx : 0;
 }
 
-function mapPlotLines(plotLines: LineChartPlotLine[]) {
-  return plotLines
-    .filter((l) => l.type === 'Independent' && l.valueType === 'Fixed' && typeof l.fixedValue === 'number')
-    .map((l) => ({
-      value: l.fixedValue as number,
+const TOPIC_RE = /^\{\{.+\}\}$/;
+
+function mapPlotLines(
+  plotLines: LineChartPlotLine[],
+  chartIdx: number,
+  data: DataEntry[],
+) {
+  return plotLines.flatMap((l, plIdx) => {
+    if (l.type !== 'Independent' || l.valueType !== 'Fixed' || !l.fixedValue) return [];
+
+    let value: number | undefined;
+    if (TOPIC_RE.test(l.fixedValue.trim())) {
+      const key = `charts[${chartIdx}].plotLines[${plIdx}].fixedValue`;
+      const entry = data.find((d) => d.key === key);
+      const raw = entry?.value;
+      value =
+        typeof raw === 'number'
+          ? raw
+          : typeof raw === 'string' && raw !== ''
+            ? Number(raw)
+            : undefined;
+    } else {
+      const num = parseFloat(l.fixedValue);
+      value = Number.isFinite(num) ? num : undefined;
+    }
+
+    if (value === undefined) return [];
+    return [{
+      value,
       color: l.color || '#3b82f6',
       width: l.lineWidth ?? 2,
       dashStyle: (l.lineStyle === 'Dashed' ? 'Dash' : 'Solid') as 'Solid' | 'Dash',
       label: l.name || undefined,
-    }));
+    }];
+  });
 }
 
 function mapPlotBands(plotBands: LineChartPlotBand[]) {
@@ -340,7 +415,7 @@ const FALLBACK_STYLING: LineChartStyling = {
   misc: { gridLineColor: '#CCCCCC', legendTextColor: '#666666' },
 };
 
-export function LineChart({ config, data, onEvent, timeConfig }: LineChartProps) {
+export function LineChart({ config, data, onEvent, timeConfig, error }: LineChartProps) {
   const styling: LineChartStyling = (() => {
     const s = config?.style as unknown;
     if (s && typeof s === 'object' && 'card' in (s as object)) return s as LineChartStyling;
@@ -374,92 +449,9 @@ export function LineChart({ config, data, onEvent, timeConfig }: LineChartProps)
     });
   }
 
-  // No charts configured
-  if (!activeChart || chartIdx < 0) {
-    return (
-      <div className="line-chart line-chart--card line-chart__empty">
-        <Settings size={28} className="line-chart__empty-icon" />
-        <p className="line-chart__empty-title BodyMediumSemibold">Widget not configured</p>
-        <p className="line-chart__empty-subtitle BodySmallRegular">
-          Add at least one data source to render this chart.
-        </p>
-      </div>
-    );
-  }
-
-  // Loading skeleton — bindings exist but data hasn't arrived yet
-  const hasBindings = activeChart.series.some((s) =>
-    /^\{\{.+\}\}$/.test((s.dataSource ?? '').trim()),
-  );
-  if (hasBindings && data.length === 0) {
-    return (
-      <div className="line-chart line-chart--card line-chart--loading">
-        <div className="line-chart__skeleton" />
-      </div>
-    );
-  }
-
-  // Build series + categories from resolved slot data
-  const resolvedSeries = activeChart.series.map((s, i) => {
-    const payload = getSeriesData(`charts[${chartIdx}].series[${i}].dataSource`, data);
-    return {
-      id:    s._id,
-      name:  s.name || `Series ${i + 1}`,
-      color: s.color || undefined,
-      slots: payload?.slots ?? [],
-    };
-  });
-
-  const firstWithSlots = resolvedSeries.find((s) => s.slots.length > 0);
-  const categories = firstWithSlots ? firstWithSlots.slots.map((sl) => sl.label) : [];
-  const seriesForChart = resolvedSeries.map((s) => ({
-    name:  s.name,
-    color: s.color,
-    data:  s.slots.length > 0
-      ? s.slots.map((sl) => sl.value ?? 0)
-      : categories.map(() => 0),
-  }));
-
-  // No data for this time range
-  if (categories.length === 0 && data.length > 0) {
-    return (
-      <div className="line-chart line-chart--card line-chart__empty">
-        <Database size={28} className="line-chart__empty-icon" />
-        <p className="line-chart__empty-title BodyMediumSemibold">No data available</p>
-        <p className="line-chart__empty-subtitle BodySmallRegular">
-          The configured topics have not returned data for this time window.
-        </p>
-      </div>
-    );
-  }
-
-  const configPlotLines = mapPlotLines(activeChart.plotLines ?? []);
-  const configPlotBands = mapPlotBands(activeChart.plotBands ?? []);
-
-  const spcOverlays = computeSpcOverlays(activeChart.spcs ?? [], resolvedSeries);
-
-  const plotLines = [...configPlotLines, ...spcOverlays.plotLines];
-  const plotBands = [...configPlotBands, ...spcOverlays.plotBands];
-
-  const anomalyScatterSeries = computeAnomalyOverlays(
-    activeChart.anomalies ?? [],
-    chartIdx,
-    resolvedSeries,
-    data,
-  );
-
-  // highchartsOptions.series array is deep-merged by index:
-  // pad with {} for existing line series (neutral override), then append scatter series.
-  const highchartsOptions =
-    anomalyScatterSeries.length > 0
-      ? {
-          series: [
-            ...seriesForChart.map(() => ({} as Record<string, never>)),
-            ...anomalyScatterSeries,
-          ],
-        }
-      : undefined;
-
+  // Filters row — defined here (before any early return) so empty/error/loading
+  // states can render the time + periodicity controls and the user can recover
+  // by adjusting them without leaving the widget.
   const filtersSlot = timeConfig ? (
     <div className="line-chart__datetime-row">
       <DatePicker
@@ -475,7 +467,7 @@ export function LineChart({ config, data, onEvent, timeConfig }: LineChartProps)
         selectedPreset={selectedPreset}
         onPresetSelect={(id) => {
           setSelectedPreset(id);
-          const preset = timeConfig.allDurations?.find((d) => d.id === id);
+          const preset = timeConfig?.allDurations?.find((d) => d.id === id);
           if (preset) {
             const range = computeRangeFromPreset(preset);
             setRangeValue(range);
@@ -512,6 +504,150 @@ export function LineChart({ config, data, onEvent, timeConfig }: LineChartProps)
     </div>
   ) : undefined;
 
+  function renderStateCard(
+    icon: React.ReactNode,
+    title: string,
+    subtitle: string,
+  ) {
+    return (
+      <div className="line-chart line-chart--card">
+        {filtersSlot}
+        <div className="line-chart__state-body">
+          {icon}
+          <p className="line-chart__empty-title BodyMediumSemibold">{title}</p>
+          <p className="line-chart__empty-subtitle BodySmallRegular">{subtitle}</p>
+        </div>
+      </div>
+    );
+  }
+
+  // No charts configured — no filters needed (no chart yet to filter).
+  if (!activeChart || chartIdx < 0) {
+    return (
+      <div className="line-chart line-chart--card line-chart__empty">
+        <Settings size={28} className="line-chart__empty-icon" />
+        <p className="line-chart__empty-title BodyMediumSemibold">Widget not configured</p>
+        <p className="line-chart__empty-subtitle BodySmallRegular">
+          Add at least one data source to render this chart.
+        </p>
+      </div>
+    );
+  }
+
+  const hasBindings = activeChart.series.some((s) =>
+    /^\{\{.+\}\}$/.test((s.dataSource ?? '').trim()),
+  );
+
+  // Error state — surfaced from mini-engine (network, auth, invalid topic).
+  // Shows BEFORE the loading skeleton so failures don't appear as infinite loading.
+  if (error) {
+    return renderStateCard(
+      <Database size={28} className="line-chart__empty-icon" />,
+      "Couldn't load data",
+      error,
+    );
+  }
+
+  // Loading skeleton — bindings exist but data hasn't arrived yet.
+  if (hasBindings && data.length === 0) {
+    return (
+      <div className="line-chart line-chart--card">
+        {filtersSlot}
+        <div className="line-chart__skeleton" />
+      </div>
+    );
+  }
+
+  // Build series + categories from resolved slot data
+  const resolvedSeries = activeChart.series.map((s, i) => {
+    const payload = getSeriesData(`charts[${chartIdx}].series[${i}].dataSource`, data);
+    return {
+      id:    s._id,
+      name:  s.name || `Series ${i + 1}`,
+      color: s.color || undefined,
+      slots: payload?.slots ?? [],
+    };
+  });
+
+  const firstWithSlots = resolvedSeries.find((s) => s.slots.length > 0);
+  const categories = firstWithSlots ? firstWithSlots.slots.map((sl) => sl.label) : [];
+  const seriesForChart = resolvedSeries.map((s) => ({
+    name:  s.name,
+    color: s.color,
+    data:  s.slots.length > 0
+      ? s.slots.map((sl) => sl.value ?? 0)
+      : categories.map(() => 0),
+  }));
+
+  // No data for this time range — filters stay visible so user can adjust.
+  if (categories.length === 0 && data.length > 0) {
+    return renderStateCard(
+      <Database size={28} className="line-chart__empty-icon" />,
+      'No data available',
+      'The configured topics have not returned data for this time window.',
+    );
+  }
+
+  const configPlotLines = mapPlotLines(activeChart.plotLines ?? [], chartIdx, data);
+  const configPlotBands = mapPlotBands(activeChart.plotBands ?? []);
+
+  const spcOverlays = computeSpcOverlays(activeChart.spcs ?? [], resolvedSeries);
+
+  const plotLines = [...configPlotLines, ...spcOverlays.plotLines];
+  const plotBands = [...configPlotBands, ...spcOverlays.plotBands];
+
+  const anomalyScatterSeries = computeAnomalyOverlays(
+    activeChart.anomalies ?? [],
+    chartIdx,
+    resolvedSeries,
+    data,
+  );
+
+  // Multi-axis: build Highcharts yAxis array from axis config.
+  // Each axis maps to an index; series reference their axis by that index.
+  const axisList = activeChart.axes ?? [];
+  const hasCustomAxes = axisList.length > 0;
+
+  const yAxisHighcharts = hasCustomAxes
+    ? axisList.map((axis) => ({
+        title: { text: axis.name || undefined },
+        opposite: axis.position === 'Right',
+      }))
+    : undefined;
+
+  // Map each resolved series to its configured axis index (default 0 if unlinked).
+  // Primary: match by axis.dataSource === series.dataSource topic.
+  // Fallback: legacy linkedSeriesIds match.
+  const seriesYAxisIndices = hasCustomAxes
+    ? resolvedSeries.map((s, i) => {
+        const seriesConfig = activeChart.series[i];
+        let axisIdx = axisList.findIndex(
+          (a) => a.dataSource && seriesConfig?.dataSource && a.dataSource === seriesConfig.dataSource,
+        );
+        if (axisIdx < 0) {
+          axisIdx = axisList.findIndex((a) => a.linkedSeriesIds?.includes(s.id));
+        }
+        return axisIdx >= 0 ? axisIdx : 0;
+      })
+    : null;
+
+  // highchartsOptions.series is deep-merged by index:
+  // pad with axis assignment (or {}) for existing series, then append anomaly series.
+  const highchartsOptions =
+    anomalyScatterSeries.length > 0 || hasCustomAxes
+      ? {
+          ...(yAxisHighcharts ? { yAxis: yAxisHighcharts } : {}),
+          series: [
+            ...seriesForChart.map((_, i) =>
+              seriesYAxisIndices !== null
+                ? { yAxis: seriesYAxisIndices[i] }
+                : ({} as Record<string, never>),
+            ),
+            ...anomalyScatterSeries,
+          ],
+        }
+      : undefined;
+
   return (
     <DSLineChart
       title={activeChart.title || undefined}
@@ -520,7 +656,7 @@ export function LineChart({ config, data, onEvent, timeConfig }: LineChartProps)
       bare={!styling.card.wrapInCard}
       smooth
       showLegend
-      yAxisTitle={activeChart.defaultAxis?.yAxisLabel || undefined}
+      yAxisTitle={hasCustomAxes ? undefined : (activeChart.defaultAxis?.yAxisLabel || undefined)}
       xAxisTitle={activeChart.defaultAxis?.xAxisLabel || undefined}
       plotLines={plotLines.length > 0 ? plotLines : undefined}
       plotBands={plotBands.length > 0 ? plotBands : undefined}

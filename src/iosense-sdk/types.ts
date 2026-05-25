@@ -40,7 +40,13 @@ export interface SeriesPayload {
 }
 
 export interface ScalarBinding { key: string; topic: string; }
-export interface SeriesBinding  { key: string; topic: string; type: 'series'; }
+export interface SeriesBinding  {
+  key: string;
+  topic: string;
+  type: 'series';
+  /** Per-binding aggregation override. When set, backend buckets the series at this resolution. */
+  aggregation?: SeriesAggregation;
+}
 export type BindingEntry = ScalarBinding | SeriesBinding;
 
 export interface DataEntry {
@@ -106,6 +112,9 @@ export interface LineChartSeries {
   m?: string;
   s?: string;
   addAsTooltip?: boolean;
+  // Per-series deviation indicator override — when set, takes precedence over
+  // uiConfig.deviationIndicator for this series' tooltip. Undefined = inherit.
+  deviationIndicator?: DeviationIndicatorMode;
 }
 
 export interface LineChartDefaultAxis {
@@ -119,7 +128,8 @@ export interface LineChartAxis {
   _id: string;
   name: string;
   position: 'Left' | 'Right';
-  linkedSeriesIds: string[];
+  dataSource: string;         // bindable: stores {{uns:wsId://path}}
+  linkedSeriesIds: string[];  // legacy fallback for renderer; kept for backward compat
 }
 
 export type PlotLineType = 'Independent' | 'Dependent';
@@ -137,9 +147,14 @@ export interface LineChartPlotLine {
   color: string;
   type: PlotLineType;
   valueType: PlotLineValueType;
-  fixedValue?: number;
+  fixedValue?: string;
   dynamicTopic?: string;
+  downsampling?: string;
+  downsamplingUnit?: string;
+  dataPrecision?: number;
+  unit?: string;
   periodicities?: PlotLinePeriodicityEntry[];
+  durationType?: string;
   startDate?: string;
   endDate?: string;
   lineWidth: number;
@@ -232,82 +247,63 @@ export type DataTableOperator = 'sum' | 'avg' | 'min' | 'max' | 'median' | 'firs
 export interface DataTableColumn {
   _id: string;
   sourceMode: DataTableSourceMode;
+  // Existing
   seriesId?: string;
-  topic?: string;
-  label?: string;
-  unit?: string;
-  showUnit: boolean;
-  operator: DataTableOperator;
+  // AddNew
+  topic?: string;           // UNS binding: stores {{uns:wsId://path}}
+  downsampling?: string;
+  downsamplingUnit?: string;
   dataPrecision: number;
+  unit?: string;
 }
 
 export interface DataTableConfig {
   enabled: boolean;
   columns: DataTableColumn[];
   transposeTable: boolean;
+  operator: DataTableOperator;
+  showUnit: boolean;
 }
+
+export type DeviationIndicatorMode = 'standard' | 'inverse';
 
 export interface LineChartUIConfig {
   charts: ChartInstance[];
   activeChartId: string | null;
   dataTable: DataTableConfig;
   style: LineChartStyling;
+  // Tooltip deviation indicator behavior — only used when timeConfig.comparisonMode is true.
+  // 'standard': green up = positive, red down = negative
+  // 'inverse':  red up = positive, green down = negative (for "lower is better" metrics)
+  deviationIndicator?: DeviationIndicatorMode;
+  // UI disclosure: when true, advanced time fields (Disable Time Selection,
+  // Future Days Allowed) are revealed. Default false. Auto-resolves to true on
+  // load if any underlying advanced field already has a non-default value.
+  advanceSettings?: boolean;
 }
 
-export interface GTPPreset {
-  id: string;
-  label: string;
-  x?: number;
-  xPeriod?: 'minute' | 'hour' | 'day' | 'week' | 'month' | 'year';
-  calendarType?: 'today' | 'yesterday' | 'current_week' | 'previous_week' | 'current_month' | 'previous_month';
-  isBuiltIn?: boolean;
-  navigation?: string;
-  xEvent?: string;
-  y?: number;
-  yPeriod?: 'minute' | 'hour' | 'day' | 'week' | 'month' | 'year';
-  yEvent?: string;
-  periodicities?: string[];
-}
+// GTP/TimeTab types — re-exported from the design-sdk's public TimeTabConfiguration
+// subpath so local copies don't drift from the source of truth.
+import type {
+  TimeTabUIConfig,
+  GTPPreset,
+  GTPShift,
+  GTPCycleTimeConfig,
+} from '@faclon-labs/design-sdk/TimeTabConfiguration';
+export type {
+  TimeTabUIConfig,
+  GTPPreset,
+  GTPShift,
+  GTPCycleTimeConfig,
+};
 
-export interface GTPShift {
-  id: string;
-  name: string;
-  startTime: string;
-  endTime: string;
-  color: string;
-}
-
-export interface GTPCycleTimeConfig {
-  identifier: 'start' | 'end';
-  hour: string;
-  minute: string;
-  dayOfWeek: number | null;
-  date: string;
-  month: string;
-  year: string;
-}
-
+// Not publicly re-exported by the SDK index — kept local. Shape mirrors the
+// SDK's internal types (see node_modules/@faclon-labs/design-sdk/.../types.d.ts).
 export type GTPTimeType = 'fixed' | 'local' | 'global';
 
 export interface GTPGlobalTimepicker {
   id: string;
   name: string;
-}
-
-export interface TimeTabUIConfig {
-  timezone: string;
-  timeType?: GTPTimeType;
-  globalTimepickerId?: string;
-  defaultDurationId: string;
-  allDurations: GTPPreset[];
-  defaultPeriodicity: 'minute' | 'hourly' | 'daily' | 'weekly' | 'monthly';
-  disablePeriodicities?: boolean;
-  comparisonMode?: boolean;
-  disableTimeSelection?: boolean;
-  futureDaysAllowed?: string;
-  shifts?: GTPShift[];
-  shiftAggregator?: string;
-  cycleTime?: GTPCycleTimeConfig;
 }
 
 export interface LineChartEnvelope {

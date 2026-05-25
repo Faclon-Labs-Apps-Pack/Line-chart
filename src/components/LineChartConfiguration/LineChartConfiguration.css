@@ -205,11 +205,26 @@
   flex-shrink: 0;
 }
 
+.lc-config__item-card-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+
 .lc-config__item-card-title {
   color: var(--text-default-primary, #050505);
   font-size: 14px;
   font-weight: 500;
   line-height: 20px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.lc-config__item-card-subtitle {
+  color: var(--text-default-secondary, #6b7280);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -307,15 +322,6 @@
   gap: var(--spacing-04);
 }
 
-.lc-config__editor-swatch {
-  display: inline-block;
-  width: 16px;
-  height: 16px;
-  border-radius: var(--global-border-radius-small);
-  border: var(--fds-border-subtle);
-  vertical-align: middle;
-}
-
 /* Data Source editor layout helpers */
 .lc-config__ds-row {
   display: flex;
@@ -349,6 +355,18 @@
   padding: var(--spacing-03);
   background: var(--background-default-subtle);
   border-radius: var(--global-border-radius-medium);
+}
+
+/* ----- Flat section (no border/background — plain header + fields) -------- */
+.lc-config__flat-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-03, 8px);
+}
+
+.lc-config__flat-section-title {
+  color: var(--text-default-primary);
+  margin: 0;
 }
 
 /* ----- Sub-block grouping inside editor forms ----------------------------- */
@@ -432,6 +450,14 @@
   margin-left: 2px;
 }
 
+/* Fields inside a ProductAccordionItem in the PlotLine / generic editor bodies */
+.lc-config__editor-accordion-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-04, 12px);
+  padding-top: var(--spacing-02, 4px);
+}
+
 /* ----- SPC accordion section body ----------------------------------------- */
 .lc-config__spc-section {
   display: flex;
@@ -482,6 +508,177 @@
 .lc-config__time-tab {
   padding: var(--spacing-04);
   overflow-y: auto;
+}
+
+/* ----- Deviation indicator selector (custom, post-TimeTabConfiguration) --- */
+.lc-config__deviation-indicator {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-03, 8px);
+  padding: 0 var(--spacing-04, 16px) var(--spacing-04, 16px);
+}
+
+.lc-config__deviation-indicator__caption {
+  color: var(--text-default-secondary, #6b7280);
+  margin: 0;
+}
+
+.lc-config__deviation-indicator__card {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-03, 8px);
+  padding: var(--spacing-03, 8px) var(--spacing-04, 12px);
+  background: var(--surface-default, #ffffff);
+  border: 1px solid var(--border-default, #e5e7eb);
+  border-radius: var(--border-radius-02, 6px);
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  transition: border-color 120ms ease, background-color 120ms ease;
+}
+
+.lc-config__deviation-indicator__card:hover {
+  border-color: var(--border-strong, #9ca3af);
+}
+
+.lc-config__deviation-indicator__card--active {
+  border-color: var(--border-action, #2563eb);
+  background: var(--surface-action-subtle, #eff6ff);
+}
+
+.lc-config__deviation-indicator__icons {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.lc-config__deviation-indicator__arrow--up-green   { color: #16a34a; }
+.lc-config__deviation-indicator__arrow--down-red   { color: #dc2626; }
+.lc-config__deviation-indicator__arrow--up-red     { color: #dc2626; }
+.lc-config__deviation-indicator__arrow--down-green { color: #16a34a; }
+
+.lc-config__deviation-indicator__label {
+  color: var(--text-default-primary, #111827);
+  line-height: 1.3;
+}
+
+/* ----- Faded state for global cards when AS is on ------------------------- */
+.lc-config__deviation-indicator--faded .lc-config__deviation-indicator__card {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+/* ----- Advance Settings disclosure + per-series override panel ------------ */
+.lc-config__advance-settings {
+  display: flex;
+  flex-direction: column;
+  padding: 0 var(--spacing-04, 16px);
+}
+
+.lc-config__advance-settings__toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--spacing-04, 16px) 0;
+  cursor: pointer;
+}
+
+.lc-config__advance-settings__label {
+  color: var(--text-default-primary, #111827);
+}
+
+.lc-config__advance-settings__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-03, 8px);
+  padding-bottom: var(--spacing-04, 16px);
+}
+
+.lc-config__advance-settings__chart-tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--border-default, #e5e7eb);
+  margin-bottom: var(--spacing-03, 8px);
+}
+
+.lc-config__advance-settings__chart-tab {
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  padding: var(--spacing-02, 6px) var(--spacing-04, 12px);
+  cursor: pointer;
+  font: inherit;
+  color: var(--text-default-secondary, #6b7280);
+  transition: color 120ms ease, border-color 120ms ease;
+}
+
+.lc-config__advance-settings__chart-tab:hover {
+  color: var(--text-default-primary, #111827);
+}
+
+.lc-config__advance-settings__chart-tab--active {
+  color: var(--text-action, #2563eb);
+  border-bottom-color: var(--text-action, #2563eb);
+}
+
+.lc-config__advance-settings__series-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-03, 8px);
+  padding: var(--spacing-02, 6px) 0;
+}
+
+.lc-config__advance-settings__series-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-default-primary, #111827);
+}
+
+.lc-config__advance-settings__empty {
+  color: var(--text-default-secondary, #6b7280);
+  text-align: center;
+  padding: var(--spacing-03, 8px) 0;
+}
+
+/* ----- Small icon-only deviation toggle (per-series) ---------------------- */
+.lc-config__dev-icon-toggle {
+  display: inline-flex;
+  border: 1px solid var(--border-default, #e5e7eb);
+  border-radius: var(--border-radius-02, 6px);
+  overflow: hidden;
+}
+
+.lc-config__dev-icon-toggle__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  background: var(--surface-default, #ffffff);
+  border: 0;
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  color: inherit;
+  transition: background-color 120ms ease;
+}
+
+.lc-config__dev-icon-toggle__btn + .lc-config__dev-icon-toggle__btn {
+  border-left: 1px solid var(--border-default, #e5e7eb);
+}
+
+.lc-config__dev-icon-toggle__btn:hover {
+  background: var(--surface-hover, #f3f4f6);
+}
+
+.lc-config__dev-icon-toggle__btn--active {
+  background: var(--surface-action-subtle, #eff6ff);
 }
 
 /* ----- Style tab ---------------------------------------------------------- */
