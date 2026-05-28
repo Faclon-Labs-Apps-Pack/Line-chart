@@ -153,19 +153,47 @@ export function useUNSTree(authentication?: string): UseUNSTreeResult {
 
   async function loadWorkspaces() {
     // _cache.workspaces === null means not yet fetched; {} means fetched but empty — both are valid.
-    if (!authentication || _cache.workspaces !== null) return;
+    if (!authentication) {
+      console.warn(
+        '[UNS] loadWorkspaces skipped — no auth token. ' +
+          'Authenticate first via the SSO URL: http://localhost:3000/?token=<SSO_TOKEN>',
+      );
+      return;
+    }
+    if (_cache.workspaces !== null) {
+      const count = Object.keys(_cache.workspaces).length;
+      console.log(
+        `[UNS] loadWorkspaces skipped — already cached (${count} workspace${count === 1 ? '' : 's'}).` +
+          (count === 0 ? ' If your account has workspaces, the previous fetch returned empty — try refreshing the page to re-fetch.' : ''),
+      );
+      return;
+    }
     setIsLoadingTree(true);
     try {
+      console.log('[UNS] fetching workspaces…');
       const nodes = await fetchUNSNodes(authentication, 'uns:_workspaces');
       const wsMap: Record<string, string> = {};
       for (const n of nodes) {
         if (n.type === 'Workspace' && n.name) wsMap[n.name] = n.id;
       }
-      console.log('[UNS] workspaces loaded:', Object.keys(wsMap));
+      const count = Object.keys(wsMap).length;
+      if (count === 0) {
+        console.warn(
+          '[UNS] workspace fetch returned 0 workspaces. ' +
+            `Total nodes returned: ${nodes.length}. ` +
+            'If you expect workspaces, check that the auth token belongs to an account with UNS access.',
+        );
+      } else {
+        console.log(`[UNS] workspaces loaded (${count}):`, Object.keys(wsMap));
+      }
       _cache.workspaces = wsMap;
       _notifyAll();
     } catch (err) {
-      console.error('[UNS] workspace fetch failed:', err);
+      console.error(
+        '[UNS] workspace fetch failed:',
+        err,
+        '— check Network tab for the /account/uns/nodes request',
+      );
     } finally {
       setIsLoadingTree(false);
     }

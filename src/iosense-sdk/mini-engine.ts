@@ -75,6 +75,28 @@ export async function resolve(
       resolution,
     );
     const data: DataEntry[] = items.map((item) => ({ key: item.key, value: item.value }));
+    // Diagnostic — summarize series payload shape per key so we can see the
+    // backend's actual slot count + resolution for each binding.
+    console.log(
+      '[MiniEngine] response →',
+      data.map((d) => {
+        if (d.value && typeof d.value === 'object' && '__type' in d.value) {
+          const p = d.value as { __type: string; slots?: { from: number; to: number; value: number | null }[]; meta?: { aggregation?: { resolution?: string } } };
+          return {
+            key: d.key,
+            slotCount: p.slots?.length ?? 0,
+            firstSlot: p.slots?.[0]
+              ? { from: new Date(p.slots[0].from).toISOString(), value: p.slots[0].value }
+              : null,
+            lastSlot: p.slots?.[p.slots.length - 1]
+              ? { from: new Date(p.slots[p.slots.length - 1].from).toISOString(), value: p.slots[p.slots.length - 1].value }
+              : null,
+            resolution: p.meta?.aggregation?.resolution ?? null,
+          };
+        }
+        return { key: d.key, scalar: d.value };
+      }),
+    );
     return { config: envelope.uiConfig, data };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

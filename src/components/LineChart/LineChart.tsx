@@ -1,7 +1,23 @@
-import { useState, useMemo } from 'react';
-import { Settings, Database } from 'react-feather';
+import { useState, useMemo, useRef } from 'react';
+import { Settings, AlertCircle, Info, Menu, ChevronDown } from 'react-feather';
+import type Highcharts from 'highcharts';
 import { LineChart as DSLineChart } from '@faclon-labs/design-sdk/LineChart';
-import { DatePicker, SelectInput, DropdownMenu, ActionListItem } from '@faclon-labs/design-sdk';
+import { exportChart } from '@faclon-labs/design-sdk/Chart';
+import type { ChartPointClickContext } from '@faclon-labs/design-sdk/Chart';
+import {
+  DatePicker,
+  SelectInput,
+  DropdownMenu,
+  ActionListItem,
+  IconButton,
+  Checkbox,
+} from '@faclon-labs/design-sdk';
+import { Popover, PopoverHeader, PopoverBody } from '@faclon-labs/design-sdk/Popover';
+import { EmptyState } from '@faclon-labs/design-sdk/EmptyState';
+import { Spinner } from '@faclon-labs/design-sdk/Spinner';
+// SDK 0.6.1 only ships NoDataOneIllustration in dist; the other illustrations
+// have package.json subpath entries but no JS bundle. Fall back to feather icons.
+import { NoDataOneIllustration } from '@faclon-labs/design-sdk/EmptyState/illustrations/NoDataOneIllustration';
 import {
   DataEntry,
   WidgetEvent,
@@ -315,27 +331,32 @@ function computeAnomalyOverlays(
   anomalies: LineChartAnomaly[],
   chartIdx: number,
   resolvedSeries: Array<{ id: string; slots: SeriesSlot[] }>,
+  /** Chart x-axis spine — these are the slot timestamps the chart actually plots
+   *  against. Anomaly pointData must align 1:1 with this list, NOT the target
+   *  series's own slot array (which may differ in length or ordering). */
+  categorySlots: SeriesSlot[],
   data: DataEntry[],
 ): unknown[] {
+  if (categorySlots.length === 0) return [];
+
   return anomalies.flatMap((anomaly, anomalyIdx) => {
-    const targetIdx = resolvedSeries.findIndex((s) => s.id === anomaly.applyToSeriesId);
-    const target = targetIdx >= 0 ? resolvedSeries[targetIdx] : undefined;
+    const target = resolvedSeries.find((s) => s.id === anomaly.applyToSeriesId);
     if (!target || target.slots.length === 0) return [];
 
-    // Build dual lookup for 'Existing' threshold series:
-    //  - timestamp map for exact-match alignment (primary)
-    //  - index array as fallback when from-timestamps differ between series
+    // Build a target-slot lookup keyed by `from` so we can resolve "target value
+    // at this category timestamp" in O(1). Highcharts renders by index into the
+    // chart's category array, so the anomaly series must be indexed the same.
+    const targetByTime = new Map<number, SeriesSlot>();
+    target.slots.forEach((sl) => { targetByTime.set(sl.from, sl); });
+
+    // Build threshold lookup for 'Existing' mode — also keyed by `from`.
     const thresholdByTime = new Map<number, number | null>();
-    const thresholdByIndex: (number | null)[] = [];
     if (anomaly.labelMode === 'Existing' && anomaly.existingSeriesId) {
       const src = resolvedSeries.find((s) => s.id === anomaly.existingSeriesId);
-      src?.slots.forEach((sl, i) => {
-        thresholdByTime.set(sl.from, sl.value);
-        thresholdByIndex[i] = sl.value;
-      });
+      src?.slots.forEach((sl) => { thresholdByTime.set(sl.from, sl.value); });
     }
 
-    // Pre-resolve scalar for 'NewSource' mode
+    // Pre-resolve scalar for 'NewSource' mode — single scalar threshold for all points.
     let newSourceValue: number | null = null;
     if (anomaly.labelMode === 'NewSource' && anomaly.newSourceTopic) {
       const key = `charts[${chartIdx}].anomalies[${anomalyIdx}].newSourceTopic`;
@@ -349,16 +370,20 @@ function computeAnomalyOverlays(
             : null;
     }
 
-    const pointData = target.slots.map((sl, i): number | null => {
-      if (sl.value === null) return null;
+    // pointData is built BY CATEGORY (i.e., the chart's x-axis spine).
+    // For each category timestamp, we look up the target value at that exact
+    // timestamp; if none exists or the threshold doesn't match, the slot is null
+    // so no marker is rendered at that x position.
+    const pointData = categorySlots.map((catSlot): number | null => {
+      const targetSlot = targetByTime.get(catSlot.from);
+      if (!targetSlot || targetSlot.value === null) return null;
 
       let threshold: number | null = null;
       if (anomaly.labelMode === 'Value') {
         threshold = anomaly.thresholdValue ?? null;
       } else if (anomaly.labelMode === 'Existing') {
-        // Primary: exact timestamp match; fallback: same array index
-        const byTime = thresholdByTime.get(sl.from);
-        threshold = byTime !== undefined ? byTime : (thresholdByIndex[i] ?? null);
+        const t = thresholdByTime.get(catSlot.from);
+        threshold = t !== undefined ? t : null;
       } else if (anomaly.labelMode === 'NewSource') {
         threshold = newSourceValue;
       }
@@ -370,10 +395,28 @@ function computeAnomalyOverlays(
         threshold = (anomaly.advanceM ?? 1) * threshold + (anomaly.advanceC ?? 0);
       }
 
-      return evalOperator(sl.value, anomaly.operator, threshold) ? sl.value : null;
+      return evalOperator(targetSlot.value, anomaly.operator, threshold) ? targetSlot.value : null;
     });
 
     if (pointData.every((p) => p === null)) return [];
+
+    // Debug — verify anomaly markers carry the EXACT slot.value at each
+    // category timestamp. Open the browser console: for every non-null
+    // anomaly point you should see the same y-value the main line plots.
+    if (typeof window !== 'undefined') {
+      const sample = categorySlots
+        .map((cs, i) => ({
+          catFrom: cs.from,
+          catLabel: cs.label,
+          lineValue: targetByTime.get(cs.from)?.value ?? null,
+          anomalyValue: pointData[i],
+        }))
+        .filter((row) => row.anomalyValue !== null);
+      console.log(
+        `[LineChart] anomaly "${anomaly.name}" markers (${sample.length}):`,
+        sample,
+      );
+    }
 
     // Use type:'line' with lineWidth:0 instead of type:'scatter'.
     // Scatter series in Highcharts are designed for continuous x-axes and do
@@ -416,14 +459,45 @@ const FALLBACK_STYLING: LineChartStyling = {
 };
 
 export function LineChart({ config, data, onEvent, timeConfig, error }: LineChartProps) {
+  // Highcharts instance — captured via onChartReady so the export action can
+  // serialize the chart to PNG/JPEG/SVG/CSV/XLSX via SDK's exportChart helper.
+  const chartInstanceRef = useRef<Highcharts.Chart | null>(null);
+  // Chart-level runtime view settings — exposed via the Settings popover, modeled
+  // after the SDK reference (Time Control + Chart Control groups). Local state:
+  // resets on remount, doesn't pollute the envelope. Each maps to a real
+  // <LineChart> prop from the design-sdk.
+  const [chartSettings, setChartSettings] = useState({
+    timeDrilldown: false,     // → onPointClick handler
+    showLegend: true,         // → showLegend
+    showMarkers: false,       // → showMarkers
+    showDataLabels: false,    // → showDataLabels
+    scrollable: false,        // → scrollable
+    zoomable: true,           // → zoomable
+  });
+  function updateSetting<K extends keyof typeof chartSettings>(
+    key: K,
+    value: (typeof chartSettings)[K],
+  ) {
+    setChartSettings((s) => ({ ...s, [key]: value }));
+  }
+  // Local active-chart override — lets the user switch between charts at runtime
+  // via the title dropdown without round-tripping through the configurator.
+  const [activeChartOverride, setActiveChartOverride] = useState<string | null>(null);
+  const [titleDropdownOpen, setTitleDropdownOpen] = useState(false);
   const styling: LineChartStyling = (() => {
     const s = config?.style as unknown;
     if (s && typeof s === 'object' && 'card' in (s as object)) return s as LineChartStyling;
     return FALLBACK_STYLING;
   })();
 
-  const activeChart = pickActiveChart(config);
-  const chartIdx    = activeChartIndex(config);
+  // Apply the local override (set via the title dropdown when multi-chart) to
+  // both lookups, falling back to envelope-driven activeChartId.
+  const effectiveConfig =
+    activeChartOverride && config?.charts?.some((c) => c._id === activeChartOverride)
+      ? { ...config, activeChartId: activeChartOverride }
+      : config;
+  const activeChart = pickActiveChart(effectiveConfig);
+  const chartIdx    = activeChartIndex(effectiveConfig);
 
   // Time picker state
   const presetOptions = useMemo(
@@ -505,17 +579,20 @@ export function LineChart({ config, data, onEvent, timeConfig, error }: LineChar
   ) : undefined;
 
   function renderStateCard(
-    icon: React.ReactNode,
+    illustration: React.ReactNode,
     title: string,
-    subtitle: string,
+    description: string,
   ) {
     return (
       <div className="line-chart line-chart--card">
         {filtersSlot}
         <div className="line-chart__state-body">
-          {icon}
-          <p className="line-chart__empty-title BodyMediumSemibold">{title}</p>
-          <p className="line-chart__empty-subtitle BodySmallRegular">{subtitle}</p>
+          <EmptyState
+            illustration={illustration}
+            title={title}
+            description={description}
+            size="Medium"
+          />
         </div>
       </div>
     );
@@ -525,11 +602,12 @@ export function LineChart({ config, data, onEvent, timeConfig, error }: LineChar
   if (!activeChart || chartIdx < 0) {
     return (
       <div className="line-chart line-chart--card line-chart__empty">
-        <Settings size={28} className="line-chart__empty-icon" />
-        <p className="line-chart__empty-title BodyMediumSemibold">Widget not configured</p>
-        <p className="line-chart__empty-subtitle BodySmallRegular">
-          Add at least one data source to render this chart.
-        </p>
+        <EmptyState
+          illustration={<Settings size={48} />}
+          title="Widget not configured"
+          description="Add at least one data source to render this chart."
+          size="Medium"
+        />
       </div>
     );
   }
@@ -541,19 +619,17 @@ export function LineChart({ config, data, onEvent, timeConfig, error }: LineChar
   // Error state — surfaced from mini-engine (network, auth, invalid topic).
   // Shows BEFORE the loading skeleton so failures don't appear as infinite loading.
   if (error) {
-    return renderStateCard(
-      <Database size={28} className="line-chart__empty-icon" />,
-      "Couldn't load data",
-      error,
-    );
+    return renderStateCard(<AlertCircle size={48} />, "Couldn't load data", error);
   }
 
-  // Loading skeleton — bindings exist but data hasn't arrived yet.
+  // Loading state — bindings exist but data hasn't arrived yet.
   if (hasBindings && data.length === 0) {
     return (
       <div className="line-chart line-chart--card">
         {filtersSlot}
-        <div className="line-chart__skeleton" />
+        <div className="line-chart__state-body">
+          <Spinner size="Large" color="Brand" label="Loading data…" labelPosition="Bottom" />
+        </div>
       </div>
     );
   }
@@ -582,7 +658,7 @@ export function LineChart({ config, data, onEvent, timeConfig, error }: LineChar
   // No data for this time range — filters stay visible so user can adjust.
   if (categories.length === 0 && data.length > 0) {
     return renderStateCard(
-      <Database size={28} className="line-chart__empty-icon" />,
+      <NoDataOneIllustration />,
       'No data available',
       'The configured topics have not returned data for this time window.',
     );
@@ -596,10 +672,15 @@ export function LineChart({ config, data, onEvent, timeConfig, error }: LineChar
   const plotLines = [...configPlotLines, ...spcOverlays.plotLines];
   const plotBands = [...configPlotBands, ...spcOverlays.plotBands];
 
+  // categorySlots = the chart's x-axis spine (same slots as `categories` was
+  // derived from). Anomaly markers must index against this array, not the
+  // anomaly target series's own slots, to align with the rendered x-axis.
+  const categorySlots = firstWithSlots ? firstWithSlots.slots : [];
   const anomalyScatterSeries = computeAnomalyOverlays(
     activeChart.anomalies ?? [],
     chartIdx,
     resolvedSeries,
+    categorySlots,
     data,
   );
 
@@ -648,20 +729,237 @@ export function LineChart({ config, data, onEvent, timeConfig, error }: LineChar
         }
       : undefined;
 
+  // Duration label — rendered below the title via SDK's `duration` slot (with
+  // clock icon). Format: "Duration: <preset|date range> · <periodicity>".
+  const periodicityLabel =
+    PERIODICITY_OPTIONS.find((o) => o.value === periodicity)?.label ?? periodicity;
+  const durationLabel: string | undefined = (() => {
+    const presetName = selectedPreset
+      ? timeConfig?.allDurations?.find((d) => d.id === selectedPreset)?.label
+      : null;
+    if (presetName) return `Duration: ${presetName} · ${periodicityLabel}`;
+    if (rangeValue) {
+      const fmt = (d: Date) => d.toLocaleDateString();
+      return `Duration: ${fmt(rangeValue.start)} – ${fmt(rangeValue.end)} · ${periodicityLabel}`;
+    }
+    return undefined;
+  })();
+
+  // Y-axis unit — first source: default axis's yAxisLabel suffix; fallback: nothing.
+  const yAxisUnit = activeChart.defaultAxis?.yAxisLabel?.match(/\(([^)]+)\)\s*$/)?.[1];
+
+  // Time drilldown — when enabled, clicking a point bumps periodicity one
+  // level finer and re-centers the time window on the clicked slot.
+  function drillDown(p: string): string | null {
+    switch (p.toLowerCase()) {
+      case 'monthly': return 'weekly';
+      case 'weekly':  return 'daily';
+      case 'daily':   return 'hourly';
+      case 'hourly':  return 'minute';
+      default:        return null;
+    }
+  }
+  function handlePointClick(ctx: ChartPointClickContext) {
+    if (!chartSettings.timeDrilldown) return;
+    const slot = resolvedSeries[ctx.seriesIndex]?.slots[ctx.pointIndex];
+    if (!slot) return;
+    const next = drillDown(periodicity);
+    if (!next) return;
+    const start = new Date(slot.from);
+    const end = new Date(slot.to);
+    setRangeValue({ start, end });
+    setSelectedPreset('');
+    setPeriodicity(next as typeof periodicity);
+    emitTimeChange({ start, end }, next);
+  }
+
+  // Header actions — respect uiConfig.style.hideElements toggles.
+  const showInfo = !styling.hideElements.chartTitle && !!activeChart.description;
+  const showSettings = !styling.hideElements.settingsIcon;
+  const showExport = !styling.hideElements.exportIcon;
+
+  function doExport(format: 'PNG' | 'JPEG' | 'SVG' | 'CSV' | 'XLSX') {
+    if (!chartInstanceRef.current) return;
+    exportChart({
+      instance: chartInstanceRef.current,
+      engine: 'highcharts',
+      format,
+      fileName: activeChart?.title || 'chart',
+    });
+  }
+
+  // Actions slot — three IconButtons matching SDK ChartActions's exact composition
+  // (Info / Settings / Menu icons, size 16px). Each wrapped in a Popover so panels
+  // anchor to the icons — ChartActions itself doesn't expose refs.
+  const actionsSlot = (showInfo || showSettings || showExport) ? (
+    <div className="line-chart__actions">
+      {showInfo && (
+        <Popover
+          placement="Bottom End"
+          trigger={
+            <IconButton
+              icon={<Info size={16} />}
+              size="Medium"
+              accessibilityLabel="Info"
+            />
+          }
+        >
+          <PopoverHeader title={activeChart.title || 'Chart info'} showClose />
+          <PopoverBody description={activeChart.description || 'No description provided.'} />
+        </Popover>
+      )}
+      {showSettings && (
+        <Popover
+          placement="Bottom End"
+          trigger={
+            <IconButton
+              icon={<Settings size={16} />}
+              size="Medium"
+              accessibilityLabel="Settings"
+            />
+          }
+        >
+          <PopoverBody>
+            <div className="line-chart__settings-panel">
+              <div className="line-chart__settings-group">
+                <p className="line-chart__settings-group-title LabelSmallSemibold">Time Control</p>
+                <Checkbox
+                  label="Time drilldown"
+                  isChecked={chartSettings.timeDrilldown}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                    updateSetting('timeDrilldown', e.target.checked)
+                  }
+                />
+              </div>
+              <div className="line-chart__settings-group">
+                <p className="line-chart__settings-group-title LabelSmallSemibold">Chart Control</p>
+                <Checkbox
+                  label="Legends"
+                  isChecked={chartSettings.showLegend}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                    updateSetting('showLegend', e.target.checked)
+                  }
+                />
+                <Checkbox
+                  label="Markers"
+                  isChecked={chartSettings.showMarkers}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                    updateSetting('showMarkers', e.target.checked)
+                  }
+                />
+                <Checkbox
+                  label="Data Label"
+                  isChecked={chartSettings.showDataLabels}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                    updateSetting('showDataLabels', e.target.checked)
+                  }
+                />
+                <Checkbox
+                  label="Scroll Behavior"
+                  isChecked={chartSettings.scrollable}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                    updateSetting('scrollable', e.target.checked)
+                  }
+                />
+                <Checkbox
+                  label="Zoom"
+                  isChecked={chartSettings.zoomable}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                    updateSetting('zoomable', e.target.checked)
+                  }
+                />
+              </div>
+            </div>
+          </PopoverBody>
+        </Popover>
+      )}
+      {showExport && (
+        <Popover
+          placement="Bottom End"
+          trigger={
+            <IconButton
+              icon={<Menu size={16} />}
+              size="Medium"
+              accessibilityLabel="More"
+            />
+          }
+        >
+          <PopoverBody>
+            <DropdownMenu>
+              {(['PNG', 'JPEG', 'SVG', 'CSV', 'XLSX'] as const).map((fmt) => (
+                <ActionListItem
+                  key={fmt}
+                  title={`Export as ${fmt}`}
+                  onClick={() => doExport(fmt)}
+                />
+              ))}
+            </DropdownMenu>
+          </PopoverBody>
+        </Popover>
+      )}
+    </div>
+  ) : undefined;
+
+  // Title — when multiple charts exist, render as a clickable dropdown trigger
+  // (SDK pattern: titleHasDropdown + onTitleClick). The chart switch is a local
+  // override so the user can preview different charts without leaving the renderer.
+  const hasMultipleCharts = (config?.charts?.length ?? 0) > 1;
+  const titleNode: React.ReactNode = styling.hideElements.chartTitle
+    ? undefined
+    : hasMultipleCharts ? (
+        <Popover
+          placement="Bottom Start"
+          isOpen={titleDropdownOpen}
+          onOpenChange={setTitleDropdownOpen}
+          trigger={
+            <button type="button" className="line-chart__title-trigger">
+              <span className="HeadingSmallSemibold">{activeChart.title || 'Untitled chart'}</span>
+              <ChevronDown size={16} />
+            </button>
+          }
+        >
+          <PopoverBody>
+            <DropdownMenu>
+              {config?.charts?.map((c) => (
+                <ActionListItem
+                  key={c._id}
+                  title={c.title || 'Untitled chart'}
+                  selectionType="Single"
+                  isSelected={c._id === activeChart._id}
+                  onClick={() => {
+                    setActiveChartOverride(c._id);
+                    setTitleDropdownOpen(false);
+                  }}
+                />
+              ))}
+            </DropdownMenu>
+          </PopoverBody>
+        </Popover>
+      ) : (activeChart.title || undefined);
+
   return (
     <DSLineChart
-      title={activeChart.title || undefined}
+      title={titleNode}
+      duration={durationLabel}
       categories={categories}
       series={seriesForChart}
       bare={!styling.card.wrapInCard}
       smooth
-      showLegend
+      showLegend={chartSettings.showLegend}
+      showMarkers={chartSettings.showMarkers}
+      showDataLabels={chartSettings.showDataLabels}
+      scrollable={chartSettings.scrollable}
+      zoomable={chartSettings.zoomable}
       yAxisTitle={hasCustomAxes ? undefined : (activeChart.defaultAxis?.yAxisLabel || undefined)}
       xAxisTitle={activeChart.defaultAxis?.xAxisLabel || undefined}
+      yAxisUnit={yAxisUnit}
       plotLines={plotLines.length > 0 ? plotLines : undefined}
       plotBands={plotBands.length > 0 ? plotBands : undefined}
       highchartsOptions={highchartsOptions as never}
       filters={filtersSlot}
+      actions={actionsSlot}
+      onPointClick={chartSettings.timeDrilldown ? handlePointClick : undefined}
+      onChartReady={(instance) => { chartInstanceRef.current = instance; }}
     />
   );
 }

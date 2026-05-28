@@ -34,9 +34,12 @@ import {
   Switch,
   Checkbox,
   Divider,
+  Badge,
+  ListCard,
+  ListCardLeadingItem,
+  ListCardTrailingItem,
+  ComparisonToggle,
   TimeTabConfiguration,
-  Accordion,
-  AccordionItem,
   ProductAccordionItem,
 } from '@faclon-labs/design-sdk';
 import {
@@ -1207,26 +1210,37 @@ export function LineChartConfiguration({
                   // Empty state should render rows at full opacity with their `+`
                   // visible. Only grey-out when Chart Settings is being edited.
                   const disabled = inEditMode;
+                  const hasItems = hasCounter && count > 0;
                   return (
-                    <AccordionRow
+                    <ProductAccordionItem
                       key={s}
-                      section={s}
-                      count={hasCounter ? count : undefined}
-                      expanded={expanded && !disabled}
-                      disabled={disabled}
+                      title={s}
+                      // isActive controls chevron visibility — hide chevron until at least one item exists.
+                      isActive={hasItems}
+                      isExpanded={expanded && !disabled && hasItems}
+                      isDisabled={disabled}
+                      trailingIcon={
+                        hasItems
+                          ? <Badge label={String(count)} color="Neutral" emphasis="Subtle" size="Small" />
+                          : undefined
+                      }
+                      headerAction={
+                        !disabled
+                          ? <IconButton
+                              icon={<Plus size={14} />}
+                              size="Small"
+                              accessibilityLabel={`Add ${s}`}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (sectionKey !== 'Data Table') ensureChartExists();
+                                openAddPanel(sectionKey);
+                              }}
+                            />
+                          : undefined
+                      }
                       onToggle={() => {
-                        if (disabled) return;
+                        if (disabled || !hasItems) return;
                         toggleSection(s);
-                      }}
-                      onAdd={() => {
-                        if (disabled) return;
-                        // Data Table is widget-scope — no chart needed.
-                        // All other section adds need a chart to attach to;
-                        // auto-create "Chart 1" if the user is in Empty state.
-                        if (sectionKey !== 'Data Table') {
-                          ensureChartExists();
-                        }
-                        openAddPanel(sectionKey);
                       }}
                     >
                       {/* Body = list of item cards */}
@@ -1254,7 +1268,7 @@ export function LineChartConfiguration({
                         onOperatorChange={handleDataTableOperator}
                         onShowUnitChange={handleDataTableShowUnit}
                       />
-                    </AccordionRow>
+                    </ProductAccordionItem>
                   );
                 })}
               </div>
@@ -1882,87 +1896,6 @@ function ChartSettingsDisplayMode({
 }
 
 // ===========================================================================
-// Column 1: Accordion row (chevron + count + Plus)
-// ===========================================================================
-
-interface AccordionRowProps {
-  section: SectionKey;
-  count: number | undefined;
-  expanded: boolean;
-  disabled?: boolean;
-  onToggle: () => void;
-  onAdd: () => void;
-  children: React.ReactNode;
-}
-
-function AccordionRow({
-  section,
-  count,
-  expanded,
-  disabled,
-  onToggle,
-  onAdd,
-  children,
-}: AccordionRowProps) {
-  const hasItems = typeof count === 'number' && count > 0;
-  return (
-    <div
-      className={`lc-config__accordion-row${
-        expanded ? ' lc-config__accordion-row--expanded' : ''
-      }${disabled ? ' lc-config__section--disabled' : ''}`}
-    >
-      <div className="lc-config__accordion-row-head">
-        <button
-          type="button"
-          className="lc-config__accordion-row-label-btn"
-          onClick={hasItems ? onToggle : undefined}
-          disabled={disabled}
-        >
-          <span className="lc-config__accordion-row-label BodyMediumSemibold">
-            {section}
-          </span>
-          {!disabled && hasItems && (
-            <span className="lc-config__accordion-row-count LabelSmallRegular">
-              {count}
-            </span>
-          )}
-        </button>
-        <div className="lc-config__accordion-controls">
-          {!disabled && (
-            <IconButton
-              icon={<Plus size={14} />}
-              size="Small"
-              accessibilityLabel={`Add ${section}`}
-              onClick={onAdd}
-            />
-          )}
-          {hasItems && (
-            <IconButton
-              icon={
-                <ChevronDown
-                  size={14}
-                  style={{
-                    transform: expanded ? 'rotate(180deg)' : 'rotate(0deg)',
-                    transition: 'transform 160ms ease',
-                  }}
-                />
-              }
-              size="Small"
-              accessibilityLabel={expanded ? `Collapse ${section}` : `Expand ${section}`}
-              isDisabled={disabled}
-              onClick={onToggle}
-            />
-          )}
-        </div>
-      </div>
-      {expanded && !disabled && hasItems && (
-        <div className="lc-config__accordion-body">{children}</div>
-      )}
-    </div>
-  );
-}
-
-// ===========================================================================
 // Column 1: Item-card list per section
 // ===========================================================================
 
@@ -2490,20 +2423,29 @@ function AdvanceSettingsPortal({
                   No series in this chart yet — add one on the Data tab.
                 </p>
               ) : (
-                activeChart.series.map((s) => (
-                  <div key={s._id} className="lc-config__advance-settings__series-row">
-                    <span
-                      className="lc-config__advance-settings__series-name BodyMediumRegular"
-                      title={s.name || 'Series'}
-                    >
-                      {s.name || 'Series'}
-                    </span>
-                    <DeviationIconToggle
-                      value={s.deviationIndicator ?? globalDefault}
-                      onChange={(v) => onSeriesDeviationChange(activeChart._id, s._id, v)}
-                    />
-                  </div>
-                ))
+                activeChart.series.map((s) => {
+                  const mode = s.deviationIndicator ?? globalDefault;
+                  return (
+                    <div key={s._id} className="lc-config__advance-settings__series-row">
+                      <span
+                        className="lc-config__advance-settings__series-name BodyMediumRegular"
+                        title={s.name || 'Series'}
+                      >
+                        {s.name || 'Series'}
+                      </span>
+                      <ComparisonToggle
+                        value={mode === 'inverse' ? 'right' : 'left'}
+                        onValueChange={(v) =>
+                          onSeriesDeviationChange(
+                            activeChart._id,
+                            s._id,
+                            v === 'right' ? 'inverse' : 'standard',
+                          )
+                        }
+                      />
+                    </div>
+                  );
+                })
               )}
             </>
           )}
@@ -2511,39 +2453,6 @@ function AdvanceSettingsPortal({
       )}
     </div>,
     target,
-  );
-}
-
-// Small icon-only deviation indicator selector — used per-series in Advance
-// Settings. Matches the Figma "Comparison Toggle" (71x36) component.
-function DeviationIconToggle({
-  value,
-  onChange,
-}: {
-  value: DeviationIndicatorMode;
-  onChange: (v: DeviationIndicatorMode) => void;
-}) {
-  return (
-    <div className="lc-config__dev-icon-toggle">
-      <button
-        type="button"
-        className={`lc-config__dev-icon-toggle__btn${value === 'standard' ? ' lc-config__dev-icon-toggle__btn--active' : ''}`}
-        onClick={() => onChange('standard')}
-        aria-label="Green up, Red down"
-      >
-        <span className="lc-config__deviation-indicator__arrow--up-green">▲</span>
-        <span className="lc-config__deviation-indicator__arrow--down-red">▼</span>
-      </button>
-      <button
-        type="button"
-        className={`lc-config__dev-icon-toggle__btn${value === 'inverse' ? ' lc-config__dev-icon-toggle__btn--active' : ''}`}
-        onClick={() => onChange('inverse')}
-        aria-label="Red up, Green down"
-      >
-        <span className="lc-config__deviation-indicator__arrow--up-red">▲</span>
-        <span className="lc-config__deviation-indicator__arrow--down-green">▼</span>
-      </button>
-    </div>
   );
 }
 
@@ -2592,7 +2501,9 @@ function DeviationIndicatorSelector({
 }
 
 // ===========================================================================
-// Generic item card (used inside expanded accordion bodies)
+// Generic item card — thin adapter around design-sdk's ListCard.
+// All visual primitives (swatch, title row, trailing trash icon) come from
+// ListCard + ListCardLeadingItem + ListCardTrailingItem.
 // ===========================================================================
 
 interface ItemCardProps {
@@ -2613,40 +2524,34 @@ function ItemCard({
   onRemove,
 }: ItemCardProps) {
   return (
-    <div
-      className={`lc-config__item-card${isActive ? ' lc-config__item-card--active' : ''}`}
-      role="button"
-      tabIndex={0}
+    <ListCard
+      title={title}
+      subtitle={subtitle}
+      isSelected={isActive}
       onClick={onClick}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onClick(); }
-      }}
-    >
-      <div className="lc-config__item-card-main">
-        {swatchColor && (
-          <span
-            className="lc-config__item-card-swatch"
-            style={{ background: swatchColor }}
-            aria-hidden
-          />
-        )}
-        <div className="lc-config__item-card-text">
-          <span className="lc-config__item-card-title">{title}</span>
-          {subtitle && (
-            <span className="lc-config__item-card-subtitle LabelSmallRegular">{subtitle}</span>
-          )}
-        </div>
-      </div>
-      <div className="lc-config__item-card-action" onClick={(e) => e.stopPropagation()}>
-        <IconButton
-          icon={<Trash2 size={14} />}
-          size="Medium"
-          emphasis="Subtle"
-          accessibilityLabel={`Remove ${title}`}
-          onClick={onRemove}
+      leadingItem={
+        swatchColor
+          ? <ListCardLeadingItem leading="Color" color={swatchColor} />
+          : undefined
+      }
+      trailingItems={
+        <ListCardTrailingItem
+          trailing="Icon"
+          icon={
+            <IconButton
+              icon={<Trash2 size={14} />}
+              size="Medium"
+              emphasis="Subtle"
+              accessibilityLabel={`Remove ${title}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                onRemove();
+              }}
+            />
+          }
         />
-      </div>
-    </div>
+      }
+    />
   );
 }
 

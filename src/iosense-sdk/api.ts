@@ -32,6 +32,20 @@ export async function resolveAndCompute(
     body.timeFrame = resolution;
     body.resolution = resolution;
   }
+  // Diagnostic log — confirms time window + resolution are actually sent on every call.
+  console.log('[API] resolveAndCompute →', {
+    startTime: new Date(startTime).toISOString(),
+    endTime: new Date(endTime).toISOString(),
+    durationMs: endTime - startTime,
+    resolution,
+    timeFrame: body.timeFrame,
+    bindingCount: config.length,
+    bindings: config.map((b) => ({
+      key: b.key,
+      type: 'type' in b ? b.type : 'scalar',
+      hasAggregation: 'aggregation' in b,
+    })),
+  });
   const res = await fetch(`${STAGING_BASE}/account/uns/resolveAndCompute`, {
     method: 'POST',
     headers: {
