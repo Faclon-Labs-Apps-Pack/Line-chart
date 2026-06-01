@@ -4,7 +4,7 @@
 .lc-config {
   display: flex;
   flex-direction: column;
-  background: var(--background-default-intense);
+  background: transparent;
 }
 
 /* ----- Shell (flex row containing Column 1 + optional Column 2) ----------- */
@@ -12,8 +12,7 @@
   display: flex;
   align-items: flex-start;
   gap: var(--spacing-03);
-  /* Page background shows through the gap between the two panels */
-  background: var(--background-default-subtle, #f0f2f4);
+  background: transparent;
   min-height: 100%;
 }
 
@@ -30,7 +29,7 @@
   overflow: hidden;
   border: var(--fds-border-default);
   border-radius: var(--global-border-radius-large, 8px);
-  background: var(--background-default-intense);
+  background: var(--background-surface-intense);
   position: sticky;
   top: 0;
 }
@@ -43,7 +42,7 @@
   padding: var(--spacing-04) var(--spacing-04);
   border-bottom: var(--fds-border-default);
   flex-shrink: 0;
-  background: var(--background-default-intense);
+  background: var(--background-surface-intense);
 }
 
 .lc-config__col1-header-title {
@@ -61,7 +60,7 @@
   padding: var(--spacing-03) var(--spacing-04) 0;
   border-bottom: var(--fds-border-subtle);
   flex-shrink: 0;
-  background: var(--background-default-intense);
+  background: var(--background-surface-intense);
 }
 
 /* Scrollable body */
@@ -75,7 +74,7 @@
 .lc-config__col1-footer {
   padding: var(--spacing-04) var(--spacing-04);
   border-top: var(--fds-border-default);
-  background: var(--background-default-intense);
+  background: var(--background-surface-intense);
   flex-shrink: 0;
 }
 
@@ -86,80 +85,49 @@
 }
 
 .lc-config__empty {
-  color: var(--text-default-tertiary);
+  color: var(--text-gray-tertiary);
   padding: var(--spacing-03);
   text-align: center;
 }
 
 /* ===========================================================================
-   Column 2 — sliding Add/Edit panel
+   Side-modal Add/Edit panel — replaces the old col2 flex item. Positioned
+   via SDK Modal positionX/positionY computed from the clicked accordion row.
    =========================================================================== */
-.lc-config__col2 {
+.lc-side-modal.fds-modal__backdrop--transparent {
+  pointer-events: auto;
+}
+
+.lc-side-modal .fds-modal {
+  width: 280px;
+  max-height: calc(100vh - var(--lc-anchor-y, 16px) - 16px);
   display: flex;
   flex-direction: column;
-  width: 280px;
-  min-width: 280px;
-  flex-shrink: 0;
-  /* Anchors to top, only as tall as content (up to viewport height) */
-  position: sticky;
-  top: 0;
-  height: auto;
-  max-height: 100vh;
   overflow: hidden;
-  background: var(--background-default-intense);
-  border: var(--fds-border-default);
-  border-radius: var(--global-border-radius-large, 8px);
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.10);
-  animation: lc-config__col2-slide-in 200ms ease;
 }
 
-@keyframes lc-config__col2-slide-in {
-  from {
-    transform: translateX(20px);
-    opacity: 0;
-  }
-  to {
-    transform: translateX(0);
-    opacity: 1;
-  }
-}
-
-.lc-config__col2-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: var(--spacing-04) var(--spacing-04);
-  border-bottom: var(--fds-border-default);
-  flex-shrink: 0;
-  background: var(--background-default-intense);
-}
-
-.lc-config__col2-header-title {
-  display: flex;
-  align-items: center;
-  gap: var(--spacing-02);
-  color: var(--text-default-primary);
-}
-
-.lc-config__col2-icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--text-default-secondary);
-}
-
-.lc-config__col2-body {
-  flex: 1;
-  min-height: 0;
+.lc-side-modal .fds-modal__body {
+  flex: 1 1 auto;
   overflow-y: auto;
-  padding: var(--spacing-04);
+  min-height: 0;
 }
 
-.lc-config__col2-footer {
-  padding: var(--spacing-04);
-  border-top: var(--fds-border-default);
-  background: var(--background-default-intense);
-  flex-shrink: 0;
+.lc-side-modal__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-04, 12px);
+}
+
+/* Popover z-index lifts — SelectInput / UNSPathInput / DropdownMenu inside the
+   modal must layer above the modal stacking context. */
+.fds-modal__backdrop .fds-select-input__popover,
+.fds-modal__backdrop .fds-uns-path-input__popover,
+.fds-modal__backdrop .fds-dropdown-menu {
+  z-index: var(--global-z-index-modal, 500);
+}
+
+.fds-uns-path-input__popover {
+  z-index: 9999 !important;
 }
 
 /* ----- Editor body --------------------------------------------------------- */
@@ -198,9 +166,9 @@
 
 /* ----- Hint (used by old form inline empty states inside Col-2) ------------ */
 .lc-config__hint {
-  color: var(--text-default-tertiary);
+  color: var(--text-gray-tertiary);
   padding: var(--spacing-03);
-  background: var(--background-default-subtle);
+  background: var(--background-surface-subtle);
   border-radius: var(--global-border-radius-medium);
 }
 
@@ -224,7 +192,7 @@
   padding: var(--spacing-03);
   border: var(--fds-border-subtle);
   border-radius: var(--global-border-radius-medium);
-  background: var(--background-default-subtle);
+  background: var(--background-surface-subtle);
 }
 
 .lc-config__sub-block-title {
@@ -344,7 +312,7 @@
   padding: var(--spacing-03);
   border: var(--fds-border-subtle);
   border-radius: var(--global-border-radius-medium);
-  background: var(--background-default-intense);
+  background: var(--background-surface-intense);
 }
 
 .lc-config__switch-label {
@@ -353,7 +321,7 @@
 
 /* ----- Time tab panel ----------------------------------------------------- */
 .lc-config__time-tab {
-  padding: var(--spacing-04);
+  padding: 0;
   overflow-y: auto;
 }
 
@@ -362,11 +330,11 @@
   display: flex;
   flex-direction: column;
   gap: var(--spacing-03, 8px);
-  padding: 0 var(--spacing-04, 16px) var(--spacing-04, 16px);
+  padding: 0;
 }
 
 .lc-config__deviation-indicator__caption {
-  color: var(--text-default-secondary, #6b7280);
+  color: var(--text-default-secondary);
   margin: 0;
 }
 
@@ -375,9 +343,9 @@
   align-items: center;
   gap: var(--spacing-03, 8px);
   padding: var(--spacing-03, 8px) var(--spacing-04, 12px);
-  background: var(--surface-default, #ffffff);
-  border: 1px solid var(--border-default, #e5e7eb);
-  border-radius: var(--border-radius-02, 6px);
+  background: var(--background-surface-intense);
+  border: 1px solid var(--border-gray-subtle);
+  border-radius: var(--global-border-radius-medium, 6px);
   cursor: pointer;
   text-align: left;
   font: inherit;
@@ -386,12 +354,12 @@
 }
 
 .lc-config__deviation-indicator__card:hover {
-  border-color: var(--border-strong, #9ca3af);
+  border-color: var(--border-gray-default);
 }
 
 .lc-config__deviation-indicator__card--active {
-  border-color: var(--border-action, #2563eb);
-  background: var(--surface-action-subtle, #eff6ff);
+  border-color: var(--border-brand-default);
+  background: var(--background-brand-secondary);
 }
 
 .lc-config__deviation-indicator__icons {
@@ -402,13 +370,13 @@
   line-height: 1;
 }
 
-.lc-config__deviation-indicator__arrow--up-green   { color: #16a34a; }
-.lc-config__deviation-indicator__arrow--down-red   { color: #dc2626; }
-.lc-config__deviation-indicator__arrow--up-red     { color: #dc2626; }
-.lc-config__deviation-indicator__arrow--down-green { color: #16a34a; }
+.lc-config__deviation-indicator__arrow--up-green   { color: var(--text-positive-default); }
+.lc-config__deviation-indicator__arrow--down-red   { color: var(--text-error-default); }
+.lc-config__deviation-indicator__arrow--up-red     { color: var(--text-error-default); }
+.lc-config__deviation-indicator__arrow--down-green { color: var(--text-positive-default); }
 
 .lc-config__deviation-indicator__label {
-  color: var(--text-default-primary, #111827);
+  color: var(--text-default-primary);
   line-height: 1.3;
 }
 
@@ -422,7 +390,7 @@
 .lc-config__advance-settings {
   display: flex;
   flex-direction: column;
-  padding: 0 var(--spacing-04, 16px);
+  padding: 0;
 }
 
 .lc-config__advance-settings__toggle-row {
@@ -434,7 +402,7 @@
 }
 
 .lc-config__advance-settings__label {
-  color: var(--text-default-primary, #111827);
+  color: var(--text-default-primary);
 }
 
 .lc-config__advance-settings__body {
@@ -447,7 +415,7 @@
 .lc-config__advance-settings__chart-tabs {
   display: flex;
   gap: 0;
-  border-bottom: 1px solid var(--border-default, #e5e7eb);
+  border-bottom: var(--fds-border-subtle);
   margin-bottom: var(--spacing-03, 8px);
 }
 
@@ -458,17 +426,17 @@
   padding: var(--spacing-02, 6px) var(--spacing-04, 12px);
   cursor: pointer;
   font: inherit;
-  color: var(--text-default-secondary, #6b7280);
+  color: var(--text-default-secondary);
   transition: color 120ms ease, border-color 120ms ease;
 }
 
 .lc-config__advance-settings__chart-tab:hover {
-  color: var(--text-default-primary, #111827);
+  color: var(--text-default-primary);
 }
 
 .lc-config__advance-settings__chart-tab--active {
-  color: var(--text-action, #2563eb);
-  border-bottom-color: var(--text-action, #2563eb);
+  color: var(--text-brand-default);
+  border-bottom-color: var(--text-brand-default);
 }
 
 .lc-config__advance-settings__series-row {
@@ -485,11 +453,11 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--text-default-primary, #111827);
+  color: var(--text-default-primary);
 }
 
 .lc-config__advance-settings__empty {
-  color: var(--text-default-secondary, #6b7280);
+  color: var(--text-default-secondary);
   text-align: center;
   padding: var(--spacing-03, 8px) 0;
 }
@@ -584,7 +552,7 @@
 }
 
 .lc-config__chart-settings--editing {
-  background: var(--background-default-subtle);
+  background: var(--background-surface-intense);
 }
 
 .lc-config__chart-settings-header {
@@ -635,7 +603,7 @@
 }
 
 .lc-config__ro-field-input {
-  background: var(--background-default-intense, #ffffff);
+  background: var(--background-surface-intense);
   border: 1px solid var(--border-gray-default, #c8cdd0);
   border-radius: var(--global-border-radius-medium, 4px);
   height: 36px;
@@ -653,7 +621,7 @@
 }
 
 .lc-config__ro-field-placeholder {
-  color: var(--text-default-tertiary, #768ea7);
+  color: var(--text-gray-tertiary);
 }
 
 .lc-config__chart-settings-save-inline {

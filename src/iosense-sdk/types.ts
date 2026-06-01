@@ -297,13 +297,35 @@ export type {
   GTPCycleTimeConfig,
 };
 
-// Not publicly re-exported by the SDK index — kept local. Shape mirrors the
-// SDK's internal types (see node_modules/@faclon-labs/design-sdk/.../types.d.ts).
+// Not publicly re-exported by the SDK index — mirrored from the SDK's internal
+// types (see node_modules/@faclon-labs/design-sdk/.../TimeTabConfiguration/types.d.ts).
 export type GTPTimeType = 'fixed' | 'local' | 'global';
 
 export interface GTPGlobalTimepicker {
   id: string;
   name: string;
+  timezone?: string;
+  cycleTime?: GTPCycleTimeConfig;
+  allDurations?: GTPPreset[];
+  defaultDurationId?: string;
+  shifts?: GTPShift[];
+  shiftAggregator?: string;
+  comparisonMode?: boolean;
+  futureDaysAllowed?: string;
+}
+
+// Mirrors the SDK's GTPChartSource / GTPChart — passed to TimeTabConfiguration
+// via its `charts` prop so the SDK can render the per-source deviation override
+// section natively when Comparison Mode + Advance Settings are both on.
+export interface GTPChartSource {
+  id: string;
+  name: string;
+}
+
+export interface GTPChart {
+  id: string;
+  name: string;
+  sources: GTPChartSource[];
 }
 
 export interface LineChartEnvelope {

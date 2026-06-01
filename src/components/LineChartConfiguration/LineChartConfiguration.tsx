@@ -63,6 +63,7 @@ import {
   AnomalyLabelMode,
   TimeTabUIConfig,
   GTPGlobalTimepicker,
+  GTPChart,
   DataTableConfig,
   DataTableColumn,
   DataTableSourceMode,
@@ -465,6 +466,18 @@ const SECTION_ADD_LABEL: Record<Exclude<SectionKey, 'Chart Settings'>, string> =
   'Data Table': 'Data Source',
 };
 
+// Section -> expected fully-expanded editor body height. Used to clamp the
+// modal's vertical anchor so it never overflows the viewport on first paint.
+const SECTION_EST_HEIGHT: Record<Exclude<SectionKey, 'Chart Settings'>, number> = {
+  'Data Source': 540,
+  'Statistical Process Control': 720,
+  'Anomaly Highlighting': 540,
+  Axis: 540,
+  'Plot Line': 720,
+  'Plot Band': 540,
+  'Data Table': 540,
+};
+
 // Column-2 control surface: the active editor reports its current submit
 // callback + validity to the shell so the sticky footer can drive submission.
 interface EditorBinding {
@@ -506,6 +519,19 @@ export function LineChartConfiguration({
 
   // Column-2 add/edit state. null = column 2 hidden.
   const [addPanel, setAddPanel] = useState<AddPanelState | null>(null);
+
+  // Side-modal anchor — recomputed on every open from the clicked accordion row.
+  // x sits 20px right of the .app__config column; y aligns to the row header,
+  // clamped so the modal fits within the viewport. The CSS var --lc-anchor-y
+  // is set on <html> so the modal's max-height can react without re-renders.
+  const [modalAnchor, setModalAnchor] = useState<{ x: number; y: number }>({ x: 316, y: 120 });
+
+  // .lc-config root — used to walk up to .app__config for x-anchor calculation.
+  const rootRef = useRef<HTMLDivElement | null>(null);
+
+  // Per-section row container refs — readable from openAddPanel/openEditPanel
+  // to locate the clicked accordion header for y-anchor calculation.
+  const rowRefs = useRef<Record<string, HTMLDivElement | null>>({});
 
   // The active editor's submit binding (kept in sync via setEditorBinding).
   const [editorBinding, setEditorBinding] = useState<EditorBinding | null>(null);
@@ -600,6 +626,19 @@ export function LineChartConfiguration({
   const hasChart = charts.length > 0;
   const inEditMode = chartEditMode || newChartDraft;
 
+  // Derived: GTPChart[] view of local charts — passed to TimeTabConfiguration's
+  // `charts` prop (SDK 0.6.5+) so the SDK can render the per-source deviation
+  // override section natively when Comparison Mode + Advance Settings are on.
+  const gtpCharts = useMemo<GTPChart[]>(
+    () =>
+      charts.map((c) => ({
+        id: c._id,
+        name: c.title,
+        sources: c.series.map((s) => ({ id: s._id, name: s.name })),
+      })),
+    [charts],
+  );
+
   function emit(
     overrides?: Partial<{
       charts: ChartInstance[];
@@ -686,8 +725,34 @@ export function LineChartConfiguration({
     });
   }
 
-  // ---- Column-2 open/close --------------------------------------------------
+  // ---- Side-modal anchor + open/close ---------------------------------------
+  const computeAnchorFromRef = useCallback(
+    (section: Exclude<SectionKey, 'Chart Settings'>) => {
+      const row = rowRefs.current[section];
+      const headerEl =
+        (row?.querySelector('.fds-pa-item__header') as HTMLElement | null) ?? row;
+      const anchorRect = headerEl?.getBoundingClientRect();
+      const panelEl =
+        (rootRef.current?.closest('.app__config') as HTMLElement | null) ??
+        rootRef.current;
+      const panelRect = panelEl?.getBoundingClientRect();
+      const estHeight = SECTION_EST_HEIGHT[section];
+      const x = (panelRect?.right ?? 0) + 20;
+      const margin = 16;
+      const vh = window.innerHeight;
+      let y = anchorRect?.top ?? margin;
+      if (y + estHeight + margin > vh) {
+        y = Math.max(margin, vh - estHeight - margin);
+      }
+      if (y < margin) y = margin;
+      setModalAnchor({ x, y });
+      document.documentElement.style.setProperty('--lc-anchor-y', `${y}px`);
+    },
+    [],
+  );
+
   function openAddPanel(section: Exclude<SectionKey, 'Chart Settings'>) {
+    computeAnchorFromRef(section);
     setAddPanel({ section, mode: 'add' });
     setEditorBinding(null);
   }
@@ -696,6 +761,7 @@ export function LineChartConfiguration({
     section: Exclude<SectionKey, 'Chart Settings'>,
     itemId: string,
   ) {
+    computeAnchorFromRef(section);
     setAddPanel({ section, mode: 'edit', itemId });
     setEditorBinding(null);
   }
@@ -1132,7 +1198,7 @@ export function LineChartConfiguration({
 
   // ---- Render ---------------------------------------------------------------
   return (
-    <div className="lc-config">
+    <div className="lc-config" ref={rootRef}>
       <div className="lc-config__shell">
         {/* Column 1: section accordion */}
         <div className="lc-config__col1">
@@ -1212,8 +1278,13 @@ export function LineChartConfiguration({
                   const disabled = inEditMode;
                   const hasItems = hasCounter && count > 0;
                   return (
-                    <ProductAccordionItem
+                    <div
                       key={s}
+                      ref={(el) => {
+                        rowRefs.current[sectionKey] = el;
+                      }}
+                    >
+                    <ProductAccordionItem
                       title={s}
                       // isActive controls chevron visibility — hide chevron until at least one item exists.
                       isActive={hasItems}
@@ -1269,6 +1340,7 @@ export function LineChartConfiguration({
                         onShowUnitChange={handleDataTableShowUnit}
                       />
                     </ProductAccordionItem>
+                    </div>
                   );
                 })}
               </div>
@@ -1278,8 +1350,9 @@ export function LineChartConfiguration({
               <div className="lc-config__time-tab" ref={timeTabRef}>
                 <TimeTabConfiguration
                   value={timeTabConfig}
-                  onChange={(v) => handleTimeConfigChange(v as TimeTabUIConfig)}
+                  onChange={handleTimeConfigChange}
                   globalTimepickers={globalTimepickers}
+                  charts={gtpCharts}
                 />
                 <DeviationIndicatorPortal
                   scope={timeTabRef}
@@ -1333,25 +1406,44 @@ export function LineChartConfiguration({
           )}
         </div>
 
-        {/* Column 2: sliding Add/Edit panel */}
-        {addPanel && (
-          <div className="lc-config__col2" role="dialog" aria-label={addPanelSubmitLabel}>
-            <div className="lc-config__col2-header">
-              <div className="lc-config__col2-header-title">
-                <span className="BodyMediumSemibold">
-                  {addPanel.mode === 'edit' ? 'Edit ' : 'Add '}
-                  {SECTION_ADD_LABEL[addPanel.section]}
-                </span>
-              </div>
-              <IconButton
-                icon={<X size={16} />}
-                size="Small"
-                accessibilityLabel="Close panel"
-                onClick={closeAddPanel}
-              />
-            </div>
+      </div>
 
-            <div className="lc-config__col2-body">
+      {/* Side-modal Add/Edit panel — positioned 20px to the right of the
+          .app__config column, anchored to the clicked accordion row. */}
+      {addPanel && (
+        <Modal
+          {...({ transparent: true } as any)}
+          isOpen={true}
+          onClose={closeAddPanel}
+          positionX={modalAnchor.x}
+          positionY={modalAnchor.y}
+          className="lc-side-modal"
+          header={
+            <ModalHeader
+              title={`${addPanel.mode === 'edit' ? 'Edit ' : 'Add '}${SECTION_ADD_LABEL[addPanel.section]}`}
+              onClose={closeAddPanel}
+            />
+          }
+          footer={
+            <ModalFooter
+              stacking="Vertical"
+              primaryAction={
+                <Button
+                  variant="Secondary"
+                  color="Primary"
+                  size="Small"
+                  isFullWidth
+                  label={addPanelSubmitLabel}
+                  onClick={() => {
+                    if (editorBinding && editorBinding.isValid) editorBinding.submit();
+                  }}
+                />
+              }
+            />
+          }
+        >
+          <ModalBody>
+            <div className="lc-side-modal__body">
               {addPanel.section === 'Data Source' && (
                 <DataSourceEditor
                   // Key forces remount on item swap so internal state rehydrates cleanly.
@@ -1470,23 +1562,9 @@ export function LineChartConfiguration({
                 />
               )}
             </div>
-
-            <div className="lc-config__col2-footer">
-              <Button
-                variant="Primary"
-                color="Primary"
-                size="Medium"
-                isFullWidth
-                label={addPanelSubmitLabel}
-                isDisabled={!editorBinding || !editorBinding.isValid}
-                onClick={() => {
-                  if (editorBinding && editorBinding.isValid) editorBinding.submit();
-                }}
-              />
-            </div>
-          </div>
-        )}
-      </div>
+          </ModalBody>
+        </Modal>
+      )}
 
       {/* Confirm delete modal (shared across all CRUD sections) */}
       <ConfirmDeleteModal
