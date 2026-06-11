@@ -25,9 +25,10 @@
   width: 280px;
   min-width: 280px;
   flex-shrink: 0;
-  height: 100vh;
+  /* Fill the viewport minus the .app wrapper's top+bottom padding so the
+     panel (and its sticky footer) stays fully visible without overflow. */
+  height: calc(100vh - 2 * var(--spacing-05, 16px));
   overflow: hidden;
-  border: var(--fds-border-default);
   border-radius: var(--global-border-radius-large, 8px);
   background: var(--background-surface-intense);
   position: sticky;
@@ -130,6 +131,34 @@
   z-index: 9999 !important;
 }
 
+/* Per-source deviation section: hide the SDK's chart Tabs strip — we replace it
+   with a single-select "Chart" dropdown injected just before it. */
+.fds-ttc__per-source > .fds-tabs {
+  display: none !important;
+}
+.lc-config__per-source-chart-field {
+  margin-bottom: var(--spacing-04, 12px);
+}
+
+/* Time tab "Add Shift" / "Add Duration" panels are the SDK Modal in positioned
+   (transparent-backdrop) mode, which sits at --global-z-index-overlay (300) and
+   gets overlapped by the preview's popover-level chrome. Lift the panel above
+   every layer (match the Data-tab side modals). Its Hour/Minute SelectInput
+   dropdowns portal to <body>, so lift those even higher so they stay usable. */
+/* Every SDK modal backdrop — the Add Shift / Add Duration panels, the Delete
+   confirmation modal (Delete Shift / Delete Duration), and the Data-tab side
+   modals — must float above the preview. They all share `.fds-modal__backdrop`
+   and otherwise sit at the default overlay z-index (300), which the preview's
+   popover-level chrome (500) overlaps. Lift them all; their inner SelectInput
+   dropdowns portal to <body>, so keep those higher still to stay usable. */
+.fds-modal__backdrop {
+  z-index: 9000 !important;
+}
+.fds-select-input__popover,
+.fds-color-input__popover {
+  z-index: 9999 !important;
+}
+
 /* ----- Editor body --------------------------------------------------------- */
 .lc-config__editor {
   display: flex;
@@ -206,7 +235,7 @@
   display: grid;
   grid-template-columns: 1fr 1fr auto;
   gap: var(--spacing-02);
-  align-items: end;
+  align-items: center;
 }
 
 .lc-config__date-row {
@@ -236,9 +265,13 @@
   gap: var(--spacing-04, 12px);
 }
 
-/* Stretch DatePicker (defaults to width: max-content in design-sdk) to fill the column. */
+/* Stretch DatePicker (defaults to width: max-content in design-sdk) to fill the
+   column — including the inner single-mode trigger + field, which keep
+   max-content width otherwise. */
 .lc-config__duration-group__fields .fds-datepicker,
-.lc-config__duration-group__fields .fds-datepicker__trigger-row {
+.lc-config__duration-group__fields .fds-datepicker__trigger-row,
+.lc-config__duration-group__fields .fds-date-trigger,
+.lc-config__duration-group__fields .fds-date-trigger__field {
   width: 100%;
   max-width: 100%;
 }
@@ -271,6 +304,23 @@
   flex-direction: column;
   gap: var(--spacing-04, 12px);
   padding-top: var(--spacing-02, 4px);
+}
+
+/* Plotline "Style" accordion: drop the SDK accordion body's horizontal padding
+   so Line Width / Line Style align flush with the rest of the editor fields.
+   The SDK wraps content in `.fds-pa-item__body-inner` (which holds the 16px
+   horizontal + bottom inset), so zero both the body and its inner wrapper. */
+.lc-config__plotline-style .fds-pa-item__body,
+.lc-config__plotline-style .fds-pa-item__body-inner {
+  padding-left: 0;
+  padding-right: 0;
+}
+/* Drop the body's bottom padding and the SDK's bottom divider line. */
+.lc-config__plotline-style .fds-pa-item__body-inner {
+  padding-bottom: 0;
+}
+.lc-config__plotline-style .fds-pa-item__body {
+  border-bottom: none;
 }
 
 /* ----- SPC accordion section body ----------------------------------------- */

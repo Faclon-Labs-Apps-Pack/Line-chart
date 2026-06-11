@@ -9,10 +9,7 @@ import {
   Plus,
   Trash2,
   Edit2,
-  Lock,
-  Unlock,
   ChevronDown,
-  Info,
 } from 'react-feather';
 import {
   Tabs,
@@ -41,6 +38,7 @@ import {
   ComparisonToggle,
   TimeTabConfiguration,
   ProductAccordionItem,
+  Tooltip,
 } from '@faclon-labs/design-sdk';
 import {
   LineChartEnvelope,
@@ -76,7 +74,10 @@ import {
 import './LineChartConfiguration.css';
 
 interface LineChartConfigurationProps {
-  config: LineChartEnvelope | undefined;
+  // Optional: the host may mount the configurator before any envelope exists.
+  // All init reads via `config?.` + `normalizeLineChartUIConfig` defaults, and
+  // the resync effect is guarded by `if (config)`, so undefined is safe.
+  config?: LineChartEnvelope;
   authentication?: string;
   onChange: (config: LineChartEnvelope) => void;
   // Angular runtime injection — all-or-none; dev harness falls back to useUNSTree hook
@@ -208,9 +209,15 @@ const DEFAULT_DATA_TABLE: DataTableConfig = {
   enabled: false,
   columns: [],
   transposeTable: false,
-  operator: 'avg',
+  operators: ['avg'],
   showUnit: true,
 };
+
+// Read operators from a config, tolerating the legacy single `operator` field.
+function resolveDataTableOperators(dt: DataTableConfig): DataTableOperator[] {
+  if (dt.operators && dt.operators.length) return dt.operators;
+  return dt.operator ? [dt.operator] : ['avg'];
+}
 
 // Widget size preset dimensions (px). Custom is user-supplied.
 const SIZE_PRESETS: Record<StylingWidgetSize, { w?: number; h?: number; label: string }> = {
@@ -226,41 +233,49 @@ const FONT_WEIGHTS: StylingFontWeight[] = ['Regular', 'Medium', 'Semi-Bold', 'Bo
 const DEFAULT_STYLING: LineChartStyling = {
   size: { preset: 'Medium', customWidth: 880, customHeight: 400, lockAspectRatio: false },
   card: {
-    wrapInCard: true,
-    backgroundColor: '#EEEEEE',
+    wrapInCard: false,
+    backgroundColor: '#FFFFFF',
     borderColor: '#EEEEEE',
     borderWidth: 1,
     borderRadius: 8,
   },
   hideElements: { settingsIcon: false, exportIcon: false, chartTitle: false },
   advancedEnabled: false,
-  chartTitle: { fontSize: 20, fontColor: '#333333', fontWeight: 'Semi-Bold' },
-  xAxisLabel: { textColor: '#666666', lineColor: '#333333' },
-  yAxisLabel: { textColor: '#666666', lineColor: '#333333' },
+  chartTitle: { fontSize: 18, fontColor: '#050505', fontWeight: 'Semi-Bold' },
+  xAxisLabel: { textColor: '#050505', lineColor: '#DEE1E3', dataPointColor: '#050505' },
+  yAxisLabel: { textColor: '#050505', lineColor: '#333333', dataPointColor: '#050505' },
   dataTable: {
-    headerBackgroundColor: '#F5F5F5',
-    headerTextColor: '#999999',
-    headerTextSize: 16,
+    headerBackgroundColor: '#EEF0F1',
+    headerTextColor: '#616D75',
+    headerTextSize: 14,
     headerTextWeight: 'Semi-Bold',
-    dataPointTextSize: 18,
-    dataPointTextWeight: 'Medium',
-    dataPointTextColor: '#2F4256',
+    dataPointTextSize: 14,
+    dataPointTextWeight: 'Regular',
+    dataPointTextColor: '#292F32',
   },
-  misc: { gridLineColor: '#CCCCCC', legendTextColor: '#666666' },
+  misc: { gridLineColor: '#DEE1E3', legendTextColor: '#292F2E' },
 };
 
 function normalizeStyling(raw: unknown): LineChartStyling {
   if (raw && typeof raw === 'object') {
     const obj = raw as Record<string, unknown>;
     if ('size' in obj && 'advancedEnabled' in obj) {
-      return obj as unknown as LineChartStyling;
+      const styling = obj as unknown as LineChartStyling;
+      // Wrap Into Card defaults to off — only on when explicitly set true.
+      return {
+        ...styling,
+        card: {
+          ...styling.card,
+          wrapInCard: styling.card?.wrapInCard === true,
+        },
+      };
     }
     const card = (obj.card as Record<string, unknown> | undefined) ?? {};
     return {
       ...DEFAULT_STYLING,
       card: {
         ...DEFAULT_STYLING.card,
-        wrapInCard: typeof card.wrapInCard === 'boolean' ? card.wrapInCard : true,
+        wrapInCard: typeof card.wrapInCard === 'boolean' ? card.wrapInCard : false,
         backgroundColor:
           typeof card.bg === 'string' && card.bg.trim().length > 0
             ? card.bg
@@ -338,22 +353,45 @@ function migrateChartSpcs(chart: ChartInstance): ChartInstance {
   return { ...chart, spcs: chart.spcs.map((s) => migrateSpc(s)) };
 }
 
+// Normalize a single DataTableConfig (fills defaults + migrates the legacy
+// single `operator` to the `operators` array). Used for the per-chart data
+// table and the legacy widget-level mirror.
+function normalizeDataTable(raw: Partial<DataTableConfig> | undefined): DataTableConfig {
+  if (!raw) return { ...DEFAULT_DATA_TABLE };
+  return {
+    ...DEFAULT_DATA_TABLE,
+    ...raw,
+    operators:
+      raw.operators && raw.operators.length
+        ? raw.operators
+        : raw.operator
+          ? [raw.operator]
+          : DEFAULT_DATA_TABLE.operators,
+  };
+}
+
 function normalizeLineChartUIConfig(raw: unknown): LineChartUIConfig {
   const obj = (raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}) as Record<string, unknown>;
 
-  const rawDataTable = obj.dataTable as Partial<DataTableConfig> | undefined;
-  const dataTable: DataTableConfig = rawDataTable
-    ? { ...DEFAULT_DATA_TABLE, ...rawDataTable }
-    : DEFAULT_DATA_TABLE;
+  // Legacy widget-level data table (older configs stored one shared table).
+  // It's now per-chart — kept as a fallback so existing configs keep their
+  // table on charts that don't yet have their own.
+  const dataTable = normalizeDataTable(obj.dataTable as Partial<DataTableConfig> | undefined);
   const style = normalizeStyling(obj.style);
   const deviationIndicator: DeviationIndicatorMode =
     obj.deviationIndicator === 'inverse' ? 'inverse' : 'standard';
   const advanceSettings: boolean =
     typeof obj.advanceSettings === 'boolean' ? obj.advanceSettings : false;
 
-  // Already in new shape — pass through (still migrate inner SPC shape).
+  // Already in new shape — pass through (migrate inner SPC shape + per-chart
+  // data table; charts without their own table inherit the legacy widget one).
   if (Array.isArray(obj.charts)) {
-    const charts = (obj.charts as ChartInstance[]).map(migrateChartSpcs);
+    const charts = (obj.charts as ChartInstance[]).map((c) => ({
+      ...migrateChartSpcs(c),
+      dataTable: normalizeDataTable(
+        (c as { dataTable?: Partial<DataTableConfig> }).dataTable ?? dataTable,
+      ),
+    }));
     const activeChartId =
       typeof obj.activeChartId === 'string'
         ? obj.activeChartId
@@ -386,6 +424,8 @@ function normalizeLineChartUIConfig(raw: unknown): LineChartUIConfig {
       plotBands: Array.isArray(obj.plotBands) ? (obj.plotBands as LineChartPlotBand[]) : [],
       spcs: Array.isArray(obj.spcs) ? (obj.spcs as unknown[]).map(migrateSpc) : [],
       anomalies: Array.isArray(obj.anomalies) ? (obj.anomalies as LineChartAnomaly[]) : [],
+      // Old single-chart config — adopt the legacy widget-level data table.
+      dataTable,
     };
     return { charts: [chart], activeChartId: chart._id, dataTable, style, deviationIndicator, advanceSettings };
   }
@@ -395,11 +435,16 @@ function normalizeLineChartUIConfig(raw: unknown): LineChartUIConfig {
 }
 
 // Factory for a fresh ChartInstance.
-function newChart(title: string, description: string): ChartInstance {
+function newChart(
+  title: string,
+  description: string,
+  chartType: 'Aggregated' | 'Realtime' = 'Aggregated',
+): ChartInstance {
   return {
     _id: `chart_${Date.now()}`,
     title: title.trim(),
     description: description.trim() || undefined,
+    chartType,
     series: [],
     defaultAxis: { ...DEFAULT_DEFAULT_AXIS },
     axes: [],
@@ -407,6 +452,7 @@ function newChart(title: string, description: string): ChartInstance {
     plotBands: [],
     spcs: [],
     anomalies: [],
+    dataTable: { ...DEFAULT_DATA_TABLE },
   };
 }
 
@@ -436,7 +482,9 @@ type SectionKey =
 const SECTION_ORDER: SectionKey[] = [
   'Chart Settings',
   'Data Source',
-  'Statistical Process Control',
+  // 'Statistical Process Control', // Hidden for now — may be re-enabled later.
+  // All SPC code (SPCEditor, handlers, types, addPanel case) is kept intact;
+  // simply re-add this entry to restore the section in the accordion.
   'Anomaly Highlighting',
   'Axis',
   'Plot Line',
@@ -463,7 +511,7 @@ const SECTION_ADD_LABEL: Record<Exclude<SectionKey, 'Chart Settings'>, string> =
   Axis: 'Axis',
   'Plot Line': 'Plotline',
   'Plot Band': 'Plotband',
-  'Data Table': 'Data Source',
+  'Data Table': 'Data Table',
 };
 
 // Section -> expected fully-expanded editor body height. Used to clamp the
@@ -554,8 +602,6 @@ export function LineChartConfiguration({
   // Full styling config (widget-level).
   const [styling, setStyling] = useState<LineChartStyling>(initialUiConfig.style);
 
-  // Data Table config (widget-level).
-  const [dataTable, setDataTable] = useState<DataTableConfig>(initialUiConfig.dataTable);
 
   // Deviation indicator preference — only meaningful when comparison mode is on.
   const [deviationIndicator, setDeviationIndicator] = useState<DeviationIndicatorMode>(
@@ -576,6 +622,43 @@ export function LineChartConfiguration({
   // Ref to the Time tab wrapper; the portal uses it to inject the deviation
   // indicator selector directly after the SDK's Comparison Mode row.
   const timeTabRef = useRef<HTMLDivElement | null>(null);
+
+  // The Duration section's "add" button is rendered inside the SDK
+  // TimeTabConfiguration (aria-label "Add preset"), so it can't be wrapped in a
+  // <Tooltip> directly. Track its hover + position and render a controlled SDK
+  // Tooltip ("Add Duration") over it.
+  const [addDurTooltipRect, setAddDurTooltipRect] = useState<DOMRect | null>(null);
+  useEffect(() => {
+    const root = timeTabRef.current;
+    if (!root) return;
+    let btn: Element | null = null;
+    const onEnter = () => {
+      if (btn) setAddDurTooltipRect(btn.getBoundingClientRect());
+    };
+    const onLeave = () => setAddDurTooltipRect(null);
+    const attach = () => {
+      const found = root.querySelector('[aria-label="Add preset"]');
+      if (found && found !== btn) {
+        if (btn) {
+          btn.removeEventListener('mouseenter', onEnter);
+          btn.removeEventListener('mouseleave', onLeave);
+        }
+        btn = found;
+        btn.addEventListener('mouseenter', onEnter);
+        btn.addEventListener('mouseleave', onLeave);
+      }
+    };
+    attach();
+    const mo = new MutationObserver(attach);
+    mo.observe(root, { childList: true, subtree: true });
+    return () => {
+      mo.disconnect();
+      if (btn) {
+        btn.removeEventListener('mouseenter', onEnter);
+        btn.removeEventListener('mouseleave', onLeave);
+      }
+    };
+  }, [topTab]);
 
   // Full TimeTabConfiguration state — prefer timeTabConfig for re-hydration so the
   // component restores its exact UI state; fall back to timeConfig for older envelopes.
@@ -601,7 +684,6 @@ export function LineChartConfiguration({
       setCharts(next.charts);
       setActiveChartId(next.activeChartId);
       setStyling(next.style);
-      setDataTable(next.dataTable);
       setDeviationIndicator(next.deviationIndicator ?? 'standard');
       const tc = config.timeTabConfig ?? config.timeConfig;
       const shouldAutoOpen =
@@ -622,9 +704,92 @@ export function LineChartConfiguration({
     return charts.find((c) => c._id === activeChartId) ?? null;
   }, [charts, activeChartId]);
 
+  // Data Table is now PER-CHART: read/write the active chart's `dataTable`.
+  // `setDataTable` routes through updateActiveChart so the edit is scoped to the
+  // active chart (and emitted). `updateActiveChart` is hoisted (declared below).
+  const dataTable: DataTableConfig = activeChart?.dataTable ?? DEFAULT_DATA_TABLE;
+  const setDataTable = (next: DataTableConfig) =>
+    updateActiveChart((c) => ({ ...c, dataTable: next }));
+
   // Derived: hasChart + inEditMode — drive section disabling.
   const hasChart = charts.length > 0;
   const inEditMode = chartEditMode || newChartDraft;
+  // Active chart's type drives periodicity availability (Time tab + plotlines).
+  const activeChartIsRealtime = (activeChart?.chartType ?? 'Aggregated') === 'Realtime';
+
+  // The SDK TimeTabConfiguration has no prop to hide periodicity (its
+  // `disablePeriodicities` is type-only / a runtime no-op). When the active chart
+  // is Realtime, DOM-patch the Time tab + its Add/Edit Duration modal to hide all
+  // periodicity controls (the inputs carry stable `name`s; duration cards render a
+  // "Periodicity: …" subtitle). Shifts are left intact. Scoped + cheap; re-applies
+  // via MutationObserver since the modal is portal-rendered and the list re-renders.
+  useEffect(() => {
+    if (topTab !== 'Time' || !activeChartIsRealtime) return;
+    const hide = (el: Element | null) => {
+      if (el instanceof HTMLElement) el.style.display = 'none';
+    };
+    const patch = () => {
+      // Periodicity SelectInputs (Add/Edit Duration modal + fixed-time config).
+      document
+        .querySelectorAll('input[name="periodicity"], input[name="fixed-duration-periodicity"]')
+        .forEach((inp) => hide(inp.closest('.fds-ttc__required-select')));
+      // Duration-card "Periodicity: …" subtitles in the Time tab list.
+      const root = timeTabRef.current;
+      if (root) {
+        root.querySelectorAll('*').forEach((el) => {
+          if (
+            el.children.length === 0 &&
+            /^Periodicity:/.test(el.textContent?.trim() ?? '')
+          ) {
+            hide(el);
+          }
+        });
+      }
+    };
+    patch();
+    const mo = new MutationObserver(patch);
+    mo.observe(document.body, { childList: true, subtree: true });
+    return () => mo.disconnect();
+  }, [topTab, activeChartIsRealtime]);
+
+  // Single-open accordion behaviour for the Time tab (mirrors the Data tab).
+  // The SDK's TimeTabConfiguration renders uncontrolled ProductAccordionItems
+  // with no single-open prop, so we enforce it from the DOM: whenever an item
+  // gains the `--expanded` class, collapse every OTHER expanded accordion in
+  // the tab by clicking its header (skipping ancestors of the opened item so
+  // any nested accordion keeps its parent open). Closing an item removes its
+  // expanded class, so the observer doesn't recurse.
+  useEffect(() => {
+    if (topTab !== 'Time') return;
+    const root = timeTabRef.current;
+    if (!root) return;
+    let busy = false;
+    const collapseOthers = (opened: Element) => {
+      if (busy) return;
+      busy = true;
+      root.querySelectorAll('.fds-pa-item--expanded').forEach((el) => {
+        if (el === opened || el.contains(opened)) return; // keep self + ancestors
+        const header = el.querySelector(':scope > .fds-pa-item__header') as HTMLElement | null;
+        header?.click();
+      });
+      busy = false;
+    };
+    const obs = new MutationObserver((mutations) => {
+      for (const m of mutations) {
+        const target = m.target;
+        if (!(target instanceof HTMLElement)) continue;
+        if (
+          target.classList.contains('fds-pa-item') &&
+          target.classList.contains('fds-pa-item--expanded')
+        ) {
+          collapseOthers(target);
+          break;
+        }
+      }
+    });
+    obs.observe(root, { attributes: true, attributeFilter: ['class'], subtree: true });
+    return () => obs.disconnect();
+  }, [topTab]);
 
   // Derived: GTPChart[] view of local charts — passed to TimeTabConfiguration's
   // `charts` prop (SDK 0.6.5+) so the SDK can render the per-source deviation
@@ -718,10 +883,9 @@ export function LineChartConfiguration({
   // ---- Section expand/collapse ---------------------------------------------
   function toggleSection(s: SectionKey) {
     setExpandedSections((prev) => {
-      const next = new Set(prev);
-      if (next.has(s)) next.delete(s);
-      else next.add(s);
-      return next;
+      // Accordion behaves single-open: opening a section collapses the others.
+      if (prev.has(s)) return new Set();
+      return new Set([s]);
     });
   }
 
@@ -957,8 +1121,12 @@ export function LineChartConfiguration({
   // ---- Chart Settings mutators ---------------------------------------------
 
   // Save the State-1 first chart from the inline form.
-  function handleCreateFirstChart(title: string, description: string) {
-    const c = newChart(title, description);
+  function handleCreateFirstChart(
+    title: string,
+    description: string,
+    chartType: 'Aggregated' | 'Realtime',
+  ) {
+    const c = newChart(title, description, chartType);
     const nextCharts = [c];
     setCharts(nextCharts);
     setActiveChartId(c._id);
@@ -968,8 +1136,12 @@ export function LineChartConfiguration({
   }
 
   // Save the new-chart draft (Plus button flow in State 2/4).
-  function handleSaveNewChart(title: string, description: string) {
-    const c = newChart(title, description);
+  function handleSaveNewChart(
+    title: string,
+    description: string,
+    chartType: 'Aggregated' | 'Realtime',
+  ) {
+    const c = newChart(title, description, chartType);
     const nextCharts = [...charts, c];
     setCharts(nextCharts);
     setActiveChartId(c._id);
@@ -978,13 +1150,18 @@ export function LineChartConfiguration({
     emit({ charts: nextCharts, activeChartId: c._id });
   }
 
-  // Save edits to the active chart's title/description.
-  function handleSaveChartEdits(title: string, description: string) {
+  // Save edits to the active chart's title/description/type.
+  function handleSaveChartEdits(
+    title: string,
+    description: string,
+    chartType: 'Aggregated' | 'Realtime',
+  ) {
     if (!activeChartId) return;
     updateActiveChart((c) => ({
       ...c,
       title: title.trim(),
       description: description.trim() || undefined,
+      chartType,
     }));
     setChartEditMode(false);
   }
@@ -1008,35 +1185,35 @@ export function LineChartConfiguration({
   function handleDataTableEnable(enabled: boolean) {
     const next = { ...dataTable, enabled };
     setDataTable(next);
-    emit({ dataTable: next });
   }
   function handleDataTableTranspose(transposeTable: boolean) {
     const next = { ...dataTable, transposeTable };
     setDataTable(next);
-    emit({ dataTable: next });
   }
-  function handleDataTableOperator(operator: DataTableOperator) {
-    const next = { ...dataTable, operator };
+  function handleDataTableOperators(operators: DataTableOperator[]) {
+    // Drop the legacy single-operator field once the array drives selection.
+    const next = { ...dataTable, operators };
+    delete (next as Partial<DataTableConfig>).operator;
     setDataTable(next);
-    emit({ dataTable: next });
   }
   function handleDataTableShowUnit(showUnit: boolean) {
     const next = { ...dataTable, showUnit };
     setDataTable(next);
-    emit({ dataTable: next });
   }
-  function handleAddDataTableColumn(column: DataTableColumn) {
-    const next = { ...dataTable, columns: [...dataTable.columns, column] };
+  function handleAddDataTableColumns(columns: DataTableColumn[]) {
+    if (columns.length === 0) return;
+    const next = { ...dataTable, columns: [...dataTable.columns, ...columns] };
     setDataTable(next);
-    emit({ dataTable: next });
   }
-  function handleUpdateDataTableColumn(column: DataTableColumn) {
+  // Edit mode: replace the edited column in place with the submitted column(s).
+  // Multi-select Existing mode may yield extras, which are inserted at the same
+  // position so they appear next to the original.
+  function handleReplaceDataTableColumn(replaceId: string, columns: DataTableColumn[]) {
     const next = {
       ...dataTable,
-      columns: dataTable.columns.map((c) => (c._id === column._id ? column : c)),
+      columns: dataTable.columns.flatMap((c) => (c._id === replaceId ? columns : [c])),
     };
     setDataTable(next);
-    emit({ dataTable: next });
   }
   function handleRemoveDataTableColumn(id: string) {
     const next = {
@@ -1044,7 +1221,6 @@ export function LineChartConfiguration({
       columns: dataTable.columns.filter((c) => c._id !== id),
     };
     setDataTable(next);
-    emit({ dataTable: next });
     if (
       addPanel &&
       addPanel.mode === 'edit' &&
@@ -1250,6 +1426,9 @@ export function LineChartConfiguration({
                           setActiveChartId(id);
                           emit({ activeChartId: id });
                         }}
+                        onChangeChartType={(t) =>
+                          updateActiveChart((c) => ({ ...c, chartType: t }))
+                        }
                         onCreateFirstChart={handleCreateFirstChart}
                         onSaveNewChart={handleSaveNewChart}
                         onSaveEdits={handleSaveChartEdits}
@@ -1297,16 +1476,18 @@ export function LineChartConfiguration({
                       }
                       headerAction={
                         !disabled
-                          ? <IconButton
-                              icon={<Plus size={14} />}
-                              size="Small"
-                              accessibilityLabel={`Add ${s}`}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                if (sectionKey !== 'Data Table') ensureChartExists();
-                                openAddPanel(sectionKey);
-                              }}
-                            />
+                          ? <Tooltip bodyText={`Add ${SECTION_ADD_LABEL[sectionKey]}`} placement="Top">
+                              <IconButton
+                                icon={<Plus size={14} />}
+                                size="Small"
+                                accessibilityLabel={`Add ${s}`}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  if (sectionKey !== 'Data Table') ensureChartExists();
+                                  openAddPanel(sectionKey);
+                                }}
+                              />
+                            </Tooltip>
                           : undefined
                       }
                       onToggle={() => {
@@ -1336,7 +1517,7 @@ export function LineChartConfiguration({
                         }
                         onEnableTable={handleDataTableEnable}
                         onTransposeTable={handleDataTableTranspose}
-                        onOperatorChange={handleDataTableOperator}
+                        onOperatorChange={handleDataTableOperators}
                         onShowUnitChange={handleDataTableShowUnit}
                       />
                     </ProductAccordionItem>
@@ -1354,22 +1535,15 @@ export function LineChartConfiguration({
                   globalTimepickers={globalTimepickers}
                   charts={gtpCharts}
                 />
-                <DeviationIndicatorPortal
-                  scope={timeTabRef}
-                  enabled={!!timeTabConfig.comparisonMode}
-                  value={deviationIndicator}
-                  faded={!!timeTabConfig.comparisonMode && advanceSettings}
-                  onChange={handleDeviationIndicatorChange}
-                />
-                <AdvanceSettingsPortal
-                  scope={timeTabRef}
-                  enabled={!!timeTabConfig.comparisonMode}
-                  open={advanceSettings}
-                  onChange={handleAdvanceSettingsChange}
-                  charts={charts}
-                  onSeriesDeviationChange={handleSeriesDeviationChange}
-                  globalDefault={deviationIndicator}
-                />
+                {/* Deviation indicator + per-source "Advance Settings" are owned
+                    by the SDK Time tab natively (`fds-ttc__deviation` cards →
+                    timeTabConfig.deviationPattern / sourceDeviationOverrides),
+                    which the preview reads directly. Our duplicate
+                    `lc-config__deviation-indicator` and "Advance Settings"
+                    portals are removed. */}
+                {/* Replace the per-source chart Tabs with a single-select
+                    "Chart" dropdown (the SDK exposes no prop for this). */}
+                <PerSourceChartDropdownPortal scope={timeTabRef} charts={gtpCharts} />
               </div>
             )}
 
@@ -1377,33 +1551,6 @@ export function LineChartConfiguration({
               <StylingSection value={styling} onChange={handleStylingChange} />
             )}
           </div>
-
-          {/* Sticky footer (+ Add Chart). Visible in Empty state too — clicking
-             creates the first chart via the new-chart-draft sub-state. Visually
-             disabled (still mounted) while Chart Settings is in edit mode. */}
-          {topTab === 'Data' && (
-            <div
-              className={`lc-config__col1-footer${
-                inEditMode ? ' lc-config__col1-footer--disabled' : ''
-              }`}
-            >
-              <Button
-                variant="Secondary"
-                color="Primary"
-                size="Medium"
-                isFullWidth
-                leadingIcon={<Plus size={16} />}
-                label="Add Chart"
-                isDisabled={inEditMode}
-                onClick={() => {
-                  if (inEditMode) return;
-                  setNewChartDraft(true);
-                  setChartEditMode(false);
-                  if (addPanel) closeAddPanel();
-                }}
-              />
-            </div>
-          )}
         </div>
 
       </div>
@@ -1429,11 +1576,14 @@ export function LineChartConfiguration({
               stacking="Vertical"
               primaryAction={
                 <Button
-                  variant="Secondary"
+                  variant="Primary"
                   color="Primary"
                   size="Small"
                   isFullWidth
                   label={addPanelSubmitLabel}
+                  // Disabled until the active editor reports all required
+                  // fields filled (editorBinding is null until the editor mounts).
+                  isDisabled={!editorBinding || !editorBinding.isValid}
                   onClick={() => {
                     if (editorBinding && editorBinding.isValid) editorBinding.submit();
                   }}
@@ -1489,6 +1639,7 @@ export function LineChartConfiguration({
                   isLoadingTree={isLoadingTree}
                   loadWorkspaces={loadWorkspaces}
                   resolveUNSValue={resolveUNSValue}
+                  isRealtime={(activeChart?.chartType ?? 'Aggregated') === 'Realtime'}
                   onSubmit={(p) => {
                     if (addPanel.mode === 'edit') handleUpdatePlotLine(p);
                     else handleAddPlotLine(p);
@@ -1553,9 +1704,10 @@ export function LineChartConfiguration({
                   isLoadingTree={isLoadingTree}
                   loadWorkspaces={loadWorkspaces}
                   resolveUNSValue={resolveUNSValue}
-                  onSubmit={(c) => {
-                    if (addPanel.mode === 'edit') handleUpdateDataTableColumn(c);
-                    else handleAddDataTableColumn(c);
+                  onSubmit={(cols) => {
+                    if (addPanel.mode === 'edit')
+                      handleReplaceDataTableColumn(addPanel.itemId, cols);
+                    else handleAddDataTableColumns(cols);
                     closeAddPanel();
                   }}
                   onReady={setEditorBinding}
@@ -1609,6 +1761,26 @@ export function LineChartConfiguration({
         onCancel={() => setPendingDeleteChart(false)}
         onConfirm={handleDeleteActiveChart}
       />
+
+      {/* Controlled SDK Tooltip positioned over the Duration section's add
+          button (which lives inside the SDK TimeTabConfiguration). */}
+      {addDurTooltipRect && (
+        <Tooltip
+          open
+          bodyText="Add Duration"
+          placement="Top"
+          style={{
+            position: 'fixed',
+            top: addDurTooltipRect.top,
+            left: addDurTooltipRect.left,
+            width: addDurTooltipRect.width,
+            height: addDurTooltipRect.height,
+            pointerEvents: 'none',
+          }}
+        >
+          <span aria-hidden="true" style={{ display: 'block', width: '100%', height: '100%' }} />
+        </Tooltip>
+      )}
     </div>
   );
 }
@@ -1617,6 +1789,51 @@ export function LineChartConfiguration({
 // Column 1: Chart Settings 4-state block
 // ===========================================================================
 
+const CHART_TYPE_OPTIONS: Array<'Aggregated' | 'Realtime'> = ['Aggregated', 'Realtime'];
+
+// Chart Type single-select — shown in every Chart Settings state (create / edit /
+// display) so it's always available, not just after the first chart exists.
+function ChartTypeSelect({
+  value,
+  onChange,
+  disabled = false,
+}: {
+  value: 'Aggregated' | 'Realtime';
+  onChange: (v: 'Aggregated' | 'Realtime') => void;
+  disabled?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <SelectInput
+      label="Chart Type"
+      placeholder="Select chart type"
+      value={value}
+      isDisabled={disabled}
+      isOpen={disabled ? false : open}
+      onOpenChange={setOpen}
+      onClick={() => {
+        if (disabled) return;
+        setOpen((o) => !o);
+      }}
+    >
+      <DropdownMenu>
+        {CHART_TYPE_OPTIONS.map((opt) => (
+          <ActionListItem
+            key={opt}
+            title={opt}
+            selectionType="Single"
+            isSelected={value === opt}
+            onClick={() => {
+              onChange(opt);
+              setOpen(false);
+            }}
+          />
+        ))}
+      </DropdownMenu>
+    </SelectInput>
+  );
+}
+
 interface ChartSettingsBlockProps {
   charts: ChartInstance[];
   activeChart: ChartInstance | null;
@@ -1624,9 +1841,22 @@ interface ChartSettingsBlockProps {
   chartEditMode: boolean;
   newChartDraft: boolean;
   onSelectChart: (id: string) => void;
-  onCreateFirstChart: (title: string, description: string) => void;
-  onSaveNewChart: (title: string, description: string) => void;
-  onSaveEdits: (title: string, description: string) => void;
+  onChangeChartType: (chartType: 'Aggregated' | 'Realtime') => void;
+  onCreateFirstChart: (
+    title: string,
+    description: string,
+    chartType: 'Aggregated' | 'Realtime',
+  ) => void;
+  onSaveNewChart: (
+    title: string,
+    description: string,
+    chartType: 'Aggregated' | 'Realtime',
+  ) => void;
+  onSaveEdits: (
+    title: string,
+    description: string,
+    chartType: 'Aggregated' | 'Realtime',
+  ) => void;
   onEnterEditMode: () => void;
   onCancelEdit: () => void;
   onStartNewChart: () => void;
@@ -1641,6 +1871,7 @@ function ChartSettingsBlock({
   chartEditMode,
   newChartDraft,
   onSelectChart,
+  onChangeChartType,
   onCreateFirstChart,
   onSaveNewChart,
   onSaveEdits,
@@ -1660,24 +1891,33 @@ function ChartSettingsBlock({
   const [draftTitle, setDraftTitle] = useState<string>('');
   const [draftDescription, setDraftDescription] = useState<string>('');
 
+  // Local draft for State 1 (first chart) chart type.
+  const [draftChartType, setDraftChartType] = useState<'Aggregated' | 'Realtime'>('Aggregated');
+
   // Local draft for edit mode — rehydrate when entering edit OR when active chart switches.
   const [editTitle, setEditTitle] = useState<string>(activeChart?.title ?? '');
   const [editDescription, setEditDescription] = useState<string>(activeChart?.description ?? '');
+  const [editChartType, setEditChartType] = useState<'Aggregated' | 'Realtime'>(
+    activeChart?.chartType ?? 'Aggregated',
+  );
 
   useEffect(() => {
     if (chartEditMode) {
       setEditTitle(activeChart?.title ?? '');
       setEditDescription(activeChart?.description ?? '');
+      setEditChartType(activeChart?.chartType ?? 'Aggregated');
     }
   }, [chartEditMode, activeChartId, activeChart]);
 
   // Local draft for new-chart sub-state.
   const [newTitle, setNewTitle] = useState<string>('');
   const [newDescription, setNewDescription] = useState<string>('');
+  const [newChartType, setNewChartType] = useState<'Aggregated' | 'Realtime'>('Aggregated');
   useEffect(() => {
     if (newChartDraft) {
       setNewTitle('');
       setNewDescription('');
+      setNewChartType('Aggregated');
     }
   }, [newChartDraft]);
 
@@ -1701,6 +1941,7 @@ function ChartSettingsBlock({
             necessityIndicator="required"
             onChange={({ value }: { name: string; value: string }) => setDraftTitle(value)}
           />
+          <ChartTypeSelect value={draftChartType} onChange={setDraftChartType} />
           <TextInput
             label="Chart Description"
             labelPosition="top"
@@ -1720,7 +1961,7 @@ function ChartSettingsBlock({
               isFullWidth
               label="Save"
               onClick={() =>
-                onCreateFirstChart(draftTitle.trim(), draftDescription.trim())
+                onCreateFirstChart(draftTitle.trim(), draftDescription.trim(), draftChartType)
               }
             />
           </div>
@@ -1749,6 +1990,7 @@ function ChartSettingsBlock({
             necessityIndicator="required"
             onChange={({ value }: { name: string; value: string }) => setNewTitle(value)}
           />
+          <ChartTypeSelect value={newChartType} onChange={setNewChartType} />
           <TextInput
             label="Chart Description"
             labelPosition="top"
@@ -1775,7 +2017,7 @@ function ChartSettingsBlock({
             isDisabled={!canSave}
             onClick={() => {
               if (!canSave) return;
-              onSaveNewChart(newTitle.trim(), newDescription.trim());
+              onSaveNewChart(newTitle.trim(), newDescription.trim(), newChartType);
             }}
           />
         </div>
@@ -1814,6 +2056,9 @@ function ChartSettingsBlock({
             necessityIndicator="required"
             onChange={({ value }: { name: string; value: string }) => setEditTitle(value)}
           />
+          {/* Chart Type is locked while editing an existing chart — only the
+              title/description can change. */}
+          <ChartTypeSelect value={editChartType} onChange={setEditChartType} disabled />
           <TextInput
             label="Chart Description"
             labelPosition="top"
@@ -1840,7 +2085,7 @@ function ChartSettingsBlock({
             isDisabled={!canSave}
             onClick={() => {
               if (!canSave) return;
-              onSaveEdits(editTitle.trim(), editDescription.trim());
+              onSaveEdits(editTitle.trim(), editDescription.trim(), editChartType);
             }}
           />
         </div>
@@ -1859,6 +2104,7 @@ function ChartSettingsBlock({
       activeChart={activeChart}
       isMulti={isMulti}
       onSelectChart={onSelectChart}
+      onChangeChartType={onChangeChartType}
       onStartNewChart={onStartNewChart}
       onEnterEditMode={onEnterEditMode}
     />
@@ -1898,6 +2144,7 @@ interface ChartSettingsDisplayModeProps {
   activeChart: ChartInstance | null;
   isMulti: boolean;
   onSelectChart: (id: string) => void;
+  onChangeChartType: (chartType: 'Aggregated' | 'Realtime') => void;
   onStartNewChart: () => void;
   onEnterEditMode: () => void;
 }
@@ -1907,29 +2154,35 @@ function ChartSettingsDisplayMode({
   activeChart,
   isMulti,
   onSelectChart,
+  onChangeChartType,
   onStartNewChart,
   onEnterEditMode,
 }: ChartSettingsDisplayModeProps) {
   const [chartDropdownOpen, setChartDropdownOpen] = useState(false);
+  const chartType = activeChart?.chartType ?? 'Aggregated';
   return (
     <div className="lc-config__chart-settings">
       <div className="lc-config__chart-settings-header">
         <span className="BodySmallSemibold">Chart Settings</span>
         <div className="lc-config__chart-settings-header-actions">
-          <IconButton
-            icon={<Plus size={16} />}
-            size="Medium"
-            emphasis="Subtle"
-            accessibilityLabel="Add new chart"
-            onClick={onStartNewChart}
-          />
-          <IconButton
-            icon={<Edit2 size={16} />}
-            size="Medium"
-            emphasis="Subtle"
-            accessibilityLabel="Edit chart"
-            onClick={onEnterEditMode}
-          />
+          <Tooltip bodyText="Add New Chart" placement="Top">
+            <IconButton
+              icon={<Plus size={16} />}
+              size="Medium"
+              emphasis="Subtle"
+              accessibilityLabel="Add new chart"
+              onClick={onStartNewChart}
+            />
+          </Tooltip>
+          <Tooltip bodyText="Edit Chart" placement="Top">
+            <IconButton
+              icon={<Edit2 size={16} />}
+              size="Medium"
+              emphasis="Subtle"
+              accessibilityLabel="Edit chart"
+              onClick={onEnterEditMode}
+            />
+          </Tooltip>
         </div>
       </div>
       <div className="lc-config__chart-settings-body">
@@ -1964,6 +2217,7 @@ function ChartSettingsDisplayMode({
             required
           />
         )}
+        <ChartTypeSelect value={chartType} onChange={onChangeChartType} />
         <ReadOnlyField
           label="Chart Description"
           value={activeChart?.description ?? ''}
@@ -1992,7 +2246,7 @@ interface SectionItemListProps {
   onRemove: (id: string, title: string, message: string) => void;
   onEnableTable: (enabled: boolean) => void;
   onTransposeTable: (transpose: boolean) => void;
-  onOperatorChange: (op: DataTableOperator) => void;
+  onOperatorChange: (ops: DataTableOperator[]) => void;
   onShowUnitChange: (show: boolean) => void;
 }
 
@@ -2016,29 +2270,44 @@ function SectionItemList({
 }: SectionItemListProps) {
   const [dtOperatorOpen, setDtOperatorOpen] = useState(false);
 
+  const selectedOperators = resolveDataTableOperators(dataTable);
+  function toggleOperator(op: DataTableOperator) {
+    const next = selectedOperators.includes(op)
+      ? selectedOperators.filter((o) => o !== op)
+      : [...selectedOperators, op];
+    // Keep at least one operator selected.
+    onOperatorChange(next.length ? next : selectedOperators);
+  }
+  const operatorTags = selectedOperators.map((op) => ({
+    label: DATA_TABLE_OPERATOR_LABELS[op],
+    onDismiss: () => toggleOperator(op),
+  }));
+
   // Data Table is special — has section-level controls inline.
   if (section === 'Data Table') {
     return (
       <>
         <SelectInput
-          label="Operator *"
-          placeholder="Select operator"
-          value={DATA_TABLE_OPERATOR_LABELS[dataTable.operator || 'avg']}
+          label="Operator"
+          multiType="multiple"
+          isRequired
+          placeholder="Select operators"
+          tags={operatorTags}
           isOpen={dtOperatorOpen}
           onOpenChange={setDtOperatorOpen}
-          onClick={() => setDtOperatorOpen((o) => !o)}
+          onBackspace={() => {
+            if (selectedOperators.length > 1)
+              onOperatorChange(selectedOperators.slice(0, -1));
+          }}
         >
           <DropdownMenu>
             {DATA_TABLE_OPERATOR_OPTIONS.map((op) => (
               <ActionListItem
                 key={op}
                 title={DATA_TABLE_OPERATOR_LABELS[op]}
-                selectionType="Single"
-                isSelected={(dataTable.operator || 'avg') === op}
-                onClick={() => {
-                  onOperatorChange(op);
-                  setDtOperatorOpen(false);
-                }}
+                selectionType="Multiple"
+                isSelected={selectedOperators.includes(op)}
+                onClick={() => toggleOperator(op)}
               />
             ))}
           </DropdownMenu>
@@ -2136,7 +2405,7 @@ function SectionItemList({
           <ItemCard
             key={a._id}
             title={a.name}
-
+            subtitle={`Position: ${a.position}`}
             isActive={activeEditItemId === a._id}
             onClick={() => onEdit(a._id)}
             onRemove={() =>
@@ -2289,10 +2558,13 @@ function deriveDataTableColumnLabel(
     const s = seriesById.get(column.seriesId);
     if (s) return s.name || `Series ${column.seriesId}`;
   }
-  if (column.sourceMode === 'AddNew' && column.topic) {
-    const unwrapped = column.topic.replace(/^\{\{(.+)\}\}$/, '$1');
-    const parts = unwrapped.split('/');
-    return parts[parts.length - 1] || 'UNS Source';
+  if (column.sourceMode === 'AddNew') {
+    if (column.name?.trim()) return column.name.trim();
+    if (column.topic) {
+      const unwrapped = column.topic.replace(/^\{\{(.+)\}\}$/, '$1');
+      const parts = unwrapped.split('/');
+      return parts[parts.length - 1] || 'UNS Source';
+    }
   }
   return 'Data Source';
 }
@@ -2377,6 +2649,117 @@ function DeviationIndicatorPortal({
   return createPortal(
     <DeviationIndicatorSelector value={value} faded={faded} onChange={onChange} />,
     target,
+  );
+}
+
+// ===========================================================================
+// Per-source chart selector → "Chart" dropdown. The SDK renders the per-source
+// deviation section's chart switcher as a Tabs strip; we hide that strip and
+// inject a single-select "Chart" dropdown that drives the (hidden) tabs by
+// clicking the matching tab button. Mounts whenever the SDK's
+// `.fds-ttc__per-source` section is present (Comparison Mode + Advance Settings).
+// ===========================================================================
+
+const PER_SOURCE_SELECT_CLASS = 'lc-config__per-source-chart-select';
+
+function PerSourceChartDropdownPortal({
+  scope,
+  charts,
+}: {
+  scope: React.RefObject<HTMLDivElement | null>;
+  charts: GTPChart[];
+}) {
+  const [target, setTarget] = useState<HTMLElement | null>(null);
+
+  useEffect(() => {
+    const root = scope.current;
+    if (!root) return;
+    function ensure() {
+      if (!root) return;
+      const perSource = root.querySelector('.fds-ttc__per-source');
+      const tabs = perSource?.querySelector(':scope > .fds-tabs') as HTMLElement | null;
+      if (!perSource || !tabs) {
+        setTarget((t) => (t ? null : t));
+        return;
+      }
+      let ph = perSource.querySelector(
+        `:scope > .${PER_SOURCE_SELECT_CLASS}`,
+      ) as HTMLElement | null;
+      if (!ph) {
+        ph = document.createElement('div');
+        ph.className = PER_SOURCE_SELECT_CLASS;
+        tabs.parentNode!.insertBefore(ph, tabs);
+      }
+      setTarget((curr) => (curr === ph ? curr : ph));
+    }
+    ensure();
+    const obs = new MutationObserver(ensure);
+    obs.observe(root, { childList: true, subtree: true });
+    return () => obs.disconnect();
+  }, [scope]);
+
+  if (!target) return null;
+  return createPortal(<PerSourceChartSelect charts={charts} target={target} />, target);
+}
+
+function PerSourceChartSelect({
+  charts,
+  target,
+}: {
+  charts: GTPChart[];
+  target: HTMLElement;
+}) {
+  const tabsRoot = target.parentElement?.querySelector(
+    ':scope > .fds-tabs',
+  ) as HTMLElement | null;
+  const readActive = () =>
+    (tabsRoot?.querySelector('.fds-tab-item--selected') as HTMLElement | null)?.getAttribute(
+      'data-value',
+    ) ||
+    charts[0]?.id ||
+    '';
+  const [selected, setSelected] = useState(readActive());
+  const [open, setOpen] = useState(false);
+
+  // Re-sync if the chart set changes (keep a valid selection).
+  useEffect(() => {
+    setSelected((s) => (charts.some((c) => c.id === s) ? s : readActive()));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [charts.map((c) => c.id).join('|')]);
+
+  const pickChart = (id: string) => {
+    setSelected(id);
+    setOpen(false);
+    // Drive the SDK's (hidden) tabs — a programmatic click fires the tab's
+    // onClick even though the strip is display:none.
+    const btn = tabsRoot?.querySelector(
+      `.fds-tab-item[data-value="${id}"]`,
+    ) as HTMLElement | null;
+    btn?.click();
+  };
+
+  return (
+    <div className="lc-config__per-source-chart-field">
+      <SelectInput
+        label="Chart"
+        value={charts.find((c) => c.id === selected)?.name ?? ''}
+        isOpen={open}
+        onOpenChange={setOpen}
+        onClick={() => setOpen((o) => !o)}
+      >
+        <DropdownMenu>
+          {charts.map((c) => (
+            <ActionListItem
+              key={c.id}
+              title={c.name}
+              selectionType="Single"
+              isSelected={c.id === selected}
+              onClick={() => pickChart(c.id)}
+            />
+          ))}
+        </DropdownMenu>
+      </SelectInput>
+    </div>
   );
 }
 
@@ -2653,8 +3036,6 @@ function useEditorBinding(
 // Editor: Data Source (Series)
 // ===========================================================================
 
-const DOWNSAMPLING_UNITS = ['Sec', 'Min', 'Hour', 'Day'];
-
 interface DataSourceEditorProps {
   initial: LineChartSeries | null;
   existingCount: number;
@@ -2681,20 +3062,17 @@ function DataSourceEditor({
     initial?.color ?? DEFAULT_COLORS[existingCount % DEFAULT_COLORS.length],
   );
   const [dataSource, setDataSource] = useState(initial?.dataSource ?? '');
-  const [realTime, setRealTime] = useState(initial?.realTime ?? false);
-  const [downsampling, setDownsampling] = useState(initial?.downsampling ?? '');
-  const [downsamplingUnit, setDownsamplingUnit] = useState(initial?.downsamplingUnit ?? 'Min');
-  const [downsamplingUnitOpen, setDownsamplingUnitOpen] = useState(false);
   const [dataPrecision, setDataPrecision] = useState(
     initial?.dataPrecision !== undefined ? String(initial.dataPrecision) : '2',
   );
   const [limit, setLimit] = useState(initial?.limit ?? '');
-  const [advanceParameters, setAdvanceParameters] = useState(initial?.advanceParameters ?? false);
-  const [m, setM] = useState(initial?.m ?? '');
-  const [s, setS] = useState(initial?.s ?? '');
   const [addAsTooltip, setAddAsTooltip] = useState(initial?.addAsTooltip ?? false);
 
-  const isValid = name.trim().length > 0 && dataSource.trim().length > 0;
+  // Name, Color and UNS Path are mandatory.
+  const isValid =
+    name.trim().length > 0 &&
+    color.trim().length > 0 &&
+    dataSource.trim().length > 0;
 
   const submit = useCallback(() => {
     if (!isValid) return;
@@ -2703,20 +3081,13 @@ function DataSourceEditor({
       name: name.trim(),
       color: color || DEFAULT_COLORS[existingCount % DEFAULT_COLORS.length],
       dataSource,
-      realTime,
-      downsampling: downsampling || undefined,
-      downsamplingUnit: downsampling ? downsamplingUnit : undefined,
       dataPrecision: dataPrecision ? Number(dataPrecision) : undefined,
       limit: limit || undefined,
-      advanceParameters: advanceParameters || undefined,
-      m: advanceParameters && m ? m : undefined,
-      s: advanceParameters && s ? s : undefined,
       addAsTooltip: addAsTooltip || undefined,
     });
   }, [
-    isValid, initial, existingCount, name, color, dataSource, realTime,
-    downsampling, downsamplingUnit, dataPrecision, limit,
-    advanceParameters, m, s, addAsTooltip, onSubmit,
+    isValid, initial, existingCount, name, color, dataSource,
+    dataPrecision, limit, addAsTooltip, onSubmit,
   ]);
 
   useEditorBinding(isValid, submit, onReady);
@@ -2741,22 +3112,10 @@ function DataSourceEditor({
         onChange={(hex) => setColor(hex)}
       />
 
-      {/* Real Time toggle */}
-      <div className="lc-config__ds-row lc-config__ds-row--toggle">
-        <div className="lc-config__ds-toggle-label">
-          <span className="BodySmallSemibold">Real Time</span>
-          <Info size={14} color="var(--text-default-tertiary, #768ea7)" />
-        </div>
-        <Switch
-          accessibilityLabel="Toggle real time"
-          isChecked={realTime}
-          onChange={({ isChecked }) => setRealTime(isChecked)}
-        />
-      </div>
-
       {/* UNS Path */}
       <UNSPathInput
         label="UNS Path"
+        necessityIndicator="required"
         placeholder="Enter UNS Path"
         value={dataSource}
         tree={unsTree}
@@ -2765,48 +3124,18 @@ function DataSourceEditor({
         onChange={(value) => setDataSource(resolveUNSValue(value))}
       />
 
-      {/* Downsampling + Unit */}
-      <div className="lc-config__ds-row lc-config__ds-row--halves">
-        <TextInput
-          label="Downsampling *"
-          labelPosition="top"
-          placeholder="Enter value"
-          value={downsampling}
-          onChange={({ value }: { name: string; value: string }) => setDownsampling(value)}
-        />
-        <SelectInput
-          label="Unit"
-          placeholder="Min"
-          value={downsamplingUnit}
-          isOpen={downsamplingUnitOpen}
-          onOpenChange={setDownsamplingUnitOpen}
-          onClick={() => setDownsamplingUnitOpen((o) => !o)}
-        >
-          <DropdownMenu>
-            {DOWNSAMPLING_UNITS.map((u) => (
-              <ActionListItem
-                key={u}
-                title={u}
-                selectionType="Single"
-                isSelected={u === downsamplingUnit}
-                onClick={() => { setDownsamplingUnit(u); setDownsamplingUnitOpen(false); }}
-              />
-            ))}
-          </DropdownMenu>
-        </SelectInput>
-      </div>
-
-      {/* Data Precision + Limit */}
+      {/* Data Precision + Unit */}
       <div className="lc-config__ds-row lc-config__ds-row--halves">
         <TextInput
           label="Data Precision"
           labelPosition="top"
+          type="number"
           placeholder="Enter value"
           value={dataPrecision}
           onChange={({ value }: { name: string; value: string }) => setDataPrecision(value)}
         />
         <TextInput
-          label="Limit"
+          label="Unit"
           labelPosition="top"
           placeholder="Enter value"
           value={limit}
@@ -2814,38 +3143,9 @@ function DataSourceEditor({
         />
       </div>
 
-      {/* Advance Parameters toggle */}
-      <div className="lc-config__ds-row lc-config__ds-row--toggle">
-        <span className="BodySmallSemibold">Advance Parameters</span>
-        <Switch
-          accessibilityLabel="Toggle advance parameters"
-          isChecked={advanceParameters}
-          onChange={({ isChecked }) => setAdvanceParameters(isChecked)}
-        />
-      </div>
-
-      {/* m + s (only when Advance Parameters ON) */}
-      {advanceParameters && (
-        <div className="lc-config__ds-row lc-config__ds-row--halves">
-          <TextInput
-            label="m"
-            labelPosition="top"
-            placeholder="Enter value"
-            value={m}
-            onChange={({ value }: { name: string; value: string }) => setM(value)}
-          />
-          <TextInput
-            label="s"
-            labelPosition="top"
-            placeholder="Enter value"
-            value={s}
-            onChange={({ value }: { name: string; value: string }) => setS(value)}
-          />
-        </div>
-      )}
-
       {/* Add Source as Tooltip */}
       <Checkbox
+        size="Medium"
         isChecked={addAsTooltip}
         onChange={(e) => setAddAsTooltip(e.target.checked)}
       >
@@ -2875,18 +3175,42 @@ function AxisEditor({
   initial,
   series,
   existingCount,
-  unsTree,
-  isLoadingTree,
-  loadWorkspaces,
-  resolveUNSValue,
   onSubmit,
   onReady,
 }: AxisEditorProps) {
   const [name, setName] = useState(initial?.name ?? '');
   const [position, setPosition] = useState<'Left' | 'Right'>(initial?.position ?? 'Left');
-  const [dataSource, setDataSource] = useState(initial?.dataSource ?? '');
+  // Data Source is now a multi-select of the added series (linkedSeriesIds).
+  const [linkedSeriesIds, setLinkedSeriesIds] = useState<string[]>(
+    initial?.linkedSeriesIds ?? [],
+  );
+  const [dsOpen, setDsOpen] = useState(false);
+  // Search text for the autocomplete input. Wiring onInputChange is also what
+  // keeps the multi-select field interactive (without it the SDK forces the
+  // field into a read-only / disabled-looking state).
+  const [dsSearch, setDsSearch] = useState('');
 
-  const isValid = name.trim().length > 0;
+  const seriesById = useMemo(() => {
+    const m = new Map<string, LineChartSeries>();
+    series.forEach((s) => m.set(s._id, s));
+    return m;
+  }, [series]);
+
+  const filteredSeries = useMemo(() => {
+    const q = dsSearch.trim().toLowerCase();
+    if (!q) return series;
+    return series.filter((s) => (s.name || '').toLowerCase().includes(q));
+  }, [series, dsSearch]);
+
+  function toggleSeries(id: string) {
+    setLinkedSeriesIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
+    );
+    setDsSearch('');
+  }
+
+  // Name + at least one Data Source are required (per design).
+  const isValid = name.trim().length > 0 && linkedSeriesIds.length > 0;
 
   const submit = useCallback(() => {
     if (!isValid) return;
@@ -2894,12 +3218,19 @@ function AxisEditor({
       _id: initial?._id ?? `axis_${Date.now()}_${existingCount}`,
       name: name.trim(),
       position,
-      dataSource,
-      linkedSeriesIds: [],
+      // Bindable UNS path is preserved from the existing axis; the Data Source
+      // field now drives which series feed this axis.
+      dataSource: initial?.dataSource ?? '',
+      linkedSeriesIds,
     });
-  }, [isValid, initial, existingCount, name, position, dataSource, onSubmit]);
+  }, [isValid, initial, existingCount, name, position, linkedSeriesIds, onSubmit]);
 
   useEditorBinding(isValid, submit, onReady);
+
+  const tags = linkedSeriesIds.map((id) => ({
+    label: seriesById.get(id)?.name || 'Untitled',
+    onDismiss: () => toggleSeries(id),
+  }));
 
   return (
     <div className="lc-config__editor">
@@ -2911,24 +3242,41 @@ function AxisEditor({
         necessityIndicator="required"
         onChange={({ value }: { name: string; value: string }) => setName(value)}
       />
-      <UNSPathInput
+      <SelectInput
         label="Data Source"
-        placeholder="Type / to browse UNS or paste {{topic}} directly"
-        value={dataSource}
-        tree={unsTree}
-        isLoading={isLoadingTree}
-        onOpen={loadWorkspaces}
-        onChange={(v: string) => setDataSource(resolveUNSValue(v))}
-      />
+        multiType="multiple"
+        isRequired
+        placeholder={series.length === 0 ? 'No data sources available' : 'Select data sources'}
+        tags={tags}
+        isOpen={dsOpen}
+        onOpenChange={setDsOpen}
+        inputValue={dsSearch}
+        onInputChange={setDsSearch}
+        onBackspace={() => setLinkedSeriesIds((prev) => prev.slice(0, -1))}
+        isDisabled={series.length === 0}
+      >
+        <DropdownMenu emptyTitle="No matching data sources">
+          {filteredSeries.map((s) => (
+            <ActionListItem
+              key={s._id}
+              title={s.name || `Series ${s._id}`}
+              selectionType="Multiple"
+              isSelected={linkedSeriesIds.includes(s._id)}
+              onClick={() => toggleSeries(s._id)}
+            />
+          ))}
+        </DropdownMenu>
+      </SelectInput>
       <RadioGroup
         label="Axis Position"
         name="axis-position"
         value={position}
         onChange={({ value }) => setPosition(value as 'Left' | 'Right')}
         orientation="Horizontal"
+        size="Medium"
       >
-        <Radio label="Left" value="Left" />
-        <Radio label="Right" value="Right" />
+        <Radio label="Left" value="Left" size="Medium" />
+        <Radio label="Right" value="Right" size="Medium" />
       </RadioGroup>
     </div>
   );
@@ -2938,10 +3286,9 @@ function AxisEditor({
 // Editor: Plot Line
 // ===========================================================================
 
-const PERIODICITY_OPTIONS = ['Hourly', 'Daily', 'Weekly', 'Monthly'];
+const PERIODICITY_OPTIONS = ['Hourly', 'Daily', 'Weekly', 'Monthly', 'Quarterly'];
 const LINE_STYLE_OPTIONS: PlotLineStyle[] = ['Solid', 'Dashed'];
 const DURATION_TYPE_OPTIONS = ['Fixed', 'Custom'];
-const DOWNSAMPLING_UNIT_OPTIONS = ['second', 'minute', 'hour', 'day', 'week', 'month', 'year'];
 
 interface PlotLineEditorProps {
   initial: LineChartPlotLine | null;
@@ -2952,6 +3299,8 @@ interface PlotLineEditorProps {
   resolveUNSValue: (raw: string) => string;
   onSubmit: (line: LineChartPlotLine) => void;
   onReady: (b: EditorBinding) => void;
+  // When the chart is Realtime, periodicity-dependent plotlines are unavailable.
+  isRealtime?: boolean;
 }
 
 function PlotLineEditor({
@@ -2963,19 +3312,21 @@ function PlotLineEditor({
   resolveUNSValue,
   onSubmit,
   onReady,
+  isRealtime = false,
 }: PlotLineEditorProps) {
   const [name, setName] = useState(initial?.name ?? '');
   const [color, setColor] = useState(initial?.color ?? '#3b82f6');
-  const [type, setType] = useState<PlotLineType>(initial?.type ?? 'Independent');
+  // In Realtime, only Independent plotlines exist — force the editor to that
+  // type so a previously-Dependent line edited here doesn't expose periodicity.
+  const [type, setType] = useState<PlotLineType>(
+    isRealtime ? 'Independent' : initial?.type ?? 'Independent',
+  );
   const [valueType, setValueType] = useState<PlotLineValueType>(
     initial?.valueType ?? 'Fixed',
   );
   const [valueTypeOpen, setValueTypeOpen] = useState(false);
   const [fixedValue, setFixedValue] = useState(initial?.fixedValue ?? '');
   const [dynamicTopic, setDynamicTopic] = useState(initial?.dynamicTopic ?? '');
-  const [downsampling, setDownsampling] = useState(initial?.downsampling ?? '');
-  const [downsamplingUnit, setDownsamplingUnit] = useState(initial?.downsamplingUnit ?? '');
-  const [downsamplingUnitOpen, setDownsamplingUnitOpen] = useState(false);
   const [dataPrecision, setDataPrecision] = useState<string>(
     typeof initial?.dataPrecision === 'number' ? String(initial.dataPrecision) : '',
   );
@@ -3002,7 +3353,12 @@ function PlotLineEditor({
   const isValid = name.trim().length > 0;
 
   function addPeriodicityRow() {
-    setPeriodicities((rows) => [...rows, { periodicity: 'Hourly', value: 0 }]);
+    setPeriodicities((rows) => {
+      // Default the new row to the first periodicity not already chosen.
+      const used = new Set(rows.map((r) => r.periodicity));
+      const next = PERIODICITY_OPTIONS.find((p) => !used.has(p)) ?? PERIODICITY_OPTIONS[0];
+      return [...rows, { periodicity: next, value: 0 }];
+    });
   }
   function updatePeriodicityRow(idx: number, patch: Partial<PlotLinePeriodicityEntry>) {
     setPeriodicities((rows) => rows.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
@@ -3026,8 +3382,6 @@ function PlotLineEditor({
           ? fixedValue
           : undefined,
       dynamicTopic: isDynamic ? dynamicTopic : undefined,
-      downsampling: isDynamic && downsampling ? downsampling : undefined,
-      downsamplingUnit: isDynamic && downsamplingUnit ? downsamplingUnit : undefined,
       dataPrecision:
         isDynamic && dataPrecision !== '' && !Number.isNaN(Number(dataPrecision))
           ? Number(dataPrecision)
@@ -3050,8 +3404,6 @@ function PlotLineEditor({
     valueType,
     fixedValue,
     dynamicTopic,
-    downsampling,
-    downsamplingUnit,
     dataPrecision,
     unit,
     periodicities,
@@ -3082,24 +3434,29 @@ function PlotLineEditor({
         onChange={(hex: string) => setColor(hex)}
       />
 
-      <RadioGroup
-        label="Plotline Type"
-        name="plotline-type"
-        value={type}
-        onChange={({ value }) => setType(value as PlotLineType)}
-        orientation="Vertical"
-      >
-        <Radio
-          label="Periodicity Independent"
-          helpText="Plotline uses a static value, unaffected by periodic intervals."
-          value="Independent"
-        />
-        <Radio
-          label="Periodicity Dependent"
-          helpText="Plotline values dynamically derived from the selected periodic dataset."
-          value="Dependent"
-        />
-      </RadioGroup>
+      {/* Realtime charts have no periodicity, so the "Periodicity Dependent"
+          option is hidden — only Independent plotlines are available. */}
+      {!isRealtime && (
+        <RadioGroup
+          label="Plotline Type"
+          name="plotline-type"
+          size="Medium"
+          value={type}
+          onChange={({ value }) => setType(value as PlotLineType)}
+          orientation="Vertical"
+        >
+          <Radio
+            label="Periodicity Independent"
+            helpText="Plotline uses a static value, unaffected by periodic intervals."
+            value="Independent"
+          />
+          <Radio
+            label="Periodicity Dependent"
+            helpText="Plotline values dynamically derived from the selected periodic dataset."
+            value="Dependent"
+          />
+        </RadioGroup>
+      )}
 
       <SelectInput
         label="Value Type *"
@@ -3126,14 +3483,14 @@ function PlotLineEditor({
       </SelectInput>
 
       {type === 'Independent' && valueType === 'Fixed' && (
-        <UNSPathInput
-          label="Value *"
-          placeholder="Type / to browse UNS or paste {{topic}} directly"
+        <TextInput
+          label="Value"
+          labelPosition="top"
+          type="number"
+          necessityIndicator="required"
+          placeholder="Enter value"
           value={fixedValue}
-          tree={unsTree}
-          isLoading={isLoadingTree}
-          onOpen={loadWorkspaces}
-          onChange={(v: string) => setFixedValue(resolveUNSValue(v))}
+          onChange={({ value }: { name: string; value: string }) => setFixedValue(value)}
         />
       )}
 
@@ -3148,40 +3505,6 @@ function PlotLineEditor({
             onOpen={loadWorkspaces}
             onChange={(v: string) => setDynamicTopic(resolveUNSValue(v))}
           />
-          <div className="lc-config__date-row">
-            <TextInput
-              label="Downsampling *"
-              labelPosition="top"
-              placeholder="Enter value"
-              value={downsampling}
-              onChange={({ value }: { name: string; value: string }) =>
-                setDownsampling(value)
-              }
-            />
-            <SelectInput
-              label="Downsampling Unit *"
-              placeholder="Select unit"
-              value={downsamplingUnit}
-              isOpen={downsamplingUnitOpen}
-              onOpenChange={setDownsamplingUnitOpen}
-              onClick={() => setDownsamplingUnitOpen((o) => !o)}
-            >
-              <DropdownMenu>
-                {DOWNSAMPLING_UNIT_OPTIONS.map((opt) => (
-                  <ActionListItem
-                    key={opt}
-                    title={opt}
-                    selectionType="Single"
-                    isSelected={downsamplingUnit === opt}
-                    onClick={() => {
-                      setDownsamplingUnit(opt);
-                      setDownsamplingUnitOpen(false);
-                    }}
-                  />
-                ))}
-              </DropdownMenu>
-            </SelectInput>
-          </div>
           <div className="lc-config__date-row">
             <TextInput
               label="Data Precision *"
@@ -3226,7 +3549,13 @@ function PlotLineEditor({
                 }
               >
                 <DropdownMenu>
-                  {PERIODICITY_OPTIONS.map((p) => (
+                  {PERIODICITY_OPTIONS.filter(
+                    // Hide periodicities already chosen in other rows; keep the
+                    // current row's own selection so it stays visible/selected.
+                    (p) =>
+                      p === row.periodicity ||
+                      !periodicities.some((r, i) => i !== idx && r.periodicity === p),
+                  ).map((p) => (
                     <ActionListItem
                       key={p}
                       title={p}
@@ -3267,6 +3596,7 @@ function PlotLineEditor({
             size="Small"
             leadingIcon={<Plus size={14} />}
             label="Add Periodicity"
+            isDisabled={periodicities.length >= PERIODICITY_OPTIONS.length}
             onClick={addPeriodicityRow}
           />
         </div>
@@ -3298,7 +3628,7 @@ function PlotLineEditor({
             ))}
           </DropdownMenu>
         </SelectInput>
-        <div className="lc-config__date-row">
+        <div className="lc-config__duration-group__fields">
           <DatePicker
             mode="single"
             label="Start Date *"
@@ -3317,6 +3647,7 @@ function PlotLineEditor({
 
       <ProductAccordionItem
         title="Style"
+        className="lc-config__plotline-style"
         isExpanded={styleOpen}
         isActive
         onToggle={() => setStyleOpen((o) => !o)}
@@ -3935,13 +4266,6 @@ function AnomalyEditor({
   );
   const [existingSeriesId, setExistingSeriesId] = useState(initial?.existingSeriesId ?? '');
   const [newSourceTopic, setNewSourceTopic] = useState(initial?.newSourceTopic ?? '');
-  const [advanceEnabled, setAdvanceEnabled] = useState(initial?.advanceEnabled ?? false);
-  const [advanceM, setAdvanceM] = useState(
-    typeof initial?.advanceM === 'number' ? String(initial.advanceM) : '',
-  );
-  const [advanceC, setAdvanceC] = useState(
-    typeof initial?.advanceC === 'number' ? String(initial.advanceC) : '',
-  );
 
   const [applyToDropdownOpen, setApplyToDropdownOpen] = useState(false);
   const [operatorDropdownOpen, setOperatorDropdownOpen] = useState(false);
@@ -3985,13 +4309,6 @@ function AnomalyEditor({
     } else if (labelMode === 'NewSource') {
       anom.newSourceTopic = newSourceTopic;
     }
-    if (advanceEnabled) {
-      anom.advanceEnabled = true;
-      const m = Number(advanceM);
-      const c = Number(advanceC);
-      if (Number.isFinite(m)) anom.advanceM = m;
-      if (Number.isFinite(c)) anom.advanceC = c;
-    }
     onSubmit(anom);
   }, [
     isValid,
@@ -4005,9 +4322,6 @@ function AnomalyEditor({
     thresholdValue,
     existingSeriesId,
     newSourceTopic,
-    advanceEnabled,
-    advanceM,
-    advanceC,
     onSubmit,
   ]);
 
@@ -4082,6 +4396,7 @@ function AnomalyEditor({
       <RadioGroup
         label="Label"
         name="anomaly-label-mode"
+        size="Medium"
         value={labelMode}
         onChange={({ value }) => setLabelMode(value as AnomalyLabelMode)}
         orientation="Horizontal"
@@ -4140,36 +4455,6 @@ function AnomalyEditor({
           onChange={({ value }: { name: string; value: string }) => setThresholdValue(value)}
         />
       )}
-
-      <div className="lc-config__switch-row">
-        <span className="lc-config__switch-label LabelMediumRegular">
-          Advance Parameters
-        </span>
-        <Switch
-          accessibilityLabel="Toggle advance parameters"
-          isChecked={advanceEnabled}
-          onChange={({ isChecked }) => setAdvanceEnabled(isChecked)}
-        />
-      </div>
-
-      {advanceEnabled && (
-        <div className="lc-config__date-row">
-          <TextInput
-            label="m"
-            labelPosition="top"
-            placeholder="e.g. 1"
-            value={advanceM}
-            onChange={({ value }: { name: string; value: string }) => setAdvanceM(value)}
-          />
-          <TextInput
-            label="c"
-            labelPosition="top"
-            placeholder="e.g. 0"
-            value={advanceC}
-            onChange={({ value }: { name: string; value: string }) => setAdvanceC(value)}
-          />
-        </div>
-      )}
     </div>
   );
 }
@@ -4205,7 +4490,8 @@ interface DataTableColumnEditorProps {
   isLoadingTree?: boolean;
   loadWorkspaces: () => void;
   resolveUNSValue: (v: string) => string;
-  onSubmit: (c: DataTableColumn) => void;
+  // Multi-select Existing mode can emit several columns at once.
+  onSubmit: (cols: DataTableColumn[]) => void;
   onReady: (b: EditorBinding) => void;
 }
 
@@ -4223,19 +4509,20 @@ function DataTableColumnEditor({
   const [sourceMode, setSourceMode] = useState<DataTableSourceMode>(
     initial?.sourceMode ?? 'Existing',
   );
-  // Existing
-  const [seriesId, setSeriesId] = useState(initial?.seriesId ?? '');
+  // Existing — multi-select: each chosen series becomes its own table column.
+  const [seriesIds, setSeriesIds] = useState<string[]>(
+    initial?.seriesId ? [initial.seriesId] : [],
+  );
+  const [dsSearch, setDsSearch] = useState('');
   // AddNew
+  const [name, setName] = useState(initial?.name ?? '');
   const [topic, setTopic] = useState(initial?.topic ?? '');
-  const [downsampling, setDownsampling] = useState(initial?.downsampling ?? '');
-  const [downsamplingUnit, setDownsamplingUnit] = useState(initial?.downsamplingUnit ?? '');
   const [dataPrecision, setDataPrecision] = useState(
     typeof initial?.dataPrecision === 'number' ? String(initial.dataPrecision) : '2',
   );
   const [unit, setUnit] = useState(initial?.unit ?? '');
 
   const [seriesDropdownOpen, setSeriesDropdownOpen] = useState(false);
-  const [downsamplingUnitOpen, setDownsamplingUnitOpen] = useState(false);
 
   const seriesById = useMemo(() => {
     const m = new Map<string, LineChartSeries>();
@@ -4243,36 +4530,62 @@ function DataTableColumnEditor({
     return m;
   }, [series]);
 
-  const seriesLabel = seriesId ? (seriesById.get(seriesId)?.name ?? '') : '';
+  const filteredSeries = useMemo(() => {
+    const q = dsSearch.trim().toLowerCase();
+    if (!q) return series;
+    return series.filter((s) => (s.name || '').toLowerCase().includes(q));
+  }, [series, dsSearch]);
 
-  const isValid = sourceMode === 'Existing' ? !!seriesId : topic.trim().length > 0;
+  function toggleSeries(id: string) {
+    setSeriesIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
+    );
+    setDsSearch('');
+  }
+
+  const seriesTags = seriesIds.map((id) => ({
+    label: seriesById.get(id)?.name || 'Untitled',
+    onDismiss: () => toggleSeries(id),
+  }));
+
+  const isValid =
+    sourceMode === 'Existing'
+      ? seriesIds.length > 0
+      : name.trim().length > 0 && topic.trim().length > 0;
 
   const submit = useCallback(() => {
     if (!isValid) return;
     const precNum = Number(dataPrecision);
     const precision = Number.isFinite(precNum) && precNum >= 0 ? Math.floor(precNum) : 2;
     if (sourceMode === 'Existing') {
-      onSubmit({
-        _id: initial?._id ?? `dtcol_${Date.now()}_${existingCount}`,
+      // One column per selected series. In edit mode the first keeps the
+      // original column id; any extras are added as new columns.
+      const cols: DataTableColumn[] = seriesIds.map((sid, idx) => ({
+        _id:
+          idx === 0 && initial?._id
+            ? initial._id
+            : `dtcol_${Date.now()}_${existingCount + idx}`,
         sourceMode,
-        seriesId,
+        seriesId: sid,
         dataPrecision: precision,
         unit: unit.trim() || undefined,
-      });
+      }));
+      onSubmit(cols);
     } else {
-      onSubmit({
-        _id: initial?._id ?? `dtcol_${Date.now()}_${existingCount}`,
-        sourceMode,
-        topic,
-        downsampling: downsampling.trim() || undefined,
-        downsamplingUnit: downsamplingUnit || undefined,
-        dataPrecision: precision,
-        unit: unit.trim() || undefined,
-      });
+      onSubmit([
+        {
+          _id: initial?._id ?? `dtcol_${Date.now()}_${existingCount}`,
+          sourceMode,
+          name: name.trim(),
+          topic,
+          dataPrecision: precision,
+          unit: unit.trim() || undefined,
+        },
+      ]);
     }
   }, [
-    isValid, initial, existingCount, sourceMode, seriesId,
-    topic, downsampling, downsamplingUnit, dataPrecision, unit, onSubmit,
+    isValid, initial, existingCount, sourceMode, seriesIds,
+    name, topic, dataPrecision, unit, onSubmit,
   ]);
 
   useEditorBinding(isValid, submit, onReady);
@@ -4282,6 +4595,7 @@ function DataTableColumnEditor({
       <RadioGroup
         label="Source Mode"
         name="dt-source-mode"
+        size="Medium"
         value={sourceMode}
         onChange={({ value }) => setSourceMode(value as DataTableSourceMode)}
         orientation="Horizontal"
@@ -4293,34 +4607,43 @@ function DataTableColumnEditor({
       {/* ── Existing ─────────────────────────────── */}
       {sourceMode === 'Existing' && (
         <SelectInput
-          label="Data Source *"
-          placeholder={series.length === 0 ? 'No series available' : 'Select data source'}
-          value={seriesLabel}
+          label="Data Source"
+          multiType="multiple"
+          isRequired
+          placeholder={series.length === 0 ? 'No series available' : 'Select data sources'}
+          tags={seriesTags}
           isOpen={seriesDropdownOpen}
           onOpenChange={setSeriesDropdownOpen}
-          onClick={() => setSeriesDropdownOpen((o) => !o)}
+          inputValue={dsSearch}
+          onInputChange={setDsSearch}
+          onBackspace={() => setSeriesIds((prev) => prev.slice(0, -1))}
           isDisabled={series.length === 0}
         >
-          <DropdownMenu>
-            {series.map((s) => (
+          <DropdownMenu emptyTitle="No matching data sources">
+            {filteredSeries.map((s) => (
               <ActionListItem
                 key={s._id}
                 title={s.name || `Series ${s._id}`}
-                selectionType="Single"
-                isSelected={seriesId === s._id}
-                onClick={() => {
-                  setSeriesId(s._id);
-                  setSeriesDropdownOpen(false);
-                }}
+                selectionType="Multiple"
+                isSelected={seriesIds.includes(s._id)}
+                onClick={() => toggleSeries(s._id)}
               />
             ))}
           </DropdownMenu>
         </SelectInput>
       )}
 
-      {/* ── Add New — UNS path + Downsampling + Precision ── */}
+      {/* ── Add New — Name + UNS path + Precision ── */}
       {sourceMode === 'AddNew' && (
         <>
+          <TextInput
+            label="Name"
+            labelPosition="top"
+            placeholder="Enter name"
+            value={name}
+            necessityIndicator="required"
+            onChange={({ value }: { name: string; value: string }) => setName(value)}
+          />
           <UNSPathInput
             label="UNS Path *"
             placeholder="Enter UNS Path"
@@ -4330,39 +4653,6 @@ function DataTableColumnEditor({
             onOpen={loadWorkspaces}
             onChange={(v: string) => setTopic(resolveUNSValue(v))}
           />
-
-          <div className="lc-config__date-row">
-            <TextInput
-              label="Downsampling *"
-              labelPosition="top"
-              placeholder="Enter value"
-              value={downsampling}
-              onChange={({ value }: { name: string; value: string }) => setDownsampling(value)}
-            />
-            <SelectInput
-              label="Downsampling Unit *"
-              placeholder="Seconds"
-              value={downsamplingUnit}
-              isOpen={downsamplingUnitOpen}
-              onOpenChange={setDownsamplingUnitOpen}
-              onClick={() => setDownsamplingUnitOpen((o) => !o)}
-            >
-              <DropdownMenu>
-                {DOWNSAMPLING_UNIT_OPTIONS.map((u) => (
-                  <ActionListItem
-                    key={u}
-                    title={u.charAt(0).toUpperCase() + u.slice(1)}
-                    selectionType="Single"
-                    isSelected={downsamplingUnit === u}
-                    onClick={() => {
-                      setDownsamplingUnit(u);
-                      setDownsamplingUnitOpen(false);
-                    }}
-                  />
-                ))}
-              </DropdownMenu>
-            </SelectInput>
-          </div>
 
           <div className="lc-config__date-row">
             <TextInput
@@ -4510,33 +4800,6 @@ interface StylingSectionProps {
   onChange: (next: LineChartStyling) => void;
 }
 
-interface ColorSwatchInputProps {
-  label: string;
-  value: string;
-  onChange: (next: string) => void;
-}
-
-function ColorSwatchInput({ label, value, onChange }: ColorSwatchInputProps) {
-  return (
-    <div className="lc-config__style-tab__color-row">
-      <TextInput
-        label={label}
-        labelPosition="top"
-        placeholder="#000000"
-        value={value}
-        onChange={({ value: v }: { name: string; value: string }) => onChange(v)}
-        trailingIcon={
-          <span
-            className="lc-config__style-tab__swatch"
-            style={{ background: value || 'transparent' }}
-            aria-hidden="true"
-          />
-        }
-      />
-    </div>
-  );
-}
-
 interface FontWeightSelectProps {
   label: string;
   value: StylingFontWeight;
@@ -4572,8 +4835,6 @@ function FontWeightSelect({ label, value, onChange }: FontWeightSelectProps) {
 }
 
 function StylingSection({ value, onChange }: StylingSectionProps) {
-  const [sizeOpen, setSizeOpen] = useState(false);
-
   function update<K extends keyof LineChartStyling>(
     key: K,
     patch: Partial<LineChartStyling[K]> | LineChartStyling[K],
@@ -4586,109 +4847,30 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
     onChange({ ...value, [key]: merged } as LineChartStyling);
   }
 
-  const sizePresetLabels: StylingWidgetSize[] = ['Small', 'Medium', 'Large', 'Custom'];
-
   return (
     <div className="lc-config__section lc-config__style-tab">
-      <div className="lc-config__style-tab__row">
-        <SelectInput
-          label="Widget Size"
-          value={value.size.preset}
-          isOpen={sizeOpen}
-          onOpenChange={setSizeOpen}
-          onClick={() => setSizeOpen((o) => !o)}
-        >
-          <DropdownMenu>
-            {sizePresetLabels.map((p) => (
-              <ActionListItem
-                key={p}
-                title={p}
-                description={SIZE_PRESETS[p].label}
-                selectionType="Single"
-                isSelected={value.size.preset === p}
-                onClick={() => {
-                  const preset = SIZE_PRESETS[p];
-                  update('size', {
-                    preset: p,
-                    customWidth:
-                      p === 'Custom'
-                        ? value.size.customWidth ?? preset.w ?? 880
-                        : preset.w,
-                    customHeight:
-                      p === 'Custom'
-                        ? value.size.customHeight ?? preset.h ?? 400
-                        : preset.h,
-                  });
-                  setSizeOpen(false);
-                }}
-              />
-            ))}
-          </DropdownMenu>
-        </SelectInput>
-      </div>
-
-      {value.size.preset === 'Custom' && (
-        <div className="lc-config__style-tab__size-row">
-          <TextInput
-            label="W"
-            labelPosition="top"
-            type="number"
-            value={String(value.size.customWidth ?? '')}
-            onChange={({ value: v }: { name: string; value: string }) =>
-              update('size', { customWidth: v === '' ? undefined : Number(v) })
-            }
-          />
-          <div className="lc-config__style-tab__lock">
-            <IconButton
-              icon={
-                value.size.lockAspectRatio ? (
-                  <Lock size={16} />
-                ) : (
-                  <Unlock size={16} />
-                )
-              }
-              size="Small"
-              accessibilityLabel={
-                value.size.lockAspectRatio ? 'Aspect ratio locked' : 'Aspect ratio unlocked'
-              }
-              isHighlighted={value.size.lockAspectRatio}
-              onClick={() =>
-                update('size', { lockAspectRatio: !value.size.lockAspectRatio })
-              }
-            />
-          </div>
-          <TextInput
-            label="H"
-            labelPosition="top"
-            type="number"
-            value={String(value.size.customHeight ?? '')}
-            onChange={({ value: v }: { name: string; value: string }) =>
-              update('size', { customHeight: v === '' ? undefined : Number(v) })
-            }
-          />
-        </div>
-      )}
-
       <div className="lc-config__style-tab__switch-row">
         <span className="LabelMediumRegular lc-config__style-tab__switch-label">
           Wrap Into Card
         </span>
         <Switch
-          isChecked={value.card.wrapInCard}
+          isChecked={value.card.wrapInCard === true}
           onChange={({ isChecked }) => update('card', { wrapInCard: isChecked })}
           accessibilityLabel="Wrap into card"
         />
       </div>
 
-      <ColorSwatchInput
+      <ColorInput
         label="Background Color"
+        placeholder="Select color"
         value={value.card.backgroundColor}
-        onChange={(v) => update('card', { backgroundColor: v })}
+        onChange={(v: string) => update('card', { backgroundColor: v })}
       />
-      <ColorSwatchInput
+      <ColorInput
         label="Border Color"
+        placeholder="Select color"
         value={value.card.borderColor}
-        onChange={(v) => update('card', { borderColor: v })}
+        onChange={(v: string) => update('card', { borderColor: v })}
       />
       <TextInput
         label="Border Width"
@@ -4719,6 +4901,7 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
         <div className="lc-config__style-tab__checkbox-col">
           <Checkbox
             label="Setting Icon"
+            size="Medium"
             isChecked={value.hideElements.settingsIcon}
             onClick={() =>
               update('hideElements', { settingsIcon: !value.hideElements.settingsIcon })
@@ -4726,6 +4909,7 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
           />
           <Checkbox
             label="Export Icon"
+            size="Medium"
             isChecked={value.hideElements.exportIcon}
             onClick={() =>
               update('hideElements', { exportIcon: !value.hideElements.exportIcon })
@@ -4733,6 +4917,7 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
           />
           <Checkbox
             label="Chart Title"
+            size="Medium"
             isChecked={value.hideElements.chartTitle}
             onClick={() =>
               update('hideElements', { chartTitle: !value.hideElements.chartTitle })
@@ -4771,7 +4956,7 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
               }
               suffix="px"
             />
-            <ColorSwatchInput
+            <ColorInput
               label="Title Font Color"
               value={value.chartTitle.fontColor}
               onChange={(v) => update('chartTitle', { fontColor: v })}
@@ -4788,14 +4973,19 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
             <p className="LabelMediumSemibold lc-config__style-tab__block-title">
               X Axis
             </p>
-            <ColorSwatchInput
+            <ColorInput
               label="Axis Text Color"
-              value={value.xAxisLabel.textColor}
+              value={value.xAxisLabel.textColor ?? '#050505'}
               onChange={(v) => update('xAxisLabel', { textColor: v })}
             />
-            <ColorSwatchInput
-              label="Axis Line Color"
-              value={value.xAxisLabel.lineColor}
+            <ColorInput
+              label="Axis Data Points"
+              value={value.xAxisLabel.dataPointColor ?? '#050505'}
+              onChange={(v) => update('xAxisLabel', { dataPointColor: v })}
+            />
+            <ColorInput
+              label="X Axis Line"
+              value={value.xAxisLabel.lineColor ?? '#DEE1E3'}
               onChange={(v) => update('xAxisLabel', { lineColor: v })}
             />
           </div>
@@ -4805,15 +4995,15 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
             <p className="LabelMediumSemibold lc-config__style-tab__block-title">
               Y Axis
             </p>
-            <ColorSwatchInput
+            <ColorInput
               label="Axis Text Color"
-              value={value.yAxisLabel.textColor}
+              value={value.yAxisLabel.textColor ?? '#050505'}
               onChange={(v) => update('yAxisLabel', { textColor: v })}
             />
-            <ColorSwatchInput
-              label="Axis Line Color"
-              value={value.yAxisLabel.lineColor}
-              onChange={(v) => update('yAxisLabel', { lineColor: v })}
+            <ColorInput
+              label="Axis Data Points"
+              value={value.yAxisLabel.dataPointColor ?? '#050505'}
+              onChange={(v) => update('yAxisLabel', { dataPointColor: v })}
             />
           </div>
 
@@ -4822,12 +5012,12 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
             <p className="LabelMediumSemibold lc-config__style-tab__block-title">
               Data Table
             </p>
-            <ColorSwatchInput
+            <ColorInput
               label="Header Background Color"
               value={value.dataTable.headerBackgroundColor}
               onChange={(v) => update('dataTable', { headerBackgroundColor: v })}
             />
-            <ColorSwatchInput
+            <ColorInput
               label="Header Text Color"
               value={value.dataTable.headerTextColor}
               onChange={(v) => update('dataTable', { headerTextColor: v })}
@@ -4862,7 +5052,7 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
               value={value.dataTable.dataPointTextWeight}
               onChange={(v) => update('dataTable', { dataPointTextWeight: v })}
             />
-            <ColorSwatchInput
+            <ColorInput
               label="Data Point Text Color"
               value={value.dataTable.dataPointTextColor}
               onChange={(v) => update('dataTable', { dataPointTextColor: v })}
@@ -4874,12 +5064,12 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
             <p className="LabelMediumSemibold lc-config__style-tab__block-title">
               Others
             </p>
-            <ColorSwatchInput
+            <ColorInput
               label="Grid Line Color"
               value={value.misc.gridLineColor}
               onChange={(v) => update('misc', { gridLineColor: v })}
             />
-            <ColorSwatchInput
+            <ColorInput
               label="Legend Text Color"
               value={value.misc.legendTextColor}
               onChange={(v) => update('misc', { legendTextColor: v })}

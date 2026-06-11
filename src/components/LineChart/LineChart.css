@@ -1,0 +1,23 @@
+/* LineChart widget — fills its host container. */
+.lcw {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* Loading state: center the spinner in the available space. */
+.lcw--loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--spacing-08, 32px);
+}
+
+/* Data table hugs its content below the chart canvas (portalled into the card). */
+.lcw__data-table {
+  margin-top: var(--spacing-04, 12px);
+  width: 100%;
+  flex: 0 0 auto;
+  height: fit-content;
+}

@@ -26,6 +26,49 @@ body {
   overflow: visible;
   /* Match viewport height so sticky children work */
   height: 100vh;
+  /* Lift the whole config panel above the preview. Col1 is position:sticky,
+     which forms a stacking context that traps its modals' z-index — so the
+     preview (a later DOM sibling) would otherwise paint over the Add Shift /
+     Add Duration / Delete modals. This makes the config subtree win. Modals'
+     inner dropdowns portal to <body> (z-index 9999) so they stay on top. */
+  position: relative;
+  z-index: 1000;
+}
+
+/* The SDK tooltip portals to <body> at z-index 700 (--global-z-index-tooltip);
+   .app__config is a stacking context at z-index 1000, so without this lift the
+   section "+" tooltips render behind the left panel. Keep tooltips topmost. */
+.fds-tooltip {
+  z-index: 10000 !important;
+}
+
+/* Divider between the Shift toggle and the Comparison panel in the preview's
+   date-picker popover sidebar footer (Shift renders directly above Compare). */
+.fds-comparison-panel {
+  border-top: 1px solid var(--border-gray-muted, #dee1e3);
+}
+
+/* Remove the chart title / header button background (SDK gives it a white fill +
+   grey hover); the preview title should sit flush on the card. */
+.app__widget-frame .fds-chart__title,
+.app__widget-frame .fds-chart__title:hover {
+  background-color: transparent;
+}
+
+/* 8px gap below the Shift toggle. The SDK ShiftPanel has inline
+   `padding-bottom: 0` and no class — it's the footer child that is NOT the
+   comparison panel, so override its bottom padding. */
+.fds-date-preset-sidebar__footer > *:not(.fds-comparison-panel) {
+  padding-bottom: 8px !important;
+}
+
+/* "Future Days Allowed" — calendar day cells beyond today + N are greyed and
+   non-interactive (the capture-phase click blocker enforces it even if the
+   class is momentarily removed by a React re-render). */
+.fds-day-cell.lc-day-future-disabled {
+  opacity: 0.35;
+  pointer-events: none;
+  cursor: not-allowed;
 }
 
 .app__config > * {
@@ -50,11 +93,106 @@ body {
   min-height: 0;
 }
 
+/* The chart card fills the (resizable) frame so its inner flex column can
+   distribute height. header + filters hug their content; the canvas fills the
+   remaining space (variable height); and the portalled data table — a 4th flex
+   sibling — is capped at 30% of the card so the top group keeps ~70%. */
+.app__widget-frame .fds-chart {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.app__widget-frame .fds-chart__canvas {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* Shift mode: the ShiftLegend sits in the Chart footer. Tighten the gap between
+   the canvas and the legend to 4px (cancel the card's flex gap + footer pad). */
+.app__widget-frame .fds-chart__footer {
+  margin-top: calc(4px - var(--spacing-05, 16px));
+  padding-top: 0;
+}
+
+/* Pre-data-source empty state shown inside the chart card (in place of the
+   canvas) until a data source is configured. */
+.app__chart-empty {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Data table hugs its own content (it sits in the chart card's flex column and
+   would otherwise be stretched to absorb the canvas's leftover height). */
+.app__data-table {
+  margin-top: var(--spacing-04, 12px);
+  width: 100%;
+  /* Hug content by default; when the chart is resized taller, never exceed 30%
+     of the card height (the canvas absorbs the rest). Scroll if the table is
+     taller than its 30% cap. */
+  flex: 0 0 auto;
+  max-height: 30%;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* Keep the chart action icons (info / settings / menu) pinned to the top-right
+   even when the chart title is hidden (the title normally fills the header and
+   pushes them right; without it they'd collapse to the left). */
+.app__widget-frame .fds-chart__actions {
+  margin-left: auto;
+}
+
+/* Chart action icons (SDK ChartActions) + their dropdown menus, anchored under
+   the icon row at the card's top-right. */
+.app__chart-actions {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-03, 8px);
+}
+.app__action-menu {
+  position: absolute;
+  top: calc(100% + var(--spacing-02, 4px));
+  right: 0;
+  min-width: 180px;
+  z-index: var(--global-z-index-popover, 300);
+}
+
+/* Preview time picker: spread the date-range preset and periodicity across the
+   full chart width so the periodicity dropdown sits at the chart's right end.
+   The SDK keeps both inside one DatePicker (.fds-datepicker__trigger-row) that
+   hugs its content by default; widen it and space-between the two. Scoped to
+   .fds-chart__filters so the configurator's DatePickers are untouched. */
+.fds-chart__filters > .fds-datepicker {
+  width: 100%;
+}
+.fds-chart__filters .fds-datepicker__trigger-row {
+  width: 100%;
+  justify-content: space-between;
+}
+
+/* Periodicity dropdown: the SDK list has zero horizontal padding, so menu items
+   and the selected-row highlight sit flush against the menu edges. Add the
+   horizontal inset so items have padding around them (matching the SDK's proper
+   dropdown spacing). Scoped via the menu's own class (it portals to <body>). */
+.app__periodicity-menu .fds-dropdown-menu__list {
+  padding-left: var(--spacing-02, 4px);
+  padding-right: var(--spacing-02, 4px);
+}
+
 .app__empty {
   display: flex;
   align-items: center;
   justify-content: center;
-  height: 100%;
+  /* Match the configured chart window (default Medium = 880 × 400). */
+  width: 880px;
+  height: 400px;
+  max-width: 100%;
+  max-height: 100%;
+  padding: 40px;
   color: var(--text-default-secondary, #666);
   border: var(--fds-border-subtle, 1px solid #eee);
   border-radius: var(--global-border-radius-large, 8px);

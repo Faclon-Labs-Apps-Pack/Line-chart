@@ -103,7 +103,6 @@ export interface LineChartSeries {
   name: string;
   color: string;
   dataSource: string; // bindable: stores {{uns:wsId://path}}
-  realTime?: boolean;
   downsampling?: string;
   downsamplingUnit?: string;
   dataPrecision?: number;
@@ -213,6 +212,9 @@ export interface ChartInstance {
   _id: string;
   title: string;
   description?: string;
+  // 'Aggregated' (default) uses periodicity-based bucketing; 'Realtime' removes
+  // all periodicity controls (preview picker, Time tab, periodicity plotlines).
+  chartType?: 'Aggregated' | 'Realtime';
   series: LineChartSeries[];
   defaultAxis: LineChartDefaultAxis;
   axes: LineChartAxis[];
@@ -220,6 +222,9 @@ export interface ChartInstance {
   plotBands: LineChartPlotBand[];
   spcs: LineChartSPC[];
   anomalies: LineChartAnomaly[];
+  // Per-chart data table config (each chart has its own; the preview/widget show
+  // a data table only for the chart that configured one).
+  dataTable: DataTableConfig;
 }
 
 export type StylingFontWeight = 'Regular' | 'Medium' | 'Semi-Bold' | 'Bold';
@@ -231,8 +236,8 @@ export interface LineChartStyling {
   hideElements: { settingsIcon: boolean; exportIcon: boolean; chartTitle: boolean };
   advancedEnabled: boolean;
   chartTitle: { fontSize: number; fontColor: string; fontWeight: StylingFontWeight };
-  xAxisLabel: { textColor: string; lineColor: string };
-  yAxisLabel: { textColor: string; lineColor: string };
+  xAxisLabel: { textColor: string; lineColor: string; dataPointColor: string };
+  yAxisLabel: { textColor: string; lineColor: string; dataPointColor: string };
   dataTable: {
     headerBackgroundColor: string; headerTextColor: string; headerTextSize: number;
     headerTextWeight: StylingFontWeight; dataPointTextSize: number;
@@ -250,6 +255,7 @@ export interface DataTableColumn {
   // Existing
   seriesId?: string;
   // AddNew
+  name?: string;            // user-defined column name (required in AddNew mode)
   topic?: string;           // UNS binding: stores {{uns:wsId://path}}
   downsampling?: string;
   downsamplingUnit?: string;
@@ -261,7 +267,10 @@ export interface DataTableConfig {
   enabled: boolean;
   columns: DataTableColumn[];
   transposeTable: boolean;
-  operator: DataTableOperator;
+  /** Aggregation operators — one aggregated row/column is shown per operator. */
+  operators: DataTableOperator[];
+  /** @deprecated legacy single-operator field; read via `operators`. */
+  operator?: DataTableOperator;
   showUnit: boolean;
 }
 

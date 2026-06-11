@@ -5,6 +5,7 @@ declare module '@faclon-labs/design-sdk/UNSPathInput' {
 
   export interface UNSPathInputProps {
     label?: string;
+    necessityIndicator?: 'none' | 'required';
     placeholder?: string;
     value: string;
     tree?: UNSTree;
