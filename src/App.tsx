@@ -44,8 +44,10 @@ import {
   DataTableColumn,
   DataTableOperator,
   LineChartSeries,
+  DataEntry,
 } from './iosense-sdk/types';
 import { validateSSOToken } from './iosense-sdk/api';
+import { resolve, getSeriesData } from './iosense-sdk/mini-engine';
 import '@faclon-labs/design-sdk/styles.css';
 import './App.css';
 
@@ -166,6 +168,26 @@ function finerPeriodicity(p?: string): string | null {
     case 'hourly': return 'Minute';
     default: return null;
   }
+}
+
+// Real-data mode is active once we have an auth token; without one the harness
+// falls back to demo series so offline dev still renders something.
+const REAL = (auth?: string): boolean => !!auth && auth.length > 0;
+
+// "HH:mm" local time-of-day → minutes since midnight.
+function hhmmToMin(s: string): number {
+  const [h, m] = (s || '0:0').split(':').map(Number);
+  return (h || 0) * 60 + (m || 0);
+}
+
+// Does an epoch-ms timestamp's LOCAL time-of-day fall within a shift window?
+// Handles windows that wrap past midnight (e.g. 22:00 → 06:00).
+function inShiftWindow(ms: number, startTime: string, endTime: string): boolean {
+  const d = new Date(ms);
+  const t = d.getHours() * 60 + d.getMinutes();
+  const a = hhmmToMin(startTime);
+  const b = hhmmToMin(endTime);
+  return a <= b ? t >= a && t < b : t >= a || t < b;
 }
 
 // Deterministic pseudo-random demo series — same `seed` and `length` always
@@ -417,6 +439,122 @@ export default function App() {
   const [periodicityOpen, setPeriodicityOpen] = useState<boolean>(false);
   const [selectedPeriodicity, setSelectedPeriodicity] = useState<string>('');
 
+  // ---------------------------------------------------------------------------
+  // Real data resolution. The harness (acting as the mini-engine) calls
+  // resolve() with the current time window so the preview plots the actual UNS
+  // topic data instead of demo series. Three windows:
+  //   • resolvedData     — current window, selected periodicity (all modes)
+  //   • resolvedPrevData — previous window (comparison mode only)
+  //   • resolvedShiftData — full range at hourly grain (shift mode only), so
+  //                         slots can be partitioned by shift time-of-day.
+  // Each effect no-ops without an auth token; consumers then fall back to demo.
+  // ---------------------------------------------------------------------------
+  const [resolvedData, setResolvedData] = useState<DataEntry[]>([]);
+  const [resolvedPrevData, setResolvedPrevData] = useState<DataEntry[]>([]);
+  const [resolvedShiftData, setResolvedShiftData] = useState<DataEntry[]>([]);
+
+  useEffect(() => {
+    if (!REAL(auth) || !envelope || !rangeValue?.start || !rangeValue?.end) {
+      setResolvedData([]);
+      return;
+    }
+    let cancelled = false;
+    resolve(envelope, {
+      authentication: auth,
+      override: {
+        startTime: +new Date(rangeValue.start),
+        endTime: +new Date(rangeValue.end),
+      },
+      periodicity: selectedPeriodicity || undefined,
+    }).then((r) => {
+      if (!cancelled) setResolvedData(r.data);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [auth, envelope, rangeValue, selectedPeriodicity]);
+
+  useEffect(() => {
+    if (chartMode !== 'comparison' || !REAL(auth) || !envelope || !rangeValue?.start || !rangeValue?.end) {
+      setResolvedPrevData([]);
+      return;
+    }
+    const startMs = +new Date(rangeValue.start);
+    const endMs = +new Date(rangeValue.end);
+    let cancelled = false;
+    resolve(envelope, {
+      authentication: auth,
+      // Previous window of equal length, immediately preceding the current one.
+      override: { startTime: 2 * startMs - endMs, endTime: startMs },
+      periodicity: selectedPeriodicity || undefined,
+    }).then((r) => {
+      if (!cancelled) setResolvedPrevData(r.data);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [chartMode, auth, envelope, rangeValue, selectedPeriodicity]);
+
+  useEffect(() => {
+    if (chartMode !== 'shift' || !REAL(auth) || !envelope || !rangeValue?.start || !rangeValue?.end) {
+      setResolvedShiftData([]);
+      return;
+    }
+    let cancelled = false;
+    resolve(envelope, {
+      authentication: auth,
+      override: {
+        startTime: +new Date(rangeValue.start),
+        endTime: +new Date(rangeValue.end),
+      },
+      // Fine grain so each slot can be classified into a shift by time-of-day.
+      periodicity: 'hourly',
+    }).then((r) => {
+      if (!cancelled) setResolvedShiftData(r.data);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [chartMode, auth, envelope, rangeValue]);
+
+  // Index of the active chart within uiConfig.charts — needed to build the
+  // series binding keys `charts[ci].series[si].dataSource` the mini-engine keys
+  // its resolved DataEntry[] by.
+  const activeChartIndex = useMemo(
+    () => charts.findIndex((c) => c._id === activeChart?._id),
+    [charts, activeChart],
+  );
+
+  // Convert the resolved DataEntry[] into chart-ready arrays for the active
+  // chart: a shared `categories` X-axis (from the longest resolved timeline)
+  // and per-series Y-values aligned to it by slot `from` timestamp. Returns null
+  // when offline or nothing resolved yet — callers then fall back to demo data.
+  const resolvedSeries = useMemo<
+    { categories: string[]; valuesByIndex: ((number | null)[] | null)[] } | null
+  >(() => {
+    if (!REAL(auth) || activeChartIndex < 0) return null;
+    const ci = activeChartIndex;
+    const configured = activeChart?.series ?? [];
+    const payloads = configured.map((_s, si) =>
+      getSeriesData(`charts[${ci}].series[${si}].dataSource`, resolvedData),
+    );
+    const canonical = payloads
+      .filter((p): p is NonNullable<typeof p> => !!p)
+      .sort((a, b) => b.slots.length - a.slots.length)[0];
+    if (!canonical) return null;
+    const fromAxis = canonical.slots.map((s) => s.from);
+    const categories = canonical.slots.map((s) => s.label);
+    const valuesByIndex = payloads.map((p) => {
+      if (!p) return null;
+      const byFrom = new Map(p.slots.map((s) => [s.from, s.value]));
+      return fromAxis.map((f) => {
+        const v = byFrom.get(f);
+        return v == null ? null : Number(v);
+      });
+    });
+    return { categories, valuesByIndex };
+  }, [auth, activeChartIndex, activeChart, resolvedData]);
+
   useEffect(() => {
     if (!defaultPeriodicity) return;
     const tc = titleCase(defaultPeriodicity);
@@ -592,18 +730,24 @@ export default function App() {
       .map((label) => ({ label }));
   }, [rangeValue, selectedPeriodicity, isRealtime, chartDisplay.inexactMultiple, chartDisplay.clipping]);
 
-  const categories = useMemo(() => timeBuckets.map((b) => b.label), [timeBuckets]);
+  // X-axis: real resolved slot labels when available, else local time buckets.
+  const categories = useMemo(
+    () => resolvedSeries?.categories ?? timeBuckets.map((b) => b.label),
+    [resolvedSeries, timeBuckets],
+  );
 
   const series = useMemo(() => {
     const configured = activeChart?.series ?? [];
-    // No dummy fallback — until the user adds a data source the chart area
-    // stays blank. Series (and their labels) appear only once configured.
+    // Real resolved values per series; demo fallback only when offline or a
+    // particular series hasn't resolved yet.
     return configured.map((s, i) => ({
       name: s.name || `Series ${i + 1}`,
-      data: demoSeriesData(i + 1, categories.length),
+      // null slot values stay null → Highcharts renders them as gaps (the SDK's
+      // LineSeries.data type is number[], but null points are valid at runtime).
+      data: (resolvedSeries?.valuesByIndex[i] ?? demoSeriesData(i + 1, categories.length)) as number[],
       color: s.color,
     }));
-  }, [activeChart, categories.length]);
+  }, [activeChart, categories.length, resolvedSeries]);
 
   // "Add Source as Tooltip" — these series stay in the chart's dataset (so a
   // shared tooltip surfaces their value when hovering other points) but render
@@ -650,12 +794,31 @@ export default function App() {
     const configured = activeChart?.series ?? [];
     if (!configured.length || !categories.length) return undefined;
 
+    const ci = activeChartIndex;
+    // Fit an arbitrary-length array onto the current category axis (different
+    // window → align by index, pad with 0).
+    const fitToCategories = (vals: number[]): number[] => {
+      const out = vals.slice(0, categories.length);
+      while (out.length < categories.length) out.push(0);
+      return out;
+    };
+
     const out: ComparisonSeriesInput[] = [];
     configured.forEach((s, i) => {
       const name = s.name || `Series ${i + 1}`;
-      const current = demoSeriesData(i + 1, categories.length);
-      // Decorrelated-but-comparable previous period (offset seed, same base/amp).
-      const previous = demoSeriesData(i + 1 + 1000, categories.length);
+      // Current — real resolved values (null gaps → 0), demo fallback.
+      const realCurrent = resolvedSeries?.valuesByIndex[i];
+      const current = realCurrent
+        ? realCurrent.map((v) => (v == null ? 0 : v))
+        : demoSeriesData(i + 1, categories.length);
+      // Previous period — real resolved values from the previous-window fetch,
+      // index-aligned onto the current axis; demo fallback (offset seed).
+      const prevPayload = REAL(auth)
+        ? getSeriesData(`charts[${ci}].series[${i}].dataSource`, resolvedPrevData)
+        : null;
+      const previous = prevPayload
+        ? fitToCategories(prevPayload.slots.map((sl) => (sl.value == null ? 0 : Number(sl.value))))
+        : demoSeriesData(i + 1 + 1000, categories.length);
       // Per-source override (SDK Advance Settings) → else the global pattern.
       const pattern: DeviationPattern =
         (timeCfg?.sourceDeviationOverrides?.[`${activeChart?._id}:${s._id}`] as DeviationPattern) ??
@@ -700,7 +863,7 @@ export default function App() {
       comparisonCategories,
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chartMode, activeChart, categories.length, comparisonCategories, timeCfg, widgetDeviationPattern]);
+  }, [chartMode, activeChart, categories.length, comparisonCategories, timeCfg, widgetDeviationPattern, resolvedSeries, resolvedPrevData, auth, activeChartIndex]);
 
   // ---------------------------------------------------------------------------
   // SHIFT render contract (preview, demo data). Synthesize per-source/per-shift
@@ -717,16 +880,63 @@ export default function App() {
       ? getValidPeriodicities(rangeValue)[0] ?? selectedPeriodicity
       : selectedPeriodicity;
     const periodicity: Periodicity = toSdkPeriodicity(effPer) ?? 'Hourly';
-    const bucketCount = Math.max(categories.length, 1);
+    const range = { start: new Date(rangeValue.start), end: new Date(rangeValue.end) };
 
-    const sources: ShiftSourceData[] = configured.map((s, si) => ({
-      id: s._id,
-      name: s.name || `Series ${si + 1}`,
-      // valuesByShift[shiftIndex][bucketIndex] — deterministic demo values.
-      valuesByShift: cfgShifts.map((_sh, shIdx) =>
-        demoSeriesData(shIdx * 7 + si + 1, bucketCount),
-      ),
-    }));
+    // Bucket boundaries matching buildShiftSeries' own internal bucketing, so the
+    // per-bucket values we compute line up with the series it shapes.
+    let shiftBuckets: TimeBucket[] = [];
+    try {
+      shiftBuckets = bucketRange(range, periodicity, { clipping: chartDisplay.clipping });
+    } catch {
+      shiftBuckets = [];
+    }
+    const bucketCount = Math.max(shiftBuckets.length || categories.length, 1);
+
+    // Real per-source/per-shift values from the hourly resolved dataset: each
+    // hourly slot is classified into (bucket, shift) by its timestamp and
+    // time-of-day, then averaged. Null when a bucket/shift has no slots.
+    const ci = activeChartIndex;
+    const realSources: ShiftSourceData[] | null = (() => {
+      if (!REAL(auth) || !resolvedShiftData.length || !shiftBuckets.length) return null;
+      const payloads = configured.map((_s, si) =>
+        getSeriesData(`charts[${ci}].series[${si}].dataSource`, resolvedShiftData),
+      );
+      if (!payloads.some(Boolean)) return null;
+      return configured.map((s, si) => {
+        const p = payloads[si];
+        return {
+          id: s._id,
+          name: s.name || `Series ${si + 1}`,
+          valuesByShift: cfgShifts.map((sh) =>
+            shiftBuckets.map((b) => {
+              if (!p) return null;
+              const bFrom = b.start.getTime();
+              const bTo = b.end.getTime();
+              const hits = p.slots.filter(
+                (sl) =>
+                  sl.from >= bFrom &&
+                  sl.from < bTo &&
+                  sl.value != null &&
+                  inShiftWindow(sl.from, sh.startTime, sh.endTime),
+              );
+              if (!hits.length) return null;
+              return hits.reduce((acc, sl) => acc + Number(sl.value), 0) / hits.length;
+            }),
+          ),
+        };
+      });
+    })();
+
+    const sources: ShiftSourceData[] =
+      realSources ??
+      configured.map((s, si) => ({
+        id: s._id,
+        name: s.name || `Series ${si + 1}`,
+        // valuesByShift[shiftIndex][bucketIndex] — deterministic demo values.
+        valuesByShift: cfgShifts.map((_sh, shIdx) =>
+          demoSeriesData(shIdx * 7 + si + 1, bucketCount),
+        ),
+      }));
 
     try {
       return buildShiftSeries({
@@ -756,6 +966,9 @@ export default function App() {
     isRealtime,
     categories.length,
     chartDisplay.clipping,
+    auth,
+    resolvedShiftData,
+    activeChartIndex,
   ]);
 
   const shiftProp = useMemo<ChartShiftConfig | undefined>(() => {
@@ -896,7 +1109,12 @@ export default function App() {
     if (!configured.length) return null;
     const anomalies = activeChart?.anomalies ?? [];
 
-    const dataByIdx = configured.map((_s, i) => demoSeriesData(i + 1, categories.length));
+    // Real resolved values (null gaps coerced to 0 for the numeric compares),
+    // demo fallback when offline / unresolved.
+    const dataByIdx = configured.map((_s, i) => {
+      const real = resolvedSeries?.valuesByIndex[i];
+      return real ? real.map((v) => (v == null ? 0 : v)) : demoSeriesData(i + 1, categories.length);
+    });
     const idxById = new Map(configured.map((s, i) => [s._id, i]));
 
     const cmp = (a: number, op: string, b: number): boolean => {
@@ -973,7 +1191,7 @@ export default function App() {
     });
 
     return { xPlotLines, seriesData };
-  }, [activeChart, categories.length]);
+  }, [activeChart, categories.length, resolvedSeries]);
 
   // Card styling from the Style tab — background / border colour, width, radius
   // applied to the chart card so the preview reflects the configured values
@@ -1421,6 +1639,7 @@ export default function App() {
                   dataTable={activeChart.dataTable}
                   series={activeChart?.series ?? []}
                   categories={categories}
+                  resolvedValues={resolvedSeries?.valuesByIndex ?? null}
                   headerStyle={dataTableStyles?.header}
                   cellStyle={dataTableStyles?.cell}
                 />,
@@ -1522,12 +1741,14 @@ function DataTablePreview({
   dataTable,
   series,
   categories,
+  resolvedValues,
   headerStyle,
   cellStyle,
 }: {
   dataTable: DataTableConfig;
   series: LineChartSeries[];
   categories: string[];
+  resolvedValues?: ((number | null)[] | null)[] | null;
   headerStyle?: React.CSSProperties;
   cellStyle?: React.CSSProperties;
 }) {
@@ -1562,14 +1783,19 @@ function DataTablePreview({
         let data: number[];
         if (col.sourceMode === 'Existing' && col.seriesId) {
           const sIdx = series.findIndex((s) => s._id === col.seriesId);
-          data = demoSeriesData(sIdx >= 0 ? sIdx + 1 : 100 + idx, categories.length);
+          // Prefer real resolved values for the referenced series (null gaps → 0
+          // for aggregation); demo fallback when offline / unresolved.
+          const real = sIdx >= 0 ? resolvedValues?.[sIdx] : undefined;
+          data = real
+            ? real.map((v) => (v == null ? 0 : v))
+            : demoSeriesData(sIdx >= 0 ? sIdx + 1 : 100 + idx, categories.length);
         } else {
           data = demoSeriesData(100 + idx, categories.length);
         }
         const prec = Number.isFinite(col.dataPrecision) ? col.dataPrecision : 2;
         return { id: col._id, label, data, prec };
       }),
-    [dataTable, series, categories, seriesById],
+    [dataTable, series, categories, seriesById, resolvedValues],
   );
 
   if (dataTable.transposeTable) {
