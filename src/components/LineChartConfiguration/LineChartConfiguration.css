@@ -5,6 +5,16 @@
   display: flex;
   flex-direction: column;
   background: transparent;
+  /* `.lc-config__col1` is `position: sticky`, which creates a stacking context
+     that traps the SDK TimeTabConfiguration's Add Duration / Add Shift popups
+     rendered inside it (the Data tab side modal renders at the `.lc-config`
+     root, OUTSIDE col1, so it isn't trapped). In the dev harness, the
+     `.app__config` wrapper has `position: relative; z-index: 1000` which
+     lifts the entire subtree above the preview, making the trapped popups
+     win. In production (Lens) there's no such wrapper, so we replicate the
+     lift on our own root. */
+  position: relative;
+  z-index: 1000;
 }
 
 /* ----- Shell (flex row containing Column 1 + optional Column 2) ----------- */
@@ -22,9 +32,8 @@
 .lc-config__col1 {
   display: flex;
   flex-direction: column;
-  width: 280px;
-  min-width: 280px;
-  flex-shrink: 0;
+  width: 100%;
+  min-width: 0;
   /* Fill the viewport minus the .app wrapper's top+bottom padding so the
      panel (and its sticky footer) stays fully visible without overflow. */
   height: calc(100vh - 2 * var(--spacing-05, 16px));
@@ -140,23 +149,45 @@
   margin-bottom: var(--spacing-04, 12px);
 }
 
-/* Time tab "Add Shift" / "Add Duration" panels are the SDK Modal in positioned
-   (transparent-backdrop) mode, which sits at --global-z-index-overlay (300) and
-   gets overlapped by the preview's popover-level chrome. Lift the panel above
-   every layer (match the Data-tab side modals). Its Hour/Minute SelectInput
-   dropdowns portal to <body>, so lift those even higher so they stay usable. */
-/* Every SDK modal backdrop — the Add Shift / Add Duration panels, the Delete
-   confirmation modal (Delete Shift / Delete Duration), and the Data-tab side
-   modals — must float above the preview. They all share `.fds-modal__backdrop`
-   and otherwise sit at the default overlay z-index (300), which the preview's
-   popover-level chrome (500) overlaps. Lift them all; their inner SelectInput
-   dropdowns portal to <body>, so keep those higher still to stay usable. */
+/* Every SDK modal backdrop — Add Shift / Add Duration in the Time tab, Delete
+   confirmation modals, and the Data-tab side modals — must float above both
+   the local preview AND any host (Lens) canvas widgets stacked next to the
+   configurator. The SDK Modal renders inline (no createPortal), so it inherits
+   whatever stacking context its ancestors create. `position: fixed` escapes
+   most containers (except ancestors with `transform`/`filter`/etc.); pair it
+   with a huge z-index so we win against any host overlay. `inset: 0` makes
+   the backdrop a full-viewport click-catcher; the inner `.fds-modal` still
+   positions itself via its inline `left`/`top` from the SDK Modal's
+   positionX/positionY props.
+   Inner SelectInput / ColorInput popovers ride one layer higher so the
+   dropdowns inside the modal stay usable. */
 .fds-modal__backdrop {
-  z-index: 9000 !important;
+  position: fixed !important;
+  inset: 0 !important;
+  z-index: 2147483647 !important;
 }
 .fds-select-input__popover,
 .fds-color-input__popover {
-  z-index: 9999 !important;
+  z-index: 2147483600 !important;
+}
+
+/* SDK TimeTabConfiguration's Add Duration / Add Shift popups are actually
+   SDK Modals — same `.fds-modal__backdrop` chrome as our Data tab modal —
+   plus a custom `.fds-ttc__panel-modal` class on the backdrop. The inner
+   `.fds-modal--positioned` gets inline `left/top` from the SDK's positionX/Y
+   logic, which anchors to `.fds-ttc`'s right edge — BUT `.fds-ttc` sits
+   INSIDE our configurator column's content area (with padding), so the inline
+   `left` lands inside the configurator instead of beside it. The modal then
+   straddles the configurator/canvas boundary and dashboard widgets visually
+   overlap it.
+   Override the SDK's inline left with a calc against `--lc-config-right-edge`
+   (which our JS sets from the configurator's real outer-right edge), so the
+   popup docks just to the right of the configurator panel like the Data tab
+   side modal does. The base `.fds-modal__backdrop` rule above already lifts
+   the backdrop to viewport-fixed + max z-index, so the popup floats over any
+   host canvas widget. */
+.fds-ttc__panel-modal .fds-modal--positioned {
+  left: calc(var(--lc-config-right-edge, 320px) + 20px) !important;
 }
 
 /* ----- Editor body --------------------------------------------------------- */
@@ -562,19 +593,33 @@
 .lc-config__style-tab__block {
   display: flex;
   flex-direction: column;
+  align-items: flex-start;
   gap: var(--spacing-03);
   padding-top: var(--spacing-02);
+  text-align: left;
 }
 
 .lc-config__style-tab__block-title {
   color: var(--text-default-primary);
   margin-top: var(--spacing-02);
+  align-self: flex-start;
+  text-align: left;
 }
 
+/* SDK Checkbox renders as `display: inline-flex` so the items shrink to
+   fit and can drift into a centered layout under certain parent rules.
+   Pin them to the start of the cross axis with left-aligned labels. */
 .lc-config__style-tab__checkbox-col {
   display: flex;
   flex-direction: column;
+  align-items: flex-start;
   gap: var(--spacing-02);
+  text-align: left;
+  width: 100%;
+}
+
+.lc-config__style-tab__checkbox-col > .fds-checkbox {
+  align-self: flex-start;
 }
 
 .lc-config__style-tab__color-row {

@@ -1,10 +1,19 @@
-import { useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import Highcharts from 'highcharts';
+import HC_Exporting from 'highcharts/modules/exporting';
+import HC_ExportData from 'highcharts/modules/export-data';
+import HC_FullScreen from 'highcharts/modules/full-screen';
 import { LineChart as DSLineChart } from '@faclon-labs/design-sdk/LineChart';
-import { Chart } from '@faclon-labs/design-sdk/Chart';
-import type { ChartPlotLine, ChartPlotBand } from '@faclon-labs/design-sdk/Chart';
+import { Chart, ChartActions, exportChart } from '@faclon-labs/design-sdk/Chart';
+import type { ChartPlotLine, ChartPlotBand, ChartExportFormat } from '@faclon-labs/design-sdk/Chart';
 import { Spinner } from '@faclon-labs/design-sdk/Spinner';
 import { EmptyState } from '@faclon-labs/design-sdk/EmptyState';
+import { DatePicker } from '@faclon-labs/design-sdk/DatePicker';
+import type { DateRange, DatePresetOption } from '@faclon-labs/design-sdk/DatePicker';
+import { DropdownMenu } from '@faclon-labs/design-sdk/DropdownMenu';
+import { ActionListItem } from '@faclon-labs/design-sdk/ActionListItem';
+import { ChevronDown } from 'react-feather';
 import {
   Table,
   TableHeader,
@@ -28,6 +37,21 @@ import type {
 import '@faclon-labs/design-sdk/styles.css';
 import './LineChart.css';
 
+// Register the Highcharts modules the SDK chart's actions slot will call
+// downstream (export to PNG/SVG/CSV/XLS, fullscreen toggle). Without these
+// registered at module load, chart.exportChart() / fullscreen.toggle() are
+// undefined and silently no-op. Order matters: `exporting` must register
+// before `export-data` (the latter extends the former).
+function installHcModule(mod: unknown) {
+  const factory = typeof mod === 'function' ? mod : (mod as { default?: unknown }).default;
+  if (typeof factory === 'function') (factory as (h: typeof Highcharts) => void)(Highcharts);
+}
+if (typeof window !== 'undefined') {
+  installHcModule(HC_Exporting);
+  installHcModule(HC_ExportData);
+  installHcModule(HC_FullScreen);
+}
+
 // ---------------------------------------------------------------------------
 // LineChart widget — pure UI renderer (DataLayer architecture).
 // Receives `config` (uiConfig) + `data` (DataEntry[] from the mini-engine) and
@@ -37,9 +61,34 @@ import './LineChart.css';
 // ---------------------------------------------------------------------------
 
 interface LineChartWidgetProps {
-  config?: LineChartUIConfig;
+  // Host may pass either the bare uiConfig OR the full envelope (with
+  // uiConfig nested). Normalize at the boundary.
+  config?: LineChartUIConfig | { uiConfig?: LineChartUIConfig };
   data?: DataEntry[];
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  // Iosense passes envelope.timeConfig as a SEPARATE top-level prop (the
+  // host-shape: { type, pickerType, defaultDurationId, allDurations,
+  // defaultPeriodicity, startTime, endTime, fixedDuration, ... }). We use
+  // it to derive the active window and emit `TIME_CHANGE` events back via
+  // onEvent — the host's data layer subscribes to those events to drive
+  // resolveAndCompute. Without this prop being read AND the corresponding
+  // TIME_CHANGE event being emitted on mount, iosense never schedules
+  // queries for this widget (the deployed Column Chart widget follows the
+  // same contract).
+  timeConfig?: {
+    type?: string;
+    pickerType?: string;
+    defaultDurationId?: string;
+    allDurations?: Array<{
+      id: string;
+      x?: number;
+      xPeriod?: string;
+      calendarType?: string;
+    }>;
+    defaultPeriodicity?: string;
+    startTime?: number | null;
+    endTime?: number | null;
+    fixedDuration?: { x?: number | string; xPeriod?: string } | null;
+  };
   onEvent?: (event: WidgetEvent) => void;
 }
 
@@ -93,12 +142,144 @@ function columnLabel(col: DataTableColumn, seriesById: Map<string, LineChartSeri
   return 'Source';
 }
 
-export function LineChart({ config, data = [] }: LineChartWidgetProps) {
+// Compute startTime/endTime from a host-shape timeConfig. Mirrors the
+// deployed Column Chart widget's `rn()` helper.
+function computeRange(tc?: LineChartWidgetProps['timeConfig']): {
+  startTime: number;
+  endTime: number;
+} {
+  const now = Date.now();
+  // If host pre-computed explicit timestamps, use them.
+  if (tc?.startTime && tc?.endTime) {
+    return { startTime: tc.startTime, endTime: tc.endTime };
+  }
+  // Otherwise, derive from the active preset (defaultDurationId → allDurations).
+  const presetId = tc?.defaultDurationId;
+  const preset = tc?.allDurations?.find((d) => d.id === presetId);
+  const PERIOD_MS: Record<string, number> = {
+    minute: 60_000,
+    hour: 3_600_000,
+    day: 86_400_000,
+    week: 7 * 86_400_000,
+    month: 30 * 86_400_000,
+    year: 365 * 86_400_000,
+  };
+  if (preset?.x && preset.xPeriod && PERIOD_MS[preset.xPeriod]) {
+    return { startTime: now - preset.x * PERIOD_MS[preset.xPeriod], endTime: now };
+  }
+  if (preset?.calendarType === 'today') {
+    const s = new Date();
+    s.setHours(0, 0, 0, 0);
+    return { startTime: s.getTime(), endTime: now };
+  }
+  if (preset?.calendarType === 'yesterday') {
+    const s = new Date();
+    s.setDate(s.getDate() - 1);
+    s.setHours(0, 0, 0, 0);
+    const e = new Date(s);
+    e.setHours(23, 59, 59, 999);
+    return { startTime: s.getTime(), endTime: e.getTime() };
+  }
+  // Fixed-mode duration as last resort.
+  const fd = tc?.fixedDuration;
+  if (fd?.x && fd.xPeriod && PERIOD_MS[fd.xPeriod]) {
+    return { startTime: now - Number(fd.x) * PERIOD_MS[fd.xPeriod], endTime: now };
+  }
+  // Final fallback: last 24h.
+  return { startTime: now - 86_400_000, endTime: now };
+}
+
+export function LineChart({
+  config: rawConfig,
+  data = [],
+  timeConfig,
+  onEvent,
+}: LineChartWidgetProps) {
+  // Mirror the Column Chart widget contract: emit a TIME_CHANGE event back
+  // via `onEvent` so the host's data layer registers this widget for query
+  // dispatch. Without at least one TIME_CHANGE the host never schedules a
+  // `resolveAndCompute` for us.
+  // The challenge: iosense passes a fresh `onEvent` function reference and
+  // a fresh `timeConfig` object on every render (echoing computed
+  // `startTime`/`endTime` back through the prop). Naive useEffect deps
+  // either (a) loop infinitely or (b) skip the first emit if onEvent was
+  // initially undefined. Solution: depend on all relevant inputs but DEDUPE
+  // by a stable "user intent" key — only emit when the user's choice
+  // (preset / periodicity / picker type) actually changed, not when iosense
+  // echoes a new startTime back at us.
+  const lastEmittedKeyRef = useRef<string>('');
+  useEffect(() => {
+    if (!onEvent) return;
+    // Wait for the host to pass a real timeConfig before emitting.
+    if (!timeConfig?.defaultDurationId && !timeConfig?.fixedDuration) return;
+    const key = [
+      timeConfig.defaultDurationId ?? '',
+      timeConfig.defaultPeriodicity ?? '',
+      timeConfig.pickerType ?? '',
+    ].join('|');
+    if (lastEmittedKeyRef.current === key) return;
+    lastEmittedKeyRef.current = key;
+    const { startTime, endTime } = computeRange(timeConfig);
+    const periodicity = (timeConfig.defaultPeriodicity || 'hourly').toLowerCase();
+    console.log('[LineChart] emit TIME_CHANGE →', { key, startTime, endTime, periodicity });
+    onEvent({
+      type: 'TIME_CHANGE',
+      payload: {
+        startTime: String(startTime),
+        endTime: String(endTime),
+        periodicity,
+      },
+    });
+  }, [
+    onEvent,
+    timeConfig?.defaultDurationId,
+    timeConfig?.defaultPeriodicity,
+    timeConfig?.pickerType,
+    timeConfig?.fixedDuration,
+  ]);
+
+  // Lens may pass the full envelope as `config` instead of just uiConfig.
+  // Detect by presence of `uiConfig` field on the input and unwrap.
+  const config: LineChartUIConfig | undefined =
+    rawConfig && typeof rawConfig === 'object' && 'uiConfig' in rawConfig && rawConfig.uiConfig
+      ? rawConfig.uiConfig
+      : (rawConfig as LineChartUIConfig | undefined);
+  // One-time diagnostic per render — tells us what shape the host actually
+  // passes for `config` (envelope vs uiConfig) and `data` (wrapped vs raw),
+  // plus per-series resolution status. Strip in a future pass if too chatty.
+  console.log('[LineChart] props →', {
+    configShape: rawConfig && typeof rawConfig === 'object' && 'uiConfig' in rawConfig ? 'envelope' : 'uiConfig',
+    chartCount: config?.charts?.length ?? 0,
+    activeChartId: config?.activeChartId ?? null,
+    dataEntryCount: data.length,
+    firstDataEntry: data[0]
+      ? {
+          key: (data[0] as { key?: string }).key,
+          hasValue: (data[0] as { value?: unknown }).value !== undefined,
+          hasSlots: Array.isArray((data[0] as unknown as { slots?: unknown }).slots),
+          slotCount: Array.isArray((data[0] as unknown as { slots?: unknown[] }).slots)
+            ? (data[0] as unknown as { slots: unknown[] }).slots.length
+            : null,
+        }
+      : null,
+  });
   const charts = config?.charts ?? [];
+  // Per-widget runtime override for which chart is shown. Lets the user
+  // switch between configured charts via the title dropdown WITHOUT writing
+  // back to the envelope. Reset when the envelope's set of charts changes.
+  const [previewChartId, setPreviewChartId] = useState<string | null>(null);
+  useEffect(() => {
+    // If the previewed chart id no longer exists (envelope changed), drop it
+    // so we fall back to the envelope's activeChartId / first chart.
+    if (previewChartId && !charts.some((c) => c._id === previewChartId)) {
+      setPreviewChartId(null);
+    }
+  }, [charts, previewChartId]);
   const activeChart = useMemo<ChartInstance | null>(() => {
     if (!charts.length) return null;
-    return charts.find((c) => c._id === config?.activeChartId) ?? charts[0];
-  }, [charts, config?.activeChartId]);
+    const id = previewChartId ?? config?.activeChartId;
+    return charts.find((c) => c._id === id) ?? charts[0];
+  }, [charts, previewChartId, config?.activeChartId]);
   const chartIndex = activeChart ? charts.findIndex((c) => c._id === activeChart._id) : -1;
 
   // Resolve each configured series from `data` (series binding key matches the
@@ -107,7 +288,10 @@ export function LineChart({ config, data = [] }: LineChartWidgetProps) {
   const { series, categories } = useMemo(() => {
     const configured = activeChart?.series ?? [];
     const resolved = configured.map((s, si) => {
-      const payload = getSeriesData(`charts[${chartIndex}].series[${si}].dataSource`, data);
+      const payload =
+        getSeriesData(`charts[${chartIndex}].series[${si}].unsPath`, data) ??
+        // Legacy key from envelopes saved before the dataSource → unsPath rename.
+        getSeriesData(`charts[${chartIndex}].series[${si}].dataSource`, data);
       const slots = payload?.slots ?? [];
       return { def: s, slots };
     });
@@ -127,7 +311,13 @@ export function LineChart({ config, data = [] }: LineChartWidgetProps) {
     return { series: out, categories: cats };
   }, [activeChart, chartIndex, data]);
 
-  const hasData = series.some((s) => s.data.some((v) => v !== null));
+  // Render whenever the backend returned slots for any series — even if all
+  // values are null / non-numeric (the backend can return string sentinels
+  // like " N/A" for compute sources, which our slot-to-number map turns into
+  // null). The X-axis with time labels still renders and the user can see
+  // the range / confirm the source is wired. The empty state is only for
+  // when ZERO slots came back.
+  const hasSlots = series.some((s) => s.data.length > 0);
 
   // "Add Source as Tooltip" — these series stay in the dataset (shared tooltip)
   // but render no line and no legend chip. Index-aligned with `series`.
@@ -287,6 +477,19 @@ export function LineChart({ config, data = [] }: LineChartWidgetProps) {
     if (miscColors.grid) xAxis.gridLineColor = miscColors.grid;
 
     const opts: any = { xAxis };
+    // Highcharts paints `<rect class="highcharts-background">` with an
+    // explicit fill — `fill: transparent` via CSS only works if NOTHING
+    // else (SDK chrome, theme classes) paints white between us and the
+    // card. The robust fix: tell Highcharts directly to use the card's
+    // background color (or transparent when wrap-in-card is on and the
+    // card has no surface of its own). Same approach mirrors the deployed
+    // Column Chart widget.
+    opts.chart = {
+      backgroundColor:
+        style?.card?.wrapInCard === false
+          ? style?.card?.backgroundColor || '#FFFFFF'
+          : 'transparent',
+    };
     if (multiAxis) {
       opts.yAxis = multiAxis.yAxis.map((a: any) => ({
         ...a,
@@ -320,26 +523,87 @@ export function LineChart({ config, data = [] }: LineChartWidgetProps) {
     });
     if (hasTooltipOnly) opts.tooltip = { shared: true };
     return opts as any;
-  }, [axisColors, miscColors, multiAxis, series, tooltipOnlyFlags, hasTooltipOnly]);
+  }, [axisColors, miscColors, multiAxis, series, tooltipOnlyFlags, hasTooltipOnly, style?.card?.wrapInCard, style?.card?.backgroundColor]);
 
   // The data table is portalled into the chart card (sibling of the canvas).
   const [cardEl, setCardEl] = useState<HTMLDivElement | null>(null);
+
+  // Per-chart in-widget UI overrides: NOT written back to the envelope (these
+  // are end-user view affordances, like flipping legend off temporarily).
+  // Defaults: legend on, dataLabel off — matches Column Chart widget defaults.
+  const [chartDisplay, setChartDisplay] = useState<{
+    legends: boolean;
+    dataLabel: boolean;
+  }>({ legends: true, dataLabel: false });
+
+  // Local DatePicker state — initialized from the host-passed timeConfig.
+  // On user pick, we emit TIME_CHANGE through onEvent so the host's data
+  // layer re-queries with the new range.
+  const initialRange = useMemo<DateRange | null>(() => {
+    const { startTime, endTime } = computeRange(timeConfig);
+    return { start: new Date(startTime), end: new Date(endTime) };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [timeConfig?.defaultDurationId, timeConfig?.pickerType]);
+  const [rangeValue, setRangeValue] = useState<DateRange | null>(initialRange);
+  // Keep `rangeValue` in sync if the host pushes a new preset down.
+  useEffect(() => {
+    setRangeValue(initialRange);
+  }, [initialRange]);
+  const [datePickerOpen, setDatePickerOpen] = useState(false);
+  const [selectedPreset, setSelectedPreset] = useState<string>(
+    timeConfig?.defaultDurationId ?? '',
+  );
+
+  // Highcharts instance handle for the export menu and fullscreen toggle.
+  const chartInstanceRef = useRef<
+    { reflow: () => void; fdsToggleFullscreen?: () => void } | null
+  >(null);
+
+  // Date presets surfaced in the DatePicker's preset rail. Derived from the
+  // host-passed allDurations so what's offered here matches what was
+  // configured in the configurator's Time tab.
+  const datePresets = useMemo<DatePresetOption[]>(
+    () =>
+      (timeConfig?.allDurations ?? []).map((d) => ({
+        value: d.id,
+        label: (d as { label?: string }).label || d.id,
+      })),
+    [timeConfig?.allDurations],
+  );
 
   // Data table is per-chart — show only the active chart's table (if any).
   const dataTable = activeChart?.dataTable;
   const showDataTable = !!dataTable && dataTable.columns.length > 0;
 
+  const configuredSeriesCount = activeChart?.series?.length ?? 0;
+
   // ----- Render states ------------------------------------------------------
+  // No envelope / no charts configured at all — host hasn't pushed a config.
   if (!activeChart) {
     return (
-      <div className="lcw">
+      <div className="lcw lcw--empty">
         <EmptyState title="No widget to display" description="This chart has no configuration." />
       </div>
     );
   }
 
-  if (data.length === 0 || !hasData) {
-    // Mini-engine returns [] while loading — show a skeleton/spinner.
+  // Chart exists but no data sources added — distinct from a loading state, so
+  // we never show an indefinite spinner just because the user hasn't picked a
+  // UNS topic yet.
+  if (configuredSeriesCount === 0) {
+    return (
+      <div className="lcw lcw--empty">
+        <EmptyState
+          title="No data source configured"
+          description="Add a data source to display the chart."
+        />
+      </div>
+    );
+  }
+
+  // Data sources configured, host hasn't delivered resolved data yet — true
+  // loading state (the host's engine call is in flight).
+  if (data.length === 0) {
     return (
       <div className="lcw lcw--loading">
         <Spinner />
@@ -347,8 +611,39 @@ export function LineChart({ config, data = [] }: LineChartWidgetProps) {
     );
   }
 
+  // ZERO slots came back for every configured series — there's truly nothing
+  // the chart can render (no time axis, no points). Show the empty state.
+  // Note: we INTENTIONALLY do NOT hit this branch when slots exist but all
+  // values are null (e.g. backend " N/A" sentinels for compute sources) —
+  // those cases still render a time-axis with null gaps, which is more
+  // useful than an empty state.
+  if (!hasSlots) {
+    return (
+      <div className="lcw lcw--empty">
+        <EmptyState
+          title="No data in selected range"
+          description="Try a different time window or check that the UNS source has values."
+        />
+      </div>
+    );
+  }
+
+  // Publish the user-picked card background color as a CSS variable so the
+  // SDK chart's legend strip (which sits inside .fds-chart but doesn't
+  // inherit a background) can paint the SAME color via a static CSS rule.
+  // `--lcw-card-bg` defaults to transparent when wrap-into-card is ON
+  // (some external wrapper owns the surface).
+  const widgetStyle = useMemo<React.CSSProperties>(() => {
+    const bg =
+      style?.card?.wrapInCard === true
+        ? 'transparent'
+        : style?.card?.backgroundColor || '#FFFFFF';
+    // CSS custom property assignment requires `as` cast in React types.
+    return { ['--lcw-card-bg' as string]: bg } as React.CSSProperties;
+  }, [style?.card?.wrapInCard, style?.card?.backgroundColor]);
+
   return (
-    <div className="lcw">
+    <div className="lcw" style={widgetStyle}>
       {miscColors.legend && (
         <style>{`.lcw [class*="legend-label"] { color: ${miscColors.legend} !important; }`}</style>
       )}
@@ -371,18 +666,93 @@ export function LineChart({ config, data = [] }: LineChartWidgetProps) {
         ref={setCardEl}
         style={cardStyle}
         title={
-          style?.hideElements?.chartTitle ? undefined : (
+          style?.hideElements?.chartTitle ? undefined : charts.length > 1 ? (
+            <ChartTitleSwitcher
+              charts={charts}
+              activeChart={activeChart}
+              onSelect={setPreviewChartId}
+              titleStyle={titleStyle}
+            />
+          ) : (
             <span style={titleStyle}>{activeChart.title || 'Line Chart'}</span>
           )
         }
+        // DatePicker in the filters slot — per-widget local time picker.
+        // Hidden if the widget has no data sources (nothing to time-filter).
+        filters={
+          <DatePicker
+            mode="range"
+            isOpen={datePickerOpen}
+            onOpenChange={setDatePickerOpen}
+            rangeValue={rangeValue}
+            onRangeChange={(v) => {
+              setRangeValue(v);
+              if (!v || !onEvent) return;
+              const startTime = new Date(v.start).getTime();
+              const endTime = new Date(v.end).getTime();
+              const periodicity = (timeConfig?.defaultPeriodicity || 'hourly').toLowerCase();
+              // User-picked custom range — bypass the dedupe key so the host
+              // refetches even if defaultDurationId hasn't changed.
+              onEvent({
+                type: 'TIME_CHANGE',
+                payload: {
+                  startTime: String(startTime),
+                  endTime: String(endTime),
+                  periodicity,
+                },
+              });
+            }}
+            showPresets={datePresets.length > 0}
+            showPresetChip={datePresets.length > 0}
+            presets={datePresets}
+            selectedPreset={selectedPreset}
+            onPresetSelect={(v: string) => {
+              setSelectedPreset(v);
+              // The preset picker fires onRangeChange synchronously with the
+              // resolved range — no need to emit TIME_CHANGE here as well.
+            }}
+            placeholder="Select date range"
+          />
+        }
+        // Info / Settings / Export icons — matches the deployed Column
+        // Chart's chrome. Settings exposes legend + data-label toggles;
+        // Export downloads PNG/JPEG/SVG/CSV/XLSX or toggles fullscreen.
+        // Honors style.hideElements.{settingsIcon,exportIcon}.
+        actions={
+          activeChart.description?.trim() ||
+          !style?.hideElements?.settingsIcon ||
+          !style?.hideElements?.exportIcon ? (
+            <ChartActionIcons
+              description={activeChart.description}
+              showSettings={!style?.hideElements?.settingsIcon}
+              showMore={!style?.hideElements?.exportIcon}
+              chartRef={chartInstanceRef}
+              display={chartDisplay}
+              onDisplayChange={setChartDisplay}
+            />
+          ) : undefined
+        }
       >
         <DSLineChart
+          // Highcharts updates options in-place via React props for most
+          // fields, but doesn't reliably pick up changes to deep style
+          // objects (axis title color, label color, line color, grid color,
+          // chart background). Force a fresh Highcharts instance by keying
+          // on a stable serialization of all style-sensitive inputs so a
+          // configurator change immediately reflects on next render.
+          key={JSON.stringify({
+            ax: axisColors,
+            mc: miscColors,
+            bg: highchartsOptions?.chart?.backgroundColor,
+            chart: activeChart._id,
+          })}
           bare
           // null entries are valid Highcharts gaps; the SDK's LineSeries types
           // data as number[], so cast at the boundary.
           series={series as any}
           categories={categories}
-          showLegend
+          showLegend={chartDisplay.legends}
+          showDataLabels={chartDisplay.dataLabel}
           showMarkers={false}
           smooth
           plotLines={multiAxis ? [] : plotLines}
@@ -390,6 +760,11 @@ export function LineChart({ config, data = [] }: LineChartWidgetProps) {
           // xAxisTitle hidden for now (not needed): xAxisTitle="Date"
           yAxisTitle={leftAxisTitle}
           highchartsOptions={highchartsOptions}
+          // Capture the Highcharts instance handle so the export menu and
+          // fullscreen toggle can target it.
+          onChartReady={(inst: { reflow: () => void; fdsToggleFullscreen?: () => void }) => {
+            chartInstanceRef.current = inst;
+          }}
         />
       </Chart>
       {cardEl &&
@@ -410,6 +785,207 @@ export function LineChart({ config, data = [] }: LineChartWidgetProps) {
 }
 
 LineChart.displayName = 'LineChart';
+
+// ---------------------------------------------------------------------------
+// ChartActionIcons — Info / Settings / Export icons in the SDK Chart's
+// `actions` slot. Mirrors the deployed Column Chart's chrome:
+//   • Info icon (only when chart has a description) → hover tooltip
+//   • Settings icon → DropdownMenu with legend / data-label toggles
+//   • Export icon  → DropdownMenu with PNG/JPEG/SVG/CSV/XLSX + Full Screen
+// Open state is controlled per-icon and dismisses on outside click / Esc.
+// ---------------------------------------------------------------------------
+function ChartActionIcons({
+  description,
+  showSettings,
+  showMore,
+  chartRef,
+  display,
+  onDisplayChange,
+}: {
+  description?: string;
+  showSettings: boolean;
+  showMore: boolean;
+  chartRef: React.MutableRefObject<{
+    reflow: () => void;
+    fdsToggleFullscreen?: () => void;
+  } | null>;
+  display: { legends: boolean; dataLabel: boolean };
+  onDisplayChange: (next: { legends: boolean; dataLabel: boolean }) => void;
+}) {
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(false);
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!settingsOpen && !moreOpen) return;
+    function onDown(e: MouseEvent) {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) {
+        setSettingsOpen(false);
+        setMoreOpen(false);
+      }
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') {
+        setSettingsOpen(false);
+        setMoreOpen(false);
+      }
+    }
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [settingsOpen, moreOpen]);
+
+  const toggle = (key: 'legends' | 'dataLabel') =>
+    onDisplayChange({ ...display, [key]: !display[key] });
+
+  const doExport = (format: ChartExportFormat) => {
+    const instance = chartRef.current;
+    if (instance) {
+      exportChart({ instance, engine: 'highcharts', format, fileName: 'line-chart' });
+    }
+    setMoreOpen(false);
+  };
+  const toggleFullscreen = () => {
+    chartRef.current?.fdsToggleFullscreen?.();
+    setMoreOpen(false);
+  };
+
+  const exportFormats: ChartExportFormat[] = ['PNG', 'JPEG', 'SVG', 'CSV', 'XLSX'];
+  const hasDescription = !!description?.trim();
+
+  return (
+    <div className="lcw__chart-actions" ref={wrapRef}>
+      <ChartActions
+        showInfo={hasDescription}
+        infoLabel={hasDescription ? description!.trim() : 'Info'}
+        showSettings={showSettings}
+        settingsLabel="Settings"
+        onSettingsClick={() => {
+          setSettingsOpen((o) => !o);
+          setMoreOpen(false);
+        }}
+        showMore={showMore}
+        moreLabel="Export"
+        onMoreClick={() => {
+          setMoreOpen((o) => !o);
+          setSettingsOpen(false);
+        }}
+      />
+      {settingsOpen && (
+        <div className="lcw__action-menu">
+          <DropdownMenu>
+            <ActionListItem contentType="SectionHeading" title="Chart Control" />
+            <ActionListItem
+              title="Legends"
+              selectionType="Multiple"
+              isSelected={display.legends}
+              onClick={() => toggle('legends')}
+            />
+            <ActionListItem
+              title="Data Label"
+              selectionType="Multiple"
+              isSelected={display.dataLabel}
+              onClick={() => toggle('dataLabel')}
+            />
+          </DropdownMenu>
+        </div>
+      )}
+      {moreOpen && (
+        <div className="lcw__action-menu">
+          <DropdownMenu>
+            {exportFormats.map((f) => (
+              <ActionListItem
+                key={f}
+                title={`Download ${f}`}
+                selectionType="None"
+                onClick={() => doExport(f)}
+              />
+            ))}
+            <ActionListItem title="Full Screen" selectionType="None" onClick={toggleFullscreen} />
+          </DropdownMenu>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Silence unused-import warning when Fragment isn't used elsewhere in the file.
+void Fragment;
+
+// ---------------------------------------------------------------------------
+// ChartTitleSwitcher — clickable title with a dropdown to switch between
+// configured charts in the same widget. Rendered as the Chart's `title` slot
+// when more than one chart exists. Uses the SDK's `fds-chart__title` /
+// `fds-chart-switcher__*` classes so it visually matches every other
+// switchable chart title in the platform.
+// ---------------------------------------------------------------------------
+function ChartTitleSwitcher({
+  charts,
+  activeChart,
+  onSelect,
+  titleStyle,
+}: {
+  charts: ChartInstance[];
+  activeChart: ChartInstance | null;
+  onSelect: (id: string) => void;
+  titleStyle?: React.CSSProperties;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    function onDown(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') setOpen(false);
+    }
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+  const label = activeChart?.title || 'Untitled Chart';
+  return (
+    <div className="fds-chart-switcher__title" ref={ref}>
+      <button
+        type="button"
+        className="fds-chart__title"
+        onClick={() => setOpen((o) => !o)}
+        aria-haspopup="menu"
+        aria-expanded={open}
+      >
+        <span className="fds-chart__title-label HeadingSmallSemibold" style={titleStyle}>
+          {label}
+        </span>
+        <ChevronDown className="fds-chart__title-icon" aria-hidden="true" />
+      </button>
+      {open && (
+        <div className="fds-chart-switcher__menu">
+          <DropdownMenu>
+            {charts.map((c) => (
+              <ActionListItem
+                key={c._id}
+                title={c.title || 'Untitled Chart'}
+                selectionType="Single"
+                isSelected={c._id === activeChart?._id}
+                onClick={() => {
+                  onSelect(c._id);
+                  setOpen(false);
+                }}
+              />
+            ))}
+          </DropdownMenu>
+        </div>
+      )}
+    </div>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Data table — aggregates each configured column from the resolved series data.
@@ -458,7 +1034,9 @@ function DataTablePreview({
         if (col.sourceMode === 'Existing' && col.seriesId) {
           const si = series.findIndex((s) => s._id === col.seriesId);
           if (si >= 0) {
-            const payload = getSeriesData(`charts[${chartIndex}].series[${si}].dataSource`, data);
+            const payload =
+              getSeriesData(`charts[${chartIndex}].series[${si}].unsPath`, data) ??
+              getSeriesData(`charts[${chartIndex}].series[${si}].dataSource`, data);
             values = (payload?.slots ?? [])
               .map((slot) => slot.value)
               .filter((v): v is number => typeof v === 'number');

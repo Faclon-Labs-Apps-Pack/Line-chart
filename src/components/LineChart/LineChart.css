@@ -1,17 +1,89 @@
-/* LineChart widget — fills its host container. */
+/* LineChart widget — fills its host container with a flex chain so the chart
+   canvas grows to whatever height the dashboard layer hands us. */
 .lcw {
   width: 100%;
   height: 100%;
   min-width: 0;
   min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
-/* Loading state: center the spinner in the available space. */
+/* Empty/loading states need an actual surface — the dashboard layer behind us
+   is grey, so a bare EmptyState/Spinner without a background looks broken
+   (transparent panel with stray text). Give every non-chart state a white
+   card and a soft border to match the SDK Chart frame. */
+.lcw--empty,
 .lcw--loading {
+  background-color: var(--background-surface-intense, #FFFFFF);
+  border: 1px solid var(--border-subtle, #EEEEEE);
+  border-radius: var(--radius-md, 8px);
   display: flex;
   align-items: center;
   justify-content: center;
   padding: var(--spacing-08, 32px);
+}
+
+/* Chart wrapper: let the SDK Chart fill the available space inside .lcw. */
+.lcw > .fds-chart {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+}
+
+/* The chart background color is set on Highcharts directly via
+   `highchartsOptions.chart.backgroundColor` in LineChart.tsx (driven by
+   `style.card.backgroundColor` from the Style tab). Don't fight it with
+   `fill: transparent !important` here — that wins the CSS cascade and the
+   user's picked color never shows up.
+   The SDK chart title is a pill with its own opaque background — when the
+   user picks a custom card background, the title would otherwise float in
+   a white capsule. Strip its surface in every state (including hover). */
+/* The SDK chart's title pill and the legend strip both have (or inherit)
+   their own opaque white surface. We don't want "transparent" — that just
+   reveals whatever's underneath, which can ALSO be white. Force them to
+   paint the SAME color the user picked in the Style tab's "Background
+   Color" field. The color is published as `--lcw-card-bg` on `.lcw` (see
+   `widgetStyle` in LineChart.tsx). When wrap-into-card is ON the variable
+   resolves to transparent. */
+.lcw .fds-chart__title,
+.lcw .fds-chart__title:hover {
+  background-color: var(--lcw-card-bg, transparent) !important;
+}
+
+.lcw .fds-chart__scrollable-legend,
+.lcw .fds-chart__scrollable-legend-item,
+.lcw .fds-chart__legend,
+.lcw .fds-chart__footer {
+  background-color: var(--lcw-card-bg, transparent) !important;
+}
+
+/* Stretch the underlying highcharts SVG so it reflows with the chart card,
+   not its mount-time intrinsic size. Without this the canvas freezes at its
+   first measured height when the dashboard layer resizes us. */
+.lcw .highcharts-container,
+.lcw .highcharts-container svg {
+  width: 100% !important;
+  height: 100% !important;
+}
+
+/* Action icons wrapper in the SDK Chart's actions slot — anchors the
+   Settings / Export DropdownMenus below the icon row. */
+.lcw__chart-actions {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--spacing-02, 4px);
+}
+
+/* Floating dropdown menu under the Settings / Export icons. Mirrors the
+   pattern used elsewhere (Column Chart) so the menu chrome is consistent. */
+.lcw__action-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  min-width: 200px;
+  z-index: 100;
 }
 
 /* Data table hugs its content below the chart canvas (portalled into the card). */

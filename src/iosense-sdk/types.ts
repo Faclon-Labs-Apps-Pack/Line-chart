@@ -102,7 +102,15 @@ export interface LineChartSeries {
   _id: string;
   name: string;
   color: string;
-  dataSource: string; // bindable: stores {{uns:wsId://path}}
+  // Bindable: stores {{uns:wsId://path}}. Field name MUST be `unsPath` —
+  // iosense's host engine reads binding keys whose path ends in `.unsPath`
+  // and treats them as series sources (same convention the deployed Column
+  // Chart widget uses). `dataSource` is kept as a legacy read-side field for
+  // existing envelopes saved before the rename; configurator/widget never
+  // emit it anymore.
+  unsPath: string;
+  /** @deprecated Use `unsPath`. Legacy field kept for envelope migration only. */
+  dataSource?: string;
   downsampling?: string;
   downsamplingUnit?: string;
   dataPrecision?: number;
@@ -127,7 +135,10 @@ export interface LineChartAxis {
   _id: string;
   name: string;
   position: 'Left' | 'Right';
-  dataSource: string;         // bindable: stores {{uns:wsId://path}}
+  // See LineChartSeries.unsPath for the rename rationale.
+  unsPath: string;
+  /** @deprecated Use `unsPath`. Legacy field for envelope migration. */
+  dataSource?: string;
   linkedSeriesIds: string[];  // legacy fallback for renderer; kept for backward compat
 }
 
@@ -337,14 +348,46 @@ export interface GTPChart {
   sources: GTPChartSource[];
 }
 
+// Host (iosense Lens) time config shape — distinct from the SDK's
+// TimeTabUIConfig. Iosense's query-engine reads this to derive `startTime`,
+// `endTime`, `timezone`, `shifts` for resolveAndCompute. Mirrors the shape
+// the deployed Column Chart widget emits (`timezone, type, pickerType,
+// cycleTime, startTime, endTime, fixedDuration, defaultDurationId,
+// allDurations, defaultPeriodicity`). Reverse-engineered from the
+// column chart bundle's onChange transform.
+export interface HostTimeConfig {
+  timezone: string;
+  type: 'local' | 'fixed' | 'global';
+  pickerType: 'local' | 'fixed' | 'global';
+  cycleTime: import('@faclon-labs/design-sdk/TimeTabConfiguration').GTPCycleTimeConfig | null;
+  startTime: number | null;
+  endTime: number | null;
+  fixedDuration?: {
+    id: 'fixed';
+    label: string;
+    navigation: string;
+    x: number;
+    xPeriod: string;
+    xEvent: string;
+    y: number;
+    yPeriod: string;
+    yEvent: string;
+  };
+  defaultDurationId: string;
+  allDurations: TimeTabUIConfig['allDurations'];
+  defaultPeriodicity: string;
+}
+
 export interface LineChartEnvelope {
   _id: string;
   type: 'LineChart';
   general: { title: string };
-  // Mini-engine reads timeConfig to compute startTime/endTime for resolveAndCompute.
-  timeConfig?: TimeTabUIConfig;
-  // Full TimeTabConfiguration UI state — configurator re-hydrates from this; mini-engine ignores it.
-  // Must always be emitted alongside timeConfig, never alone.
+  // Host (Lens) reads timeConfig in HostTimeConfig shape to derive
+  // startTime/endTime/timezone/shifts for resolveAndCompute. The legacy
+  // TimeTabUIConfig is accepted as input but always normalized via
+  // toHostTimeConfig() before persisting.
+  timeConfig?: HostTimeConfig | TimeTabUIConfig;
+  // Full TimeTabConfiguration UI state — configurator re-hydrates from this.
   timeTabConfig?: TimeTabUIConfig;
   uiConfig: LineChartUIConfig;
   dynamicBindingPathList: Array<BindingEntry>;

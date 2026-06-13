@@ -3,6 +3,14 @@ import { BindingEntry, SeriesPayload, SeriesMeta, SeriesSlot } from './types';
 const STAGING_BASE = 'https://stagingsv.iosense.io/api';
 const GRAPH = 'iosense_test_uns';
 
+// Lens injects `authentication` already prefixed with "Bearer ". Dev harness
+// stores the raw JWT. Normalize at every call site so the Authorization header
+// is never "Bearer Bearer …".
+function bearer(token: string): string {
+  const t = (token || '').trim();
+  return t.toLowerCase().startsWith('bearer ') ? t : `Bearer ${t}`;
+}
+
 function isRawSeriesItem(item: Record<string, unknown>): boolean {
   return Array.isArray(item.slots);
 }
@@ -50,7 +58,7 @@ export async function resolveAndCompute(
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${authentication}`,
+      Authorization: bearer(authentication),
     },
     body: JSON.stringify(body),
   });
@@ -90,9 +98,22 @@ export async function fetchUNSNodes(
   if (label) params.set('label', label);
   if (expandPostfix) params.set('expandPostfix', 'true');
   const res = await fetch(`${STAGING_BASE}/account/uns/nodes?${params}`, {
-    headers: { Authorization: `Bearer ${authentication}` },
+    headers: { Authorization: bearer(authentication) },
   });
+  // Without an explicit ok check, a 401/403 returning `{ success: false }` would
+  // cache an empty workspace map and silently break the UNS dropdown forever
+  // (only a page reload would clear it). Throw so the caller's catch path runs
+  // and the cache stays null, letting the next onOpen retry.
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(
+      `fetchUNSNodes HTTP ${res.status} ${res.statusText}${body ? ` — ${body.slice(0, 300)}` : ''}`,
+    );
+  }
   const json = await res.json();
+  if (json && json.success === false) {
+    throw new Error(`fetchUNSNodes returned success:false — ${JSON.stringify(json).slice(0, 300)}`);
+  }
   return (json?.data?.data ?? []) as Array<{
     id: string; type: string; name?: string; path: string | null; parentId: string | null;
   }>;

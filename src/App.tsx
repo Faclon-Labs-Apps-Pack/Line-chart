@@ -306,7 +306,10 @@ export default function App() {
   // from the envelope's timeConfig (the source of truth the mini-engine reads),
   // falling back to timeTabConfig for legacy envelopes.
   // ---------------------------------------------------------------------------
-  const timeCfg = envelope?.timeConfig ?? envelope?.timeTabConfig;
+  // Prefer the raw SDK TimeTabUIConfig (timeTabConfig); fall back to
+  // legacy `timeConfig` (which was the same SDK shape pre-refactor).
+  const timeCfg = envelope?.timeTabConfig
+    ?? (envelope?.timeConfig as import('./iosense-sdk/types').TimeTabUIConfig | undefined);
   const allDurations: GTPPreset[] = timeCfg?.allDurations ?? [];
   const defaultDurationId = timeCfg?.defaultDurationId;
   const defaultPeriodicity = timeCfg?.defaultPeriodicity;

@@ -60,6 +60,7 @@ import {
   AnomalyOperator,
   AnomalyLabelMode,
   TimeTabUIConfig,
+  HostTimeConfig,
   GTPGlobalTimepicker,
   GTPChart,
   DataTableConfig,
@@ -129,80 +130,30 @@ function buildDynamicBindingPathList(
   return paths;
 }
 
-// Sensible default for a fresh envelope's timeConfig.
-const DEFAULT_TIME_CONFIG: TimeTabUIConfig = {
+// Default timeConfig persisted in the envelope when the user hasn't opened
+// the Time tab. Iosense's host gates the widget on `envelope.timeConfig`
+// AND uses `defaultDurationId` to look up the matching preset in
+// `allDurations` to derive the window. We must ship the FULL set of
+// built-in presets so when the user selects any of them in the Time tab
+// (today / yesterday / last7d / current_week / …), the chosen id is
+// present in allDurations and iosense's engine can compute time.
+// Mirrors the SDK TimeTabConfiguration's own built-in preset roster.
+const FALLBACK_TIME_CONFIG: TimeTabUIConfig = {
   timezone: 'Asia/Kolkata',
   timeType: 'local',
   defaultDurationId: 'last24h',
-  allDurations: [
-    {
-      id: 'today',
-      label: 'Today',
-      calendarType: 'today',
-      isBuiltIn: true,
-      periodicities: ['minute', 'hourly', 'daily'],
-    },
-    {
-      id: 'yesterday',
-      label: 'Yesterday',
-      calendarType: 'yesterday',
-      isBuiltIn: true,
-      periodicities: ['minute', 'hourly', 'daily'],
-    },
-    {
-      id: 'last24h',
-      label: 'Last 24 Hours',
-      x: 24,
-      xPeriod: 'hour',
-      isBuiltIn: true,
-      periodicities: ['minute', 'hourly'],
-    },
-    {
-      id: 'last7d',
-      label: 'Last 7 Days',
-      x: 7,
-      xPeriod: 'day',
-      isBuiltIn: true,
-      periodicities: ['hourly', 'daily'],
-    },
-    {
-      id: 'last30d',
-      label: 'Last 30 Days',
-      x: 30,
-      xPeriod: 'day',
-      isBuiltIn: true,
-      periodicities: ['daily', 'weekly'],
-    },
-    {
-      id: 'current_week',
-      label: 'Current Week',
-      calendarType: 'current_week',
-      isBuiltIn: true,
-      periodicities: ['hourly', 'daily'],
-    },
-    {
-      id: 'previous_week',
-      label: 'Previous Week',
-      calendarType: 'previous_week',
-      isBuiltIn: true,
-      periodicities: ['hourly', 'daily'],
-    },
-    {
-      id: 'current_month',
-      label: 'Current Month',
-      calendarType: 'current_month',
-      isBuiltIn: true,
-      periodicities: ['daily', 'weekly'],
-    },
-    {
-      id: 'previous_month',
-      label: 'Previous Month',
-      calendarType: 'previous_month',
-      isBuiltIn: true,
-      periodicities: ['daily', 'weekly'],
-    },
-  ],
   defaultPeriodicity: 'hourly',
+  allDurations: [
+    { id: 'today',          label: 'Today',          calendarType: 'today',          isBuiltIn: true, periodicities: ['minute', 'hourly', 'daily'] },
+    { id: 'yesterday',      label: 'Yesterday',      calendarType: 'yesterday',      isBuiltIn: true, periodicities: ['minute', 'hourly', 'daily'] },
+    { id: 'last24h',        label: 'Last 24 Hours',  x: 24, xPeriod: 'hour',         isBuiltIn: true, periodicities: ['minute', 'hourly'] },
+    { id: 'last7d',         label: 'Last 7 Days',    x: 7,  xPeriod: 'day',          isBuiltIn: true, periodicities: ['hourly', 'daily'] },
+    { id: 'last30d',        label: 'Last 30 Days',   x: 30, xPeriod: 'day',          isBuiltIn: true, periodicities: ['daily', 'weekly'] },
+    { id: 'current_week',   label: 'Current Week',   calendarType: 'current_week',   isBuiltIn: true, periodicities: ['hourly', 'daily'] },
+    { id: 'previous_week',  label: 'Previous Week',  calendarType: 'previous_week',  isBuiltIn: true, periodicities: ['hourly', 'daily'] },
+    { id: 'current_month',  label: 'Current Month',  calendarType: 'current_month',  isBuiltIn: true, periodicities: ['daily', 'weekly'] },
+    { id: 'previous_month', label: 'Previous Month', calendarType: 'previous_month', isBuiltIn: true, periodicities: ['daily', 'weekly'] },
+  ],
 };
 
 const DEFAULT_DATA_TABLE: DataTableConfig = {
@@ -286,23 +237,94 @@ function normalizeStyling(raw: unknown): LineChartStyling {
   return DEFAULT_STYLING;
 }
 
+// Transform the SDK's TimeTabUIConfig into the HostTimeConfig shape that
+// iosense's Lens query-engine reads. Reverse-engineered from the deployed
+// Column Chart configurator bundle (`iolens-columnchart-widget`) — that
+// widget's onChange wraps the SDK value in this exact shape, which is why
+// its envelope's `timeConfig` is recognized by the host (and produces
+// `startTime`/`endTime`/`timezone`/`shifts` in the resolveAndCompute call).
+// Setting `timeConfig: rawTimeTabConfig` does NOT work — the host needs
+// `type`, `pickerType`, `startTime: null`, `endTime: null`, etc.
+function toHostTimeConfig(t: TimeTabUIConfig): HostTimeConfig {
+  const pickerType = (t.linkTimeWith ?? t.timeType ?? 'local') as
+    | 'local'
+    | 'fixed'
+    | 'global';
+  const fd = t.fixed?.duration;
+  const fixedDuration =
+    pickerType === 'fixed' && fd
+      ? {
+          id: 'fixed' as const,
+          label: fd.name || 'Fixed',
+          navigation: fd.navigation,
+          x: Number(fd.x) || 0,
+          xPeriod: fd.xPeriod,
+          xEvent: fd.xEvent,
+          y: Number(fd.y) || 0,
+          yPeriod: fd.yPeriod,
+          yEvent: fd.yEvent,
+        }
+      : undefined;
+  const cycleTime = pickerType === 'fixed' ? t.fixed?.cycleTime ?? null : t.cycleTime ?? null;
+  return {
+    timezone: t.timezone,
+    type: pickerType === 'global' ? 'local' : pickerType,
+    pickerType,
+    cycleTime,
+    startTime: null,
+    endTime: null,
+    fixedDuration,
+    defaultDurationId: t.defaultDurationId,
+    allDurations: t.allDurations ?? [],
+    defaultPeriodicity:
+      pickerType === 'fixed' && fd?.periodicity ? fd.periodicity.toLowerCase() : t.defaultPeriodicity,
+  };
+}
+
 function buildEnvelope(
   existing: LineChartEnvelope | undefined,
   uiConfig: LineChartUIConfig,
   timeTabConfig?: TimeTabUIConfig,
 ): LineChartEnvelope {
-  // timeTabConfig = full TimeTabConfiguration UI state (for re-hydration).
-  // timeConfig    = same value; mini-engine reads this to compute the time window.
-  // Both must always be in sync — never emit one without the other.
-  const tc = timeTabConfig ?? existing?.timeTabConfig ?? existing?.timeConfig ?? DEFAULT_TIME_CONFIG;
+  // tc is the raw SDK TimeTabUIConfig used to rebuild both the host-shape
+  // `timeConfig` (via toHostTimeConfig) and the re-hydration `timeTabConfig`.
+  // Legacy envelopes might only have `existing.timeConfig` in the old
+  // TimeTabUIConfig shape (pre-HostTimeConfig refactor); cast at that step
+  // since we know historical data has those fields.
+  const tc: TimeTabUIConfig =
+    timeTabConfig ??
+    existing?.timeTabConfig ??
+    (existing?.timeConfig as TimeTabUIConfig | undefined) ??
+    FALLBACK_TIME_CONFIG;
+  // Defensive cleanup: even after the in-memory migration runs, an existing
+  // envelope hitting buildEnvelope might still carry the legacy `dataSource`
+  // field on series/axes (e.g. on the first save after upgrade). The walker
+  // would emit duplicate bindings (one for `…dataSource`, one for `…unsPath`)
+  // pointing at the same topic, doubling API call rate and producing
+  // backend-rejected requests. Strip the legacy field from every series/axis
+  // before walking so the bindings list is canonical.
+  const cleanedUiConfig: LineChartUIConfig = {
+    ...uiConfig,
+    charts: uiConfig.charts.map((c) => ({
+      ...c,
+      series: c.series.map((s) => {
+        const { dataSource: _legacy, ...rest } = s as LineChartSeries & { dataSource?: string };
+        return rest as LineChartSeries;
+      }),
+      axes: c.axes.map((a) => {
+        const { dataSource: _legacy, ...rest } = a as LineChartAxis & { dataSource?: string };
+        return rest as LineChartAxis;
+      }),
+    })),
+  };
   const dynamicBindingPathList = buildDynamicBindingPathList(
-    uiConfig,
+    cleanedUiConfig,
     [
-      ...uiConfig.charts.flatMap((chart, ci) =>
-        chart.series.map((_s, si) => `charts[${ci}].series[${si}].dataSource`),
+      ...cleanedUiConfig.charts.flatMap((chart, ci) =>
+        chart.series.map((_s, si) => `charts[${ci}].series[${si}].unsPath`),
       ),
-      ...uiConfig.charts.flatMap((chart, ci) =>
-        chart.axes.map((_a, ai) => `charts[${ci}].axes[${ai}].dataSource`),
+      ...cleanedUiConfig.charts.flatMap((chart, ci) =>
+        chart.axes.map((_a, ai) => `charts[${ci}].axes[${ai}].unsPath`),
       ),
     ],
   );
@@ -318,15 +340,41 @@ function buildEnvelope(
       );
     }
   }
-  return {
+  const env = {
     _id: existing?._id ?? `linechart_${Date.now()}`,
-    type: 'LineChart',
+    type: 'LineChart' as const,
     general: existing?.general ?? { title: '' },
-    timeConfig: tc,
+    // timeConfig is the HOST-shape (HostTimeConfig) the Lens engine reads.
+    // timeTabConfig is the raw SDK shape (TimeTabUIConfig) used to
+    // re-hydrate the SDK TimeTabConfiguration component when the user
+    // re-opens the configurator.
+    timeConfig: toHostTimeConfig(tc),
     timeTabConfig: tc,
-    uiConfig,
+    // Persist the legacy-field-stripped uiConfig — never re-introduce
+    // `series[].dataSource` into the saved envelope.
+    uiConfig: cleanedUiConfig,
     dynamicBindingPathList,
   };
+  // Diagnostic: confirm the envelope we hand to iosense includes the
+  // host-shaped timeConfig (with `type`, `pickerType`, `defaultDurationId`,
+  // `allDurations`). If `timeConfig.type` is undefined on the next save, the
+  // host engine can't compute startTime/endTime → 422.
+  console.log('[Configurator] emit envelope →', {
+    _id: env._id,
+    timeConfigShape: env.timeConfig
+      ? {
+          type: (env.timeConfig as { type?: string }).type,
+          pickerType: (env.timeConfig as { pickerType?: string }).pickerType,
+          defaultDurationId: env.timeConfig.defaultDurationId,
+          allDurationsCount: env.timeConfig.allDurations?.length ?? 0,
+          defaultPeriodicity: env.timeConfig.defaultPeriodicity,
+          timezone: env.timeConfig.timezone,
+        }
+      : null,
+    bindingCount: env.dynamicBindingPathList.length,
+    bindingKeys: env.dynamicBindingPathList.map((b) => b.key),
+  });
+  return env;
 }
 
 const DEFAULT_DEFAULT_AXIS: LineChartDefaultAxis = {
@@ -351,6 +399,37 @@ function migrateSpc(raw: unknown): LineChartSPC {
 function migrateChartSpcs(chart: ChartInstance): ChartInstance {
   if (!Array.isArray(chart.spcs)) return chart;
   return { ...chart, spcs: chart.spcs.map((s) => migrateSpc(s)) };
+}
+
+// Migrate legacy envelopes that stored the bindable UNS path under the field
+// name `dataSource` into the new field name `unsPath`. Iosense's host engine
+// extracts bindings from keys whose path ends in `.unsPath` (the convention
+// the deployed Column Chart widget uses), so envelopes saved before the
+// rename would otherwise have their bindings ignored entirely.
+// CRITICAL: we must STRIP the legacy `dataSource` field, not just add
+// `unsPath` alongside — otherwise `buildDynamicBindingPathList` walks the
+// uiConfig and finds the `{{topic}}` literal under BOTH fields, emitting
+// duplicate bindings per series (one with key `…dataSource`, one with
+// `…unsPath`). The backend gets the same topic twice with different keys,
+// the host's resolveAndCompute call rate doubles, and at least one of the
+// two keys is incorrect for the schema and the request fails.
+function migrateChartUnsPath(chart: ChartInstance): ChartInstance {
+  type LegacySeries = LineChartSeries & { dataSource?: string };
+  type LegacyAxis = LineChartAxis & { dataSource?: string };
+  const series = (chart.series ?? []).map((s) => {
+    const legacy = s as LegacySeries;
+    if (legacy.unsPath) return s;
+    // Strip the legacy field, replace with the renamed one.
+    const { dataSource, ...rest } = legacy;
+    return { ...rest, unsPath: dataSource ?? '' } as LineChartSeries;
+  });
+  const axes = (chart.axes ?? []).map((a) => {
+    const legacy = a as LegacyAxis;
+    if (legacy.unsPath) return a;
+    const { dataSource, ...rest } = legacy;
+    return { ...rest, unsPath: dataSource ?? '' } as LineChartAxis;
+  });
+  return { ...chart, series, axes };
 }
 
 // Normalize a single DataTableConfig (fills defaults + migrates the legacy
@@ -387,7 +466,7 @@ function normalizeLineChartUIConfig(raw: unknown): LineChartUIConfig {
   // data table; charts without their own table inherit the legacy widget one).
   if (Array.isArray(obj.charts)) {
     const charts = (obj.charts as ChartInstance[]).map((c) => ({
-      ...migrateChartSpcs(c),
+      ...migrateChartUnsPath(migrateChartSpcs(c)),
       dataTable: normalizeDataTable(
         (c as { dataTable?: Partial<DataTableConfig> }).dataTable ?? dataTable,
       ),
@@ -613,7 +692,7 @@ export function LineChartConfiguration({
   // configured setting went).
   const initialAdvanceOpen = useMemo(() => {
     if (typeof initialUiConfig.advanceSettings === 'boolean') return initialUiConfig.advanceSettings;
-    const tc = config?.timeTabConfig ?? config?.timeConfig;
+    const tc = (config?.timeTabConfig ?? (config?.timeConfig as TimeTabUIConfig | undefined));
     return !!(tc?.disableTimeSelection || (tc?.futureDaysAllowed && tc.futureDaysAllowed !== ''));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -660,10 +739,38 @@ export function LineChartConfiguration({
     };
   }, [topTab]);
 
+  // The SDK's TimeTabConfiguration renders its "Add Duration" / "Add Shift"
+  // forms as an in-place panel (`.fds-ttc__panel-overlay`) that's
+  // `position: absolute; inset: 0` inside the (narrow) configurator column.
+  // In the host (Lens) canvas, the configurator column is too narrow to fit
+  // the form, so it overflows into the canvas area and dashboard widgets
+  // stack above it. Float it like the Data tab side modal instead:
+  // publish the configurator's right-edge as a CSS variable so the static
+  // CSS rule for `.fds-ttc__panel-overlay` can `position: fixed` it just
+  // beside us with a huge z-index. Keep updated on resize.
+  useEffect(() => {
+    function publishConfigRightEdge() {
+      const panelEl =
+        (rootRef.current?.closest('.app__config') as HTMLElement | null) ??
+        rootRef.current;
+      if (!panelEl) return;
+      const r = panelEl.getBoundingClientRect();
+      document.documentElement.style.setProperty('--lc-config-right-edge', `${r.right}px`);
+    }
+    publishConfigRightEdge();
+    window.addEventListener('resize', publishConfigRightEdge);
+    const ro = new ResizeObserver(publishConfigRightEdge);
+    if (rootRef.current) ro.observe(rootRef.current);
+    return () => {
+      window.removeEventListener('resize', publishConfigRightEdge);
+      ro.disconnect();
+    };
+  }, []);
+
   // Full TimeTabConfiguration state — prefer timeTabConfig for re-hydration so the
   // component restores its exact UI state; fall back to timeConfig for older envelopes.
-  const [timeTabConfig, setTimeTabConfig] = useState<TimeTabUIConfig>(
-    config?.timeTabConfig ?? config?.timeConfig ?? DEFAULT_TIME_CONFIG,
+  const [timeTabConfig, setTimeTabConfig] = useState<TimeTabUIConfig | undefined>(
+    config?.timeTabConfig ?? (config?.timeConfig as TimeTabUIConfig | undefined),
   );
 
   // Pending delete (modal) — keyed by section so a single modal can serve all.
@@ -685,13 +792,14 @@ export function LineChartConfiguration({
       setActiveChartId(next.activeChartId);
       setStyling(next.style);
       setDeviationIndicator(next.deviationIndicator ?? 'standard');
-      const tc = config.timeTabConfig ?? config.timeConfig;
+      const tc =
+        config.timeTabConfig ?? (config.timeConfig as TimeTabUIConfig | undefined);
       const shouldAutoOpen =
         typeof next.advanceSettings === 'boolean'
           ? next.advanceSettings
           : !!(tc?.disableTimeSelection || (tc?.futureDaysAllowed && tc.futureDaysAllowed !== ''));
       setAdvanceSettings(shouldAutoOpen);
-      setTimeTabConfig(config.timeTabConfig ?? config.timeConfig ?? DEFAULT_TIME_CONFIG);
+      setTimeTabConfig(tc);
       setChartEditMode(false);
       setNewChartDraft(false);
     }
@@ -2364,12 +2472,13 @@ function SectionItemList({
     return (
       <>
         {series.map((s) => {
-          const subtitle = s.dataSource
-            ? VARIABLE_REGEX.test(s.dataSource.trim())
+          const topic = s.unsPath || s.dataSource || '';
+          const subtitle = topic
+            ? VARIABLE_REGEX.test(topic.trim())
               ? 'Live data'
-              : s.dataSource.length > 28
-                ? `${s.dataSource.slice(0, 28)}…`
-                : s.dataSource
+              : topic.length > 28
+                ? `${topic.slice(0, 28)}…`
+                : topic
             : 'No topic set';
           return (
             <ItemCard
@@ -3061,7 +3170,7 @@ function DataSourceEditor({
   const [color, setColor] = useState(
     initial?.color ?? DEFAULT_COLORS[existingCount % DEFAULT_COLORS.length],
   );
-  const [dataSource, setDataSource] = useState(initial?.dataSource ?? '');
+  const [unsPath, setUnsPath] = useState(initial?.unsPath ?? initial?.dataSource ?? '');
   const [dataPrecision, setDataPrecision] = useState(
     initial?.dataPrecision !== undefined ? String(initial.dataPrecision) : '2',
   );
@@ -3072,7 +3181,7 @@ function DataSourceEditor({
   const isValid =
     name.trim().length > 0 &&
     color.trim().length > 0 &&
-    dataSource.trim().length > 0;
+    unsPath.trim().length > 0;
 
   const submit = useCallback(() => {
     if (!isValid) return;
@@ -3080,13 +3189,13 @@ function DataSourceEditor({
       _id: initial?._id ?? `series_${Date.now()}_${existingCount}`,
       name: name.trim(),
       color: color || DEFAULT_COLORS[existingCount % DEFAULT_COLORS.length],
-      dataSource,
+      unsPath,
       dataPrecision: dataPrecision ? Number(dataPrecision) : undefined,
       limit: limit || undefined,
       addAsTooltip: addAsTooltip || undefined,
     });
   }, [
-    isValid, initial, existingCount, name, color, dataSource,
+    isValid, initial, existingCount, name, color, unsPath,
     dataPrecision, limit, addAsTooltip, onSubmit,
   ]);
 
@@ -3117,11 +3226,11 @@ function DataSourceEditor({
         label="UNS Path"
         necessityIndicator="required"
         placeholder="Enter UNS Path"
-        value={dataSource}
+        value={unsPath}
         tree={unsTree}
         isLoading={isLoadingTree}
         onOpen={loadWorkspaces}
-        onChange={(value) => setDataSource(resolveUNSValue(value))}
+        onChange={(value) => setUnsPath(resolveUNSValue(value))}
       />
 
       {/* Data Precision + Unit */}
@@ -3220,7 +3329,7 @@ function AxisEditor({
       position,
       // Bindable UNS path is preserved from the existing axis; the Data Source
       // field now drives which series feed this axis.
-      dataSource: initial?.dataSource ?? '',
+      unsPath: initial?.unsPath ?? initial?.dataSource ?? '',
       linkedSeriesIds,
     });
   }, [isValid, initial, existingCount, name, position, linkedSeriesIds, onSubmit]);
