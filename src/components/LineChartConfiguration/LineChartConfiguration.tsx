@@ -92,41 +92,34 @@ interface LineChartConfigurationProps {
 
 const VARIABLE_REGEX = /^\{\{(.+)\}\}$/;
 
-// Walk uiConfig and emit BindingEntry for every {{topic}} string found.
-// seriesKeys: explicit dot-paths that get type:'series' — all others are scalar.
+// Build the dynamicBindingPathList from the explicit set of bindable fields
+// (series[].unsPath and axes[].unsPath). Every binding gets type:'series' since
+// all our data sources are time-series UNS topics. We do NOT walk the entire
+// uiConfig because other string fields (e.g. plotLines[].dynamicTopic,
+// dataTable.columns[].topic) would emit bindings without a `type` field, which
+// crashes the host DataLayer when it calls `binding.type.toLowerCase()`.
 function buildDynamicBindingPathList(
-  uiConfig: unknown,
-  seriesKeys: string[] = [],
-): Array<{ key: string; topic: string; type?: 'series' }> {
-  const seriesKeySet = new Set(seriesKeys);
-  const paths: Array<{ key: string; topic: string; type?: 'series' }> = [];
+  uiConfig: LineChartUIConfig,
+): Array<{ key: string; topic: string; type: 'series' }> {
+  const paths: Array<{ key: string; topic: string; type: 'series' }> = [];
 
-  function walk(obj: unknown, currentPath: string): void {
-    if (obj === null || obj === undefined) return;
-    if (typeof obj === 'string') {
-      const match = VARIABLE_REGEX.exec(obj.trim());
+  uiConfig.charts.forEach((chart, ci) => {
+    chart.series.forEach((s, si) => {
+      const raw = (s.unsPath || '').trim();
+      const match = VARIABLE_REGEX.exec(raw);
       if (match) {
-        const entry: { key: string; topic: string; type?: 'series' } = {
-          key: currentPath,
-          topic: match[1],
-        };
-        if (seriesKeySet.has(currentPath)) entry.type = 'series';
-        paths.push(entry);
+        paths.push({ key: `charts[${ci}].series[${si}].unsPath`, topic: match[1], type: 'series' });
       }
-      return;
-    }
-    if (Array.isArray(obj)) {
-      obj.forEach((item, index) => walk(item, `${currentPath}[${index}]`));
-      return;
-    }
-    if (typeof obj === 'object') {
-      Object.entries(obj as Record<string, unknown>).forEach(([key, val]) => {
-        walk(val, currentPath ? `${currentPath}.${key}` : key);
-      });
-    }
-  }
+    });
+    chart.axes.forEach((a, ai) => {
+      const raw = (a.unsPath || '').trim();
+      const match = VARIABLE_REGEX.exec(raw);
+      if (match) {
+        paths.push({ key: `charts[${ci}].axes[${ai}].unsPath`, topic: match[1], type: 'series' });
+      }
+    });
+  });
 
-  walk(uiConfig, '');
   return paths;
 }
 
@@ -317,17 +310,7 @@ function buildEnvelope(
       }),
     })),
   };
-  const dynamicBindingPathList = buildDynamicBindingPathList(
-    cleanedUiConfig,
-    [
-      ...cleanedUiConfig.charts.flatMap((chart, ci) =>
-        chart.series.map((_s, si) => `charts[${ci}].series[${si}].unsPath`),
-      ),
-      ...cleanedUiConfig.charts.flatMap((chart, ci) =>
-        chart.axes.map((_a, ai) => `charts[${ci}].axes[${ai}].unsPath`),
-      ),
-    ],
-  );
+  const dynamicBindingPathList = buildDynamicBindingPathList(cleanedUiConfig);
   // Warn on bindings whose topic isn't a resolved UNS path. Catches the common
   // case where resolveUNSValue cache-missed and stored the workspace-name path
   // verbatim — mini-engine would reject it and the chart would never load.

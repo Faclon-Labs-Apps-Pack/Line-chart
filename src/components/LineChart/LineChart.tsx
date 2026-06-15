@@ -1,11 +1,13 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+
 import Highcharts from 'highcharts';
 import HC_Exporting from 'highcharts/modules/exporting';
 import HC_ExportData from 'highcharts/modules/export-data';
 import HC_FullScreen from 'highcharts/modules/full-screen';
 import { LineChart as DSLineChart } from '@faclon-labs/design-sdk/LineChart';
-import { Chart, ChartActions, exportChart } from '@faclon-labs/design-sdk/Chart';
+import { Chart, exportChart } from '@faclon-labs/design-sdk/Chart';
+import { IconButton } from '@faclon-labs/design-sdk/IconButton';
 import type { ChartPlotLine, ChartPlotBand, ChartExportFormat } from '@faclon-labs/design-sdk/Chart';
 import { Spinner } from '@faclon-labs/design-sdk/Spinner';
 import { EmptyState } from '@faclon-labs/design-sdk/EmptyState';
@@ -13,7 +15,8 @@ import { DatePicker } from '@faclon-labs/design-sdk/DatePicker';
 import type { DateRange, DatePresetOption } from '@faclon-labs/design-sdk/DatePicker';
 import { DropdownMenu } from '@faclon-labs/design-sdk/DropdownMenu';
 import { ActionListItem } from '@faclon-labs/design-sdk/ActionListItem';
-import { ChevronDown } from 'react-feather';
+import { SelectInput } from '@faclon-labs/design-sdk/SelectInput';
+import { ChevronDown, Settings, MoreHorizontal, Info } from 'react-feather';
 import {
   Table,
   TableHeader,
@@ -83,6 +86,7 @@ interface LineChartWidgetProps {
       x?: number;
       xPeriod?: string;
       calendarType?: string;
+      periodicities?: string[];
     }>;
     defaultPeriodicity?: string;
     startTime?: number | null;
@@ -127,6 +131,75 @@ function aggregate(values: number[], op: DataTableOperator): number {
     default: return sum / values.length;
   }
 }
+
+const PERIODICITY_MS: Record<string, number> = {
+  Minute: 60_000,
+  Hourly: 3_600_000,
+  Daily: 86_400_000,
+  Weekly: 7 * 86_400_000,
+  Monthly: 28 * 86_400_000,
+};
+const PERIODICITY_ORDER = ['Minute', 'Hourly', 'Daily', 'Weekly', 'Monthly'];
+
+function titleCase(s: string): string {
+  if (!s) return s;
+  return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+}
+
+function getValidPeriodicities(range: DateRange | null): string[] {
+  if (!range?.start || !range?.end) return PERIODICITY_ORDER.slice();
+  const span = new Date(range.end).getTime() - new Date(range.start).getTime();
+  if (span <= 0) return PERIODICITY_ORDER.slice();
+  const MAX_BUCKETS = 1_000;
+  const valid = PERIODICITY_ORDER.filter((p) => {
+    const ms = PERIODICITY_MS[p];
+    return span >= ms && span / ms <= MAX_BUCKETS;
+  });
+  return valid.length ? valid : ['Minute'];
+}
+
+// Derive an approximate DateRange from a preset's {x, xPeriod} so
+// periodicityOptions stays accurate as soon as a preset is selected (before
+// the user clicks "Apply" and onRangeChange fires).
+function rangeFromPreset(preset: { x?: number; xPeriod?: string } | undefined): DateRange | null {
+  if (!preset || typeof preset.x !== 'number' || !preset.xPeriod) return null;
+  const end = new Date();
+  const start = new Date(end);
+  const x = preset.x;
+  switch (preset.xPeriod) {
+    case 'minute': start.setMinutes(start.getMinutes() - x); break;
+    case 'hour':   start.setHours(start.getHours() - x);     break;
+    case 'day':    start.setDate(start.getDate() - x);        break;
+    case 'week':   start.setDate(start.getDate() - x * 7);    break;
+    case 'month':  start.setMonth(start.getMonth() - x);      break;
+    case 'year':   start.setFullYear(start.getFullYear() - x); break;
+    default: return null;
+  }
+  return { start, end };
+}
+
+// Next finer periodicity for "Time drilldown" — clicking a point narrows the
+// range to that bucket and steps one level down for a re-query.
+function finerPeriodicity(p?: string): string | null {
+  switch ((p || '').toLowerCase()) {
+    case 'yearly':  return 'Monthly';
+    case 'monthly': return 'Daily';
+    case 'weekly':  return 'Daily';
+    case 'daily':   return 'Hourly';
+    case 'hourly':  return 'Minute';
+    default: return null;
+  }
+}
+
+type ChartDisplay = {
+  timeDrilldown: boolean;
+  legends: boolean;
+  dataLabel: boolean;
+  clipping: boolean;
+  zoom: boolean;
+  scrollBehavior: boolean;
+  inexactMultiple: boolean;
+};
 
 function columnLabel(col: DataTableColumn, seriesById: Map<string, LineChartSeries>): string {
   if (col.sourceMode === 'Existing' && col.seriesId) {
@@ -195,34 +268,25 @@ export function LineChart({
   timeConfig,
   onEvent,
 }: LineChartWidgetProps) {
-  // Mirror the Column Chart widget contract: emit a TIME_CHANGE event back
-  // via `onEvent` so the host's data layer registers this widget for query
-  // dispatch. Without at least one TIME_CHANGE the host never schedules a
-  // `resolveAndCompute` for us.
-  // The challenge: iosense passes a fresh `onEvent` function reference and
-  // a fresh `timeConfig` object on every render (echoing computed
-  // `startTime`/`endTime` back through the prop). Naive useEffect deps
-  // either (a) loop infinitely or (b) skip the first emit if onEvent was
-  // initially undefined. Solution: depend on all relevant inputs but DEDUPE
-  // by a stable "user intent" key — only emit when the user's choice
-  // (preset / periodicity / picker type) actually changed, not when iosense
-  // echoes a new startTime back at us.
-  const lastEmittedKeyRef = useRef<string>('');
+  // Emit TIME_CHANGE once on mount so the host's data layer registers this
+  // widget for query dispatch. Refs hold the latest values so the mount-only
+  // effect can read them without listing them as deps — if we re-emitted on
+  // every host-pushed timeConfig change, changing one widget's DatePicker would
+  // propagate its time range to every other widget on the dashboard (the host
+  // broadcasts the updated timeConfig to all widgets after any TIME_CHANGE).
+  const onEventRef = useRef(onEvent);
+  onEventRef.current = onEvent;
+  const timeConfigRef = useRef(timeConfig);
+  timeConfigRef.current = timeConfig;
   useEffect(() => {
-    if (!onEvent) return;
-    // Wait for the host to pass a real timeConfig before emitting.
-    if (!timeConfig?.defaultDurationId && !timeConfig?.fixedDuration) return;
-    const key = [
-      timeConfig.defaultDurationId ?? '',
-      timeConfig.defaultPeriodicity ?? '',
-      timeConfig.pickerType ?? '',
-    ].join('|');
-    if (lastEmittedKeyRef.current === key) return;
-    lastEmittedKeyRef.current = key;
-    const { startTime, endTime } = computeRange(timeConfig);
-    const periodicity = (timeConfig.defaultPeriodicity || 'hourly').toLowerCase();
-    console.log('[LineChart] emit TIME_CHANGE →', { key, startTime, endTime, periodicity });
-    onEvent({
+    const ev = onEventRef.current;
+    if (!ev) return;
+    const tc = timeConfigRef.current;
+    if (!tc?.defaultDurationId && !tc?.fixedDuration) return;
+    const { startTime, endTime } = computeRange(tc);
+    const periodicity = (tc.defaultPeriodicity || 'hourly').toLowerCase();
+    console.log('[LineChart] emit TIME_CHANGE (mount) →', { startTime, endTime, periodicity });
+    ev({
       type: 'TIME_CHANGE',
       payload: {
         startTime: String(startTime),
@@ -230,13 +294,8 @@ export function LineChart({
         periodicity,
       },
     });
-  }, [
-    onEvent,
-    timeConfig?.defaultDurationId,
-    timeConfig?.defaultPeriodicity,
-    timeConfig?.pickerType,
-    timeConfig?.fixedDuration,
-  ]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Run once on mount — do NOT add timeConfig/onEvent as deps
 
   // Lens may pass the full envelope as `config` instead of just uiConfig.
   // Detect by presence of `uiConfig` field on the input and unwrap.
@@ -285,7 +344,7 @@ export function LineChart({
   // Resolve each configured series from `data` (series binding key matches the
   // configurator's: charts[ci].series[si].dataSource). Categories are the slot
   // labels of the longest series (backend returns aligned, pre-bucketed slots).
-  const { series, categories } = useMemo(() => {
+  const { series, categories, catTimestamps } = useMemo(() => {
     const configured = activeChart?.series ?? [];
     const resolved = configured.map((s, si) => {
       const payload =
@@ -297,9 +356,12 @@ export function LineChart({
     });
     const longest = resolved.reduce(
       (best, r) => (r.slots.length > best.length ? r.slots : best),
-      [] as { label: string; value: number | null }[],
+      [] as { label: string; value: number | null; from: number; to: number }[],
     );
     const cats = longest.map((slot) => slot.label);
+    // Store from/to timestamps per bucket — used by the "Time drilldown"
+    // onPointClick handler to narrow the time range on click.
+    const catTs = longest.map((slot) => ({ from: (slot as any).from as number, to: (slot as any).to as number }));
     const out = resolved.map((r, i) => ({
       name: r.def.name || `Series ${i + 1}`,
       color: r.def.color,
@@ -307,8 +369,11 @@ export function LineChart({
         const v = r.slots[idx]?.value;
         return typeof v === 'number' ? v : null;
       }),
+      tooltip: {
+        valueDecimals: typeof r.def.dataPrecision === 'number' ? r.def.dataPrecision : 2,
+      },
     }));
-    return { series: out, categories: cats };
+    return { series: out, categories: cats, catTimestamps: catTs };
   }, [activeChart, chartIndex, data]);
 
   // Render whenever the backend returned slots for any series — even if all
@@ -468,6 +533,20 @@ export function LineChart({
     };
   }, [style?.dataTable]);
 
+  // Per-chart in-widget UI overrides: NOT written back to the envelope (these
+  // are end-user view affordances). Mirrors the combine line chart's Settings
+  // menu: Time Control (timeDrilldown) + Chart Control (legends, dataLabel,
+  // clipping, zoom, scrollBehavior, inexactMultiple).
+  const [chartDisplay, setChartDisplay] = useState<ChartDisplay>({
+    timeDrilldown: true,
+    legends: true,
+    dataLabel: false,
+    clipping: false,
+    zoom: true,
+    scrollBehavior: false,
+    inexactMultiple: false,
+  });
+
   const highchartsOptions = useMemo(() => {
     const titleEllipsis = { textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
     const xAxis: any = {};
@@ -489,6 +568,7 @@ export function LineChart({
         style?.card?.wrapInCard === false
           ? style?.card?.backgroundColor || '#FFFFFF'
           : 'transparent',
+      ...(chartDisplay.zoom ? { zoomType: 'x' } : {}),
     };
     if (multiAxis) {
       opts.yAxis = multiAxis.yAxis.map((a: any) => ({
@@ -509,7 +589,7 @@ export function LineChart({
     // "Add Source as Tooltip": no visible line / marker / data label and no
     // legend chip, but keep the series in the dataset (mouse-tracked) so the
     // shared tooltip reports its value when hovering other points.
-    opts.series = series.map((_, i) => {
+    opts.series = series.map((s: any, i) => {
       const so: any = {};
       if (multiAxis) so.yAxis = multiAxis.seriesAxis[i] ?? 0;
       if (tooltipOnlyFlags[i]) {
@@ -519,22 +599,49 @@ export function LineChart({
         so.showInLegend = false;
         so.states = { hover: { lineWidth: 0, halo: { size: 0 } }, inactive: { opacity: 1 } };
       }
+      // Per-series tooltip precision — passed here so the SDK's P.merge() includes
+      // it in each Highcharts series option. The SDK ignores unknown fields on the
+      // `series` prop; highchartsOptions.series is the correct path.
+      if (s.tooltip) so.tooltip = s.tooltip;
       return so;
     });
-    if (hasTooltipOnly) opts.tooltip = { shared: true };
+    // Override the SDK's defaultTooltip so per-series dataPrecision (valueDecimals)
+    // is actually applied. The SDK renders c.y as a raw number via a custom HTML
+    // formatter that ignores Highcharts' valueDecimals. We replicate its exact
+    // HTML/SVG structure but call c.y.toFixed(precision) per series.
+    const TOOLTIP_FONT = "'Noto Sans Variable', 'Noto Sans', sans-serif";
+    opts.tooltip = {
+      shared: true,
+      useHTML: true,
+      formatter(this: any) {
+        const root = typeof document !== 'undefined' ? document.documentElement : null;
+        const cs = root ? getComputedStyle(root) : null;
+        const primary = cs?.getPropertyValue('--text-gray-primary').trim() || '#192839';
+        const secondary = cs?.getPropertyValue('--text-gray-secondary').trim() || '#40566d';
+        const points: any[] = (this as any).points ?? [this];
+        const rows = points.map((c: any) => {
+          const rawColor = c.color ?? c.series?.color ?? primary;
+          const color = typeof rawColor === 'string' ? rawColor : primary;
+          const name: string = c.series?.name ?? '';
+          const precision = Math.max(0, Math.min(20, c.series?.options?.tooltip?.valueDecimals ?? 2));
+          const yVal = typeof c.y === 'number' ? c.y.toFixed(precision) : '—';
+          const dashStyle: string = c.series?.options?.dashStyle ?? 'Solid';
+          let lineRect = `<rect x="0" y="5" width="16" height="2" rx="1" fill="${color}"/>`;
+          if (dashStyle !== 'Solid') {
+            lineRect = [0, 7, 13].map((x) => `<rect x="${x}" y="5" width="4" height="2" fill="${color}"/>`).join('');
+          }
+          const svg = `<svg width="16" height="12" viewBox="0 0 16 12" style="flex:0 0 auto;vertical-align:-2px">${lineRect}<circle cx="8" cy="6" r="3" fill="${color}"/></svg>`;
+          return `<div style="display:flex;align-items:center;gap:6px;padding:1px 0;white-space:nowrap;font-family:${TOOLTIP_FONT}"><span style="display:inline-flex">${svg}</span><span style="font:400 13px/1.2 ${TOOLTIP_FONT};color:${primary}">${name} : </span><span style="font:700 13px/1.2 ${TOOLTIP_FONT};color:${primary}">${yVal}</span></div>`;
+        });
+        const cat = (points[0] as any)?.point?.category ?? (this as any).x ?? '';
+        return rows.join('') + `<div style="margin-top:4px;font:400 12px/1.2 ${TOOLTIP_FONT};color:${secondary};white-space:nowrap">${cat}</div>`;
+      },
+    };
     return opts as any;
-  }, [axisColors, miscColors, multiAxis, series, tooltipOnlyFlags, hasTooltipOnly, style?.card?.wrapInCard, style?.card?.backgroundColor]);
+  }, [axisColors, miscColors, multiAxis, series, tooltipOnlyFlags, style?.card?.wrapInCard, style?.card?.backgroundColor, chartDisplay.zoom]);
 
   // The data table is portalled into the chart card (sibling of the canvas).
   const [cardEl, setCardEl] = useState<HTMLDivElement | null>(null);
-
-  // Per-chart in-widget UI overrides: NOT written back to the envelope (these
-  // are end-user view affordances, like flipping legend off temporarily).
-  // Defaults: legend on, dataLabel off — matches Column Chart widget defaults.
-  const [chartDisplay, setChartDisplay] = useState<{
-    legends: boolean;
-    dataLabel: boolean;
-  }>({ legends: true, dataLabel: false });
 
   // Local DatePicker state — initialized from the host-passed timeConfig.
   // On user pick, we emit TIME_CHANGE through onEvent so the host's data
@@ -554,10 +661,67 @@ export function LineChart({
     timeConfig?.defaultDurationId ?? '',
   );
 
+  const [periodicityOpen, setPeriodicityOpen] = useState(false);
+  const [selectedPeriodicity, setSelectedPeriodicity] = useState<string>(
+    () => titleCase(timeConfig?.defaultPeriodicity || 'Hourly'),
+  );
+  // Sync with host-pushed defaultPeriodicity (on initial load or reset)
+  const defaultPeriodicity = timeConfig?.defaultPeriodicity;
+  useEffect(() => {
+    if (!defaultPeriodicity) return;
+    const tc = titleCase(defaultPeriodicity);
+    setSelectedPeriodicity((prev) => (prev === tc ? prev : tc));
+  }, [defaultPeriodicity]);
+
+  const activePreset = timeConfig?.allDurations?.find((d) => d.id === selectedPreset);
+
+  // When a preset is selected from the sidebar, the SDK's DatePicker only fires
+  // onPresetSelect (not onRangeChange) until the user clicks "Apply". Derive the
+  // approximate range immediately so periodicityOptions is correct on selection.
+  const allDurations = timeConfig?.allDurations;
+  useEffect(() => {
+    if (!selectedPreset || !allDurations) return;
+    const preset = allDurations.find((d) => d.id === selectedPreset);
+    const derived = rangeFromPreset(preset);
+    if (derived) setRangeValue(derived);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedPreset, allDurations]);
+
+  const periodicityOptions = useMemo(() => {
+    if (activePreset?.periodicities?.length) {
+      return activePreset.periodicities.map(titleCase);
+    }
+    return getValidPeriodicities(rangeValue);
+  }, [activePreset, rangeValue]);
+
+  // If the active selection isn't valid for the current range/preset, snap to first valid
+  useEffect(() => {
+    if (!periodicityOptions.length) return;
+    if (periodicityOptions.includes(selectedPeriodicity)) return;
+    setSelectedPeriodicity(periodicityOptions[0]);
+  }, [periodicityOptions, selectedPeriodicity]);
+
   // Highcharts instance handle for the export menu and fullscreen toggle.
   const chartInstanceRef = useRef<
     { reflow: () => void; fdsToggleFullscreen?: () => void } | null
   >(null);
+
+  // Root element ref for the ResizeObserver — triggers chart.reflow() when the
+  // dashboard resizes or repositions this widget so Highcharts recalculates
+  // tick positions and label layout rather than stretching the mount-time SVG.
+  const lcwRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = lcwRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => {
+      const chart = chartInstanceRef.current;
+      if (!chart) return;
+      try { chart.reflow(); } catch { /* chart destroyed mid-resize */ }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Date presets surfaced in the DatePicker's preset rail. Derived from the
   // host-passed allDurations so what's offered here matches what was
@@ -576,6 +740,19 @@ export function LineChart({
   const showDataTable = !!dataTable && dataTable.columns.length > 0;
 
   const configuredSeriesCount = activeChart?.series?.length ?? 0;
+
+  // Publish the user-picked card background color as a CSS variable so the
+  // SDK chart's legend strip (which sits inside .fds-chart but doesn't
+  // inherit a background) can paint the SAME color via a static CSS rule.
+  // `--lcw-card-bg` defaults to transparent when wrap-into-card is ON.
+  // Must live here (before any early return) to satisfy the Rules of Hooks.
+  const widgetStyle = useMemo<React.CSSProperties>(() => {
+    const bg =
+      style?.card?.wrapInCard === true
+        ? 'transparent'
+        : style?.card?.backgroundColor || '#FFFFFF';
+    return { ['--lcw-card-bg' as string]: bg } as React.CSSProperties;
+  }, [style?.card?.wrapInCard, style?.card?.backgroundColor]);
 
   // ----- Render states ------------------------------------------------------
   // No envelope / no charts configured at all — host hasn't pushed a config.
@@ -611,39 +788,8 @@ export function LineChart({
     );
   }
 
-  // ZERO slots came back for every configured series — there's truly nothing
-  // the chart can render (no time axis, no points). Show the empty state.
-  // Note: we INTENTIONALLY do NOT hit this branch when slots exist but all
-  // values are null (e.g. backend " N/A" sentinels for compute sources) —
-  // those cases still render a time-axis with null gaps, which is more
-  // useful than an empty state.
-  if (!hasSlots) {
-    return (
-      <div className="lcw lcw--empty">
-        <EmptyState
-          title="No data in selected range"
-          description="Try a different time window or check that the UNS source has values."
-        />
-      </div>
-    );
-  }
-
-  // Publish the user-picked card background color as a CSS variable so the
-  // SDK chart's legend strip (which sits inside .fds-chart but doesn't
-  // inherit a background) can paint the SAME color via a static CSS rule.
-  // `--lcw-card-bg` defaults to transparent when wrap-into-card is ON
-  // (some external wrapper owns the surface).
-  const widgetStyle = useMemo<React.CSSProperties>(() => {
-    const bg =
-      style?.card?.wrapInCard === true
-        ? 'transparent'
-        : style?.card?.backgroundColor || '#FFFFFF';
-    // CSS custom property assignment requires `as` cast in React types.
-    return { ['--lcw-card-bg' as string]: bg } as React.CSSProperties;
-  }, [style?.card?.wrapInCard, style?.card?.backgroundColor]);
-
   return (
-    <div className="lcw" style={widgetStyle}>
+    <div className="lcw" style={widgetStyle} ref={lcwRef}>
       {miscColors.legend && (
         <style>{`.lcw [class*="legend-label"] { color: ${miscColors.legend} !important; }`}</style>
       )}
@@ -688,17 +834,25 @@ export function LineChart({
             onRangeChange={(v) => {
               setRangeValue(v);
               if (!v || !onEvent) return;
-              const startTime = new Date(v.start).getTime();
-              const endTime = new Date(v.end).getTime();
-              const periodicity = (timeConfig?.defaultPeriodicity || 'hourly').toLowerCase();
-              // User-picked custom range — bypass the dedupe key so the host
-              // refetches even if defaultDurationId hasn't changed.
+              // `rangeValue` hasn't updated yet — compute valid periodicities
+              // from v directly so we can snap before emitting the event.
+              // This prevents the host from re-querying with an invalid
+              // periodicity (e.g. "Hourly" after switching to a year-long range).
+              const nextOptions = activePreset?.periodicities?.length
+                ? activePreset.periodicities.map(titleCase)
+                : getValidPeriodicities(v);
+              const nextPeriodicity = nextOptions.includes(selectedPeriodicity)
+                ? selectedPeriodicity
+                : (nextOptions[0] ?? selectedPeriodicity);
+              if (nextPeriodicity !== selectedPeriodicity) {
+                setSelectedPeriodicity(nextPeriodicity);
+              }
               onEvent({
                 type: 'TIME_CHANGE',
                 payload: {
-                  startTime: String(startTime),
-                  endTime: String(endTime),
-                  periodicity,
+                  startTime: String(new Date(v.start).getTime()),
+                  endTime: String(new Date(v.end).getTime()),
+                  periodicity: nextPeriodicity.toLowerCase(),
                 },
               });
             }}
@@ -708,29 +862,63 @@ export function LineChart({
             selectedPreset={selectedPreset}
             onPresetSelect={(v: string) => {
               setSelectedPreset(v);
-              // The preset picker fires onRangeChange synchronously with the
-              // resolved range — no need to emit TIME_CHANGE here as well.
             }}
             placeholder="Select date range"
+            showPeriodicity={activeChart?.chartType !== 'Realtime'}
+            periodicitySlot={
+              activeChart?.chartType !== 'Realtime' ? (
+                <SelectInput
+                  label=""
+                  value={selectedPeriodicity}
+                  placeholder="Periodicity"
+                  isOpen={periodicityOpen}
+                  onOpenChange={setPeriodicityOpen}
+                  onClick={() => setPeriodicityOpen((o) => !o)}
+                >
+                  <DropdownMenu className="lcw__periodicity-menu">
+                    {periodicityOptions.map((opt) => (
+                      <ActionListItem
+                        key={opt}
+                        title={opt}
+                        selectionType="Single"
+                        isSelected={opt === selectedPeriodicity}
+                        onClick={() => {
+                          setSelectedPeriodicity(opt);
+                          setPeriodicityOpen(false);
+                          if (!onEvent || !rangeValue) return;
+                          const startTime = new Date(rangeValue.start).getTime();
+                          const endTime = new Date(rangeValue.end).getTime();
+                          onEvent({
+                            type: 'TIME_CHANGE',
+                            payload: {
+                              startTime: String(startTime),
+                              endTime: String(endTime),
+                              periodicity: opt.toLowerCase(),
+                            },
+                          });
+                        }}
+                      />
+                    ))}
+                  </DropdownMenu>
+                </SelectInput>
+              ) : undefined
+            }
           />
         }
         // Info / Settings / Export icons — matches the deployed Column
         // Chart's chrome. Settings exposes legend + data-label toggles;
         // Export downloads PNG/JPEG/SVG/CSV/XLSX or toggles fullscreen.
-        // Honors style.hideElements.{settingsIcon,exportIcon}.
+        // Honors style.hideElements.{settingsIcon,exportIcon}; icons are shown
+        // by default when hideElements is absent or false (not explicitly true).
         actions={
-          activeChart.description?.trim() ||
-          !style?.hideElements?.settingsIcon ||
-          !style?.hideElements?.exportIcon ? (
-            <ChartActionIcons
-              description={activeChart.description}
-              showSettings={!style?.hideElements?.settingsIcon}
-              showMore={!style?.hideElements?.exportIcon}
-              chartRef={chartInstanceRef}
-              display={chartDisplay}
-              onDisplayChange={setChartDisplay}
-            />
-          ) : undefined
+          <ChartActionIcons
+            description={activeChart.description}
+            showSettings={style?.hideElements?.settingsIcon !== true}
+            showMore={style?.hideElements?.exportIcon !== true}
+            chartRef={chartInstanceRef}
+            display={chartDisplay}
+            onDisplayChange={setChartDisplay}
+          />
         }
       >
         <DSLineChart
@@ -755,13 +943,30 @@ export function LineChart({
           showDataLabels={chartDisplay.dataLabel}
           showMarkers={false}
           smooth
+          scrollable={chartDisplay.scrollBehavior}
+          scrollableMinWidth={800}
           plotLines={multiAxis ? [] : plotLines}
           plotBands={multiAxis ? [] : plotBands}
-          // xAxisTitle hidden for now (not needed): xAxisTitle="Date"
           yAxisTitle={leftAxisTitle}
           highchartsOptions={highchartsOptions}
-          // Capture the Highcharts instance handle so the export menu and
-          // fullscreen toggle can target it.
+          onPointClick={(ctx) => {
+            if (!chartDisplay.timeDrilldown || !onEvent) return;
+            const bucket = catTimestamps[ctx.pointIndex];
+            const finer = finerPeriodicity(selectedPeriodicity);
+            if (!bucket?.from || !bucket?.to || !finer) return;
+            const newRange = { start: new Date(bucket.from), end: new Date(bucket.to) };
+            setRangeValue(newRange);
+            setSelectedPreset('');
+            setSelectedPeriodicity(finer);
+            onEvent({
+              type: 'TIME_CHANGE',
+              payload: {
+                startTime: String(bucket.from),
+                endTime: String(bucket.to),
+                periodicity: finer.toLowerCase(),
+              },
+            });
+          }}
           onChartReady={(inst: { reflow: () => void; fdsToggleFullscreen?: () => void }) => {
             chartInstanceRef.current = inst;
           }}
@@ -788,11 +993,9 @@ LineChart.displayName = 'LineChart';
 
 // ---------------------------------------------------------------------------
 // ChartActionIcons — Info / Settings / Export icons in the SDK Chart's
-// `actions` slot. Mirrors the deployed Column Chart's chrome:
-//   • Info icon (only when chart has a description) → hover tooltip
-//   • Settings icon → DropdownMenu with legend / data-label toggles
-//   • Export icon  → DropdownMenu with PNG/JPEG/SVG/CSV/XLSX + Full Screen
-// Open state is controlled per-icon and dismisses on outside click / Esc.
+// `actions` slot. Menus are portalled into document.body so they are never
+// clipped by overflow:hidden or buried under Highcharts' z-index:0 stacking
+// context. Position is derived from getBoundingClientRect() → position:fixed.
 // ---------------------------------------------------------------------------
 function ChartActionIcons({
   description,
@@ -809,43 +1012,33 @@ function ChartActionIcons({
     reflow: () => void;
     fdsToggleFullscreen?: () => void;
   } | null>;
-  display: { legends: boolean; dataLabel: boolean };
-  onDisplayChange: (next: { legends: boolean; dataLabel: boolean }) => void;
+  display: ChartDisplay;
+  onDisplayChange: (next: ChartDisplay) => void;
 }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
-  const wrapRef = useRef<HTMLDivElement | null>(null);
+  const [menuPos, setMenuPos] = useState({ top: 0, right: 0 });
+
+  function capturePos(e: React.MouseEvent<HTMLButtonElement>) {
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    setMenuPos({ top: rect.bottom + 4, right: window.innerWidth - rect.right });
+  }
 
   useEffect(() => {
     if (!settingsOpen && !moreOpen) return;
-    function onDown(e: MouseEvent) {
-      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) {
-        setSettingsOpen(false);
-        setMoreOpen(false);
-      }
-    }
     function onKey(e: KeyboardEvent) {
-      if (e.key === 'Escape') {
-        setSettingsOpen(false);
-        setMoreOpen(false);
-      }
+      if (e.key === 'Escape') { setSettingsOpen(false); setMoreOpen(false); }
     }
-    document.addEventListener('mousedown', onDown);
     document.addEventListener('keydown', onKey);
-    return () => {
-      document.removeEventListener('mousedown', onDown);
-      document.removeEventListener('keydown', onKey);
-    };
+    return () => document.removeEventListener('keydown', onKey);
   }, [settingsOpen, moreOpen]);
 
-  const toggle = (key: 'legends' | 'dataLabel') =>
+  const toggle = (key: keyof ChartDisplay) =>
     onDisplayChange({ ...display, [key]: !display[key] });
 
   const doExport = (format: ChartExportFormat) => {
     const instance = chartRef.current;
-    if (instance) {
-      exportChart({ instance, engine: 'highcharts', format, fileName: 'line-chart' });
-    }
+    if (instance) exportChart({ instance, engine: 'highcharts', format, fileName: 'line-chart' });
     setMoreOpen(false);
   };
   const toggleFullscreen = () => {
@@ -853,67 +1046,102 @@ function ChartActionIcons({
     setMoreOpen(false);
   };
 
+  const settingGroups: Array<{ heading: string; items: Array<{ key: keyof ChartDisplay; label: string }> }> = [
+    {
+      heading: 'Time Control',
+      items: [{ key: 'timeDrilldown', label: 'Time drilldown' }],
+    },
+    {
+      heading: 'Chart Control',
+      items: [
+        { key: 'legends',         label: 'Legends' },
+        { key: 'dataLabel',       label: 'Data Labels' },
+        { key: 'clipping',        label: 'Clipping' },
+        { key: 'zoom',            label: 'Zoom' },
+        { key: 'scrollBehavior',  label: 'Scroll' },
+        { key: 'inexactMultiple', label: 'Inexact Multiple' },
+      ],
+    },
+  ];
   const exportFormats: ChartExportFormat[] = ['PNG', 'JPEG', 'SVG', 'CSV', 'XLSX'];
   const hasDescription = !!description?.trim();
 
+  const backdropStyle: React.CSSProperties = { position: 'fixed', inset: 0, zIndex: 9999 };
+  const menuStyle: React.CSSProperties = {
+    position: 'fixed',
+    top: menuPos.top,
+    right: menuPos.right,
+    zIndex: 10000,
+    minWidth: 200,
+  };
+
   return (
-    <div className="lcw__chart-actions" ref={wrapRef}>
-      <ChartActions
-        showInfo={hasDescription}
-        infoLabel={hasDescription ? description!.trim() : 'Info'}
-        showSettings={showSettings}
-        settingsLabel="Settings"
-        onSettingsClick={() => {
-          setSettingsOpen((o) => !o);
-          setMoreOpen(false);
-        }}
-        showMore={showMore}
-        moreLabel="Export"
-        onMoreClick={() => {
-          setMoreOpen((o) => !o);
-          setSettingsOpen(false);
-        }}
-      />
-      {settingsOpen && (
-        <div className="lcw__action-menu">
-          <DropdownMenu>
-            <ActionListItem contentType="SectionHeading" title="Chart Control" />
-            <ActionListItem
-              title="Legends"
-              selectionType="Multiple"
-              isSelected={display.legends}
-              onClick={() => toggle('legends')}
-            />
-            <ActionListItem
-              title="Data Label"
-              selectionType="Multiple"
-              isSelected={display.dataLabel}
-              onClick={() => toggle('dataLabel')}
-            />
-          </DropdownMenu>
-        </div>
+    <div className="lcw__chart-actions">
+      {hasDescription && (
+        <IconButton
+          icon={<Info size={16} />}
+          size="Medium"
+          accessibilityLabel={description!.trim()}
+        />
       )}
-      {moreOpen && (
-        <div className="lcw__action-menu">
-          <DropdownMenu>
-            {exportFormats.map((f) => (
-              <ActionListItem
-                key={f}
-                title={`Download ${f}`}
-                selectionType="None"
-                onClick={() => doExport(f)}
-              />
-            ))}
-            <ActionListItem title="Full Screen" selectionType="None" onClick={toggleFullscreen} />
-          </DropdownMenu>
-        </div>
+      {showSettings && (
+        <IconButton
+          icon={<Settings size={16} />}
+          size="Medium"
+          accessibilityLabel="Settings"
+          onClick={(e) => { capturePos(e); setSettingsOpen((o) => !o); setMoreOpen(false); }}
+        />
+      )}
+      {showMore && (
+        <IconButton
+          icon={<MoreHorizontal size={16} />}
+          size="Medium"
+          accessibilityLabel="Export"
+          onClick={(e) => { capturePos(e); setMoreOpen((o) => !o); setSettingsOpen(false); }}
+        />
+      )}
+      {settingsOpen && createPortal(
+        <>
+          <div style={backdropStyle} onClick={() => setSettingsOpen(false)} />
+          <div style={menuStyle}>
+            <DropdownMenu>
+              {settingGroups.map((group, gi) => (
+                <Fragment key={group.heading}>
+                  {gi > 0 && <ActionListItem contentType="Separator" />}
+                  <ActionListItem contentType="SectionHeading" title={group.heading} />
+                  {group.items.map((it) => (
+                    <ActionListItem
+                      key={it.key}
+                      title={it.label}
+                      selectionType="Multiple"
+                      isSelected={display[it.key]}
+                      onClick={() => toggle(it.key)}
+                    />
+                  ))}
+                </Fragment>
+              ))}
+            </DropdownMenu>
+          </div>
+        </>,
+        document.body
+      )}
+      {moreOpen && createPortal(
+        <>
+          <div style={backdropStyle} onClick={() => setMoreOpen(false)} />
+          <div style={menuStyle}>
+            <DropdownMenu>
+              {exportFormats.map((f) => (
+                <ActionListItem key={f} title={`Download ${f}`} selectionType="None" onClick={() => doExport(f)} />
+              ))}
+              <ActionListItem title="Full Screen" selectionType="None" onClick={toggleFullscreen} />
+            </DropdownMenu>
+          </div>
+        </>,
+        document.body
       )}
     </div>
   );
 }
-
-// Silence unused-import warning when Fragment isn't used elsewhere in the file.
-void Fragment;
 
 // ---------------------------------------------------------------------------
 // ChartTitleSwitcher — clickable title with a dropdown to switch between
@@ -934,29 +1162,28 @@ function ChartTitleSwitcher({
   titleStyle?: React.CSSProperties;
 }) {
   const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement | null>(null);
+  const [menuPos, setMenuPos] = useState({ top: 0, left: 0 });
+
   useEffect(() => {
     if (!open) return;
-    function onDown(e: MouseEvent) {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    }
     function onKey(e: KeyboardEvent) {
       if (e.key === 'Escape') setOpen(false);
     }
-    document.addEventListener('mousedown', onDown);
     document.addEventListener('keydown', onKey);
-    return () => {
-      document.removeEventListener('mousedown', onDown);
-      document.removeEventListener('keydown', onKey);
-    };
+    return () => document.removeEventListener('keydown', onKey);
   }, [open]);
+
   const label = activeChart?.title || 'Untitled Chart';
   return (
-    <div className="fds-chart-switcher__title" ref={ref}>
+    <div className="fds-chart-switcher__title">
       <button
         type="button"
         className="fds-chart__title"
-        onClick={() => setOpen((o) => !o)}
+        onClick={(e) => {
+          const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+          setMenuPos({ top: rect.bottom + 4, left: rect.left });
+          setOpen((o) => !o);
+        }}
         aria-haspopup="menu"
         aria-expanded={open}
       >
@@ -965,23 +1192,30 @@ function ChartTitleSwitcher({
         </span>
         <ChevronDown className="fds-chart__title-icon" aria-hidden="true" />
       </button>
-      {open && (
-        <div className="fds-chart-switcher__menu">
-          <DropdownMenu>
-            {charts.map((c) => (
-              <ActionListItem
-                key={c._id}
-                title={c.title || 'Untitled Chart'}
-                selectionType="Single"
-                isSelected={c._id === activeChart?._id}
-                onClick={() => {
-                  onSelect(c._id);
-                  setOpen(false);
-                }}
-              />
-            ))}
-          </DropdownMenu>
-        </div>
+      {open && createPortal(
+        <>
+          <div
+            style={{ position: 'fixed', inset: 0, zIndex: 9999 }}
+            onClick={() => setOpen(false)}
+          />
+          <div style={{ position: 'fixed', top: menuPos.top, left: menuPos.left, zIndex: 10000, minWidth: 200 }}>
+            <DropdownMenu>
+              {charts.map((c) => (
+                <ActionListItem
+                  key={c._id}
+                  title={c.title || 'Untitled Chart'}
+                  selectionType="Single"
+                  isSelected={c._id === activeChart?._id}
+                  onClick={() => {
+                    onSelect(c._id);
+                    setOpen(false);
+                  }}
+                />
+              ))}
+            </DropdownMenu>
+          </div>
+        </>,
+        document.body
       )}
     </div>
   );
