@@ -88,6 +88,8 @@ interface LineChartConfigurationProps {
   resolveUNSValue?: (rawValue: string) => string;
   // Angular runtime injection — list of global timepickers for the "Link Time With" dropdown.
   globalTimepickers?: GTPGlobalTimepicker[];
+  // Angular injects this to navigate back to the widget panel.
+  onBack?: () => void;
 }
 
 const VARIABLE_REGEX = /^\{\{(.+)\}\}$/;
@@ -271,6 +273,7 @@ function toHostTimeConfig(t: TimeTabUIConfig): HostTimeConfig {
     allDurations: t.allDurations ?? [],
     defaultPeriodicity:
       pickerType === 'fixed' && fd?.periodicity ? fd.periodicity.toLowerCase() : t.defaultPeriodicity,
+    shifts: t.shifts ?? [],
   };
 }
 
@@ -608,6 +611,7 @@ export function LineChartConfiguration({
   onLoadWorkspaces,
   resolveUNSValue: injectedResolveUNSValue,
   globalTimepickers,
+  onBack,
 }: LineChartConfigurationProps) {
   const hasInjectedUNS =
     injectedUnsTree !== undefined &&
@@ -1476,9 +1480,7 @@ export function LineChartConfiguration({
                 icon={<ArrowLeft size={16} />}
                 size="Small"
                 accessibilityLabel="Back"
-                onClick={() => {
-                  /* Placeholder per spec */
-                }}
+                onClick={() => { onBack?.(); }}
               />
               <span className="lc-config__title BodyMediumSemibold">Line Chart</span>
             </div>

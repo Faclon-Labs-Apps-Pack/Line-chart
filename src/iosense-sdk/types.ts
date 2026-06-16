@@ -376,6 +376,7 @@ export interface HostTimeConfig {
   defaultDurationId: string;
   allDurations: TimeTabUIConfig['allDurations'];
   defaultPeriodicity: string;
+  shifts?: TimeTabUIConfig['shifts'];
 }
 
 export interface LineChartEnvelope {

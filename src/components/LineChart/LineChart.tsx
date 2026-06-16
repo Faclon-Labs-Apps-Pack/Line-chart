@@ -9,6 +9,7 @@ import { LineChart as DSLineChart } from '@faclon-labs/design-sdk/LineChart';
 import { Chart, exportChart } from '@faclon-labs/design-sdk/Chart';
 import { IconButton } from '@faclon-labs/design-sdk/IconButton';
 import type { ChartPlotLine, ChartPlotBand, ChartExportFormat } from '@faclon-labs/design-sdk/Chart';
+import { ShiftLegend } from '@faclon-labs/design-sdk';
 import { Spinner } from '@faclon-labs/design-sdk/Spinner';
 import { EmptyState } from '@faclon-labs/design-sdk/EmptyState';
 import { DatePicker } from '@faclon-labs/design-sdk/DatePicker';
@@ -92,6 +93,7 @@ interface LineChartWidgetProps {
     startTime?: number | null;
     endTime?: number | null;
     fixedDuration?: { x?: number | string; xPeriod?: string } | null;
+    shifts?: Array<{ id: string; name: string; color: string; startTime: string; endTime: string }>;
   };
   onEvent?: (event: WidgetEvent) => void;
 }
@@ -158,11 +160,82 @@ function getValidPeriodicities(range: DateRange | null): string[] {
   return valid.length ? valid : ['Minute'];
 }
 
-// Derive an approximate DateRange from a preset's {x, xPeriod} so
-// periodicityOptions stays accurate as soon as a preset is selected (before
-// the user clicks "Apply" and onRangeChange fires).
-function rangeFromPreset(preset: { x?: number; xPeriod?: string } | undefined): DateRange | null {
-  if (!preset || typeof preset.x !== 'number' || !preset.xPeriod) return null;
+// Derive valid periodicities from a preset's definition — not from range span.
+// Mirrors the reference widget's getPresetPeriodicities. Returns null when
+// the preset shape is unrecognisable (fall back to getValidPeriodicities).
+const PRESET_MINS: Record<string, number> = {
+  minute: 1, hour: 60, day: 1440, week: 10080, month: 43200, year: 525600,
+};
+function getPresetPeriodicities(
+  preset: { x?: number; xPeriod?: string; calendarType?: string; periodicities?: string[] } | undefined,
+): string[] | null {
+  if (!preset) return null;
+  if (preset.periodicities?.length) return preset.periodicities.map(titleCase);
+  if (preset.calendarType) {
+    switch (preset.calendarType) {
+      case 'today':
+      case 'yesterday':      return ['Hourly'];
+      case 'current_week':
+      case 'previous_week':  return ['Hourly', 'Daily'];
+      case 'current_month':
+      case 'previous_month': return ['Daily'];
+      default: return null;
+    }
+  }
+  if (typeof preset.x === 'number' && preset.xPeriod) {
+    const mins = preset.x * (PRESET_MINS[preset.xPeriod] ?? 1440);
+    if (mins <= 60)    return ['Minute', 'Hourly'];
+    if (mins <= 1440)  return ['Hourly'];
+    if (mins <= 10080) return ['Hourly', 'Daily'];
+    if (mins <= 43200) return ['Daily'];
+    return ['Daily', 'Monthly'];
+  }
+  return null;
+}
+
+// Derive an approximate DateRange from a preset so periodicityOptions stays
+// accurate as soon as a preset is selected (before the user clicks "Apply").
+// Handles both x/xPeriod offsets and calendarType fixed-boundary presets.
+function rangeFromPreset(preset: { x?: number; xPeriod?: string; calendarType?: string } | undefined): DateRange | null {
+  if (!preset) return null;
+
+  // Calendar-boundary presets (today, yesterday, current/previous week/month)
+  if (preset.calendarType) {
+    const now = new Date();
+    const start = new Date(now);
+    const end = new Date(now);
+    switch (preset.calendarType) {
+      case 'today':
+        start.setHours(0, 0, 0, 0);
+        break;
+      case 'yesterday':
+        start.setDate(start.getDate() - 1); start.setHours(0, 0, 0, 0);
+        end.setDate(end.getDate() - 1);     end.setHours(23, 59, 59, 999);
+        break;
+      case 'current_week':
+        start.setDate(start.getDate() - start.getDay()); start.setHours(0, 0, 0, 0);
+        break;
+      case 'previous_week': {
+        const dow = now.getDay();
+        start.setDate(now.getDate() - dow - 7); start.setHours(0, 0, 0, 0);
+        end.setDate(now.getDate() - dow - 1);   end.setHours(23, 59, 59, 999);
+        break;
+      }
+      case 'current_month':
+        start.setDate(1); start.setHours(0, 0, 0, 0);
+        break;
+      case 'previous_month':
+        start.setMonth(start.getMonth() - 1); start.setDate(1); start.setHours(0, 0, 0, 0);
+        end.setDate(0); end.setHours(23, 59, 59, 999); // day 0 = last day of prev month
+        break;
+      default:
+        return null;
+    }
+    return { start, end };
+  }
+
+  // Relative offset presets (x units of xPeriod before now)
+  if (typeof preset.x !== 'number' || !preset.xPeriod) return null;
   const end = new Date();
   const start = new Date(end);
   const x = preset.x;
@@ -673,25 +746,71 @@ export function LineChart({
     setSelectedPeriodicity((prev) => (prev === tc ? prev : tc));
   }, [defaultPeriodicity]);
 
+  // Shift state — committed (shiftToggleOn) vs draft (draftShiftOn, in-picker only).
+  // Draft is synced from committed on every open; committed is set on Apply.
+  const cfgShifts = timeConfig?.shifts ?? [];
+  const cfgShiftKey = cfgShifts.map((s) => s.id).join('|');
+  const [shiftToggleOn, setShiftToggleOn] = useState(false);
+  const [draftShiftOn, setDraftShiftOn] = useState(false);
+  const [enabledShiftIds, setEnabledShiftIds] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    setShiftToggleOn(false);
+    setDraftShiftOn(false);
+    setEnabledShiftIds(new Set());
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cfgShiftKey]);
+
   const activePreset = timeConfig?.allDurations?.find((d) => d.id === selectedPreset);
 
   // When a preset is selected from the sidebar, the SDK's DatePicker only fires
   // onPresetSelect (not onRangeChange) until the user clicks "Apply". Derive the
-  // approximate range immediately so periodicityOptions is correct on selection.
+  // range immediately, snap periodicity, and emit TIME_CHANGE right away so the
+  // host fetches data without requiring the user to press Apply.
+  // Skip the first run — the mount effect already emits the initial TIME_CHANGE.
   const allDurations = timeConfig?.allDurations;
+  const presetInitialized = useRef(false);
+  // Blocks onRangeChange from re-emitting TIME_CHANGE when the SDK DatePicker
+  // fires it as a side-effect of a preset chip selection (preset effect already
+  // handles the emit). Mirrors the reference widget's presetSelectingRef pattern.
+  const presetSelectingRef = useRef(false);
   useEffect(() => {
     if (!selectedPreset || !allDurations) return;
     const preset = allDurations.find((d) => d.id === selectedPreset);
     const derived = rangeFromPreset(preset);
     if (derived) setRangeValue(derived);
+
+    if (!presetInitialized.current) {
+      presetInitialized.current = true;
+      return; // initial mount — mount effect handles the first TIME_CHANGE
+    }
+
+    // Use derived range when possible; fall back to existing rangeValue so
+    // onEvent always fires even for preset formats rangeFromPreset can't parse.
+    const eventRange = derived ?? rangeValue;
+    if (!eventRange) return;
+
+    // Use preset-definition periodicities (calendarType hardcodes / explicit
+    // list / minute-band), NOT bucket-count heuristic. Bucket count allows
+    // Hourly for a partial-month range — the preset definition is the authority.
+    const nextOptions = getPresetPeriodicities(preset) ?? getValidPeriodicities(eventRange);
+    const nextPeriodicity = nextOptions.includes(selectedPeriodicity)
+      ? selectedPeriodicity
+      : (nextOptions[0] ?? selectedPeriodicity);
+    if (nextPeriodicity !== selectedPeriodicity) setSelectedPeriodicity(nextPeriodicity);
+
+    onEventRef.current?.({
+      type: 'TIME_CHANGE',
+      payload: {
+        startTime: String(new Date(eventRange.start).getTime()),
+        endTime: String(new Date(eventRange.end).getTime()),
+        periodicity: nextPeriodicity.toLowerCase(),
+      },
+    });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedPreset, allDurations]);
 
   const periodicityOptions = useMemo(() => {
-    if (activePreset?.periodicities?.length) {
-      return activePreset.periodicities.map(titleCase);
-    }
-    return getValidPeriodicities(rangeValue);
+    return getPresetPeriodicities(activePreset) ?? getValidPeriodicities(rangeValue);
   }, [activePreset, rangeValue]);
 
   // If the active selection isn't valid for the current range/preset, snap to first valid
@@ -829,18 +948,27 @@ export function LineChart({
           <DatePicker
             mode="range"
             isOpen={datePickerOpen}
-            onOpenChange={setDatePickerOpen}
+            onOpenChange={(open) => {
+              if (open) setDraftShiftOn(shiftToggleOn);
+              setDatePickerOpen(open);
+            }}
             rangeValue={rangeValue}
             onRangeChange={(v) => {
               setRangeValue(v);
+              setShiftToggleOn(draftShiftOn);
+              // Preset chip selection fires onRangeChange as a side-effect
+              // (Apply button). The preset effect already emitted TIME_CHANGE
+              // with the correct snapped periodicity — skip here to avoid a
+              // second fetch with the old (un-snapped) periodicity.
+              if (presetSelectingRef.current) {
+                presetSelectingRef.current = false;
+                return;
+              }
               if (!v || !onEvent) return;
-              // `rangeValue` hasn't updated yet — compute valid periodicities
-              // from v directly so we can snap before emitting the event.
-              // This prevents the host from re-querying with an invalid
-              // periodicity (e.g. "Hourly" after switching to a year-long range).
-              const nextOptions = activePreset?.periodicities?.length
-                ? activePreset.periodicities.map(titleCase)
-                : getValidPeriodicities(v);
+              // Manual range pick: snap using preset-definition periodicities
+              // first (calendarType / explicit list / minute-band), then fall
+              // back to bucket-count heuristic for fully custom ranges.
+              const nextOptions = getPresetPeriodicities(activePreset) ?? getValidPeriodicities(v);
               const nextPeriodicity = nextOptions.includes(selectedPeriodicity)
                 ? selectedPeriodicity
                 : (nextOptions[0] ?? selectedPeriodicity);
@@ -861,9 +989,13 @@ export function LineChart({
             presets={datePresets}
             selectedPreset={selectedPreset}
             onPresetSelect={(v: string) => {
+              presetSelectingRef.current = true;
               setSelectedPreset(v);
             }}
             placeholder="Select date range"
+            showShift={cfgShifts.length > 0}
+            shiftEnabled={draftShiftOn}
+            onShiftToggle={(on) => setDraftShiftOn(on)}
             showPeriodicity={activeChart?.chartType !== 'Realtime'}
             periodicitySlot={
               activeChart?.chartType !== 'Realtime' ? (
@@ -972,6 +1104,28 @@ export function LineChart({
           }}
         />
       </Chart>
+      {shiftToggleOn && cfgShifts.length > 0 && (
+        <ShiftLegend
+          channel="shape"
+          sources={(activeChart?.series ?? []).map((s, i) => ({
+            index: i,
+            name: s.name || `Series ${i + 1}`,
+          }))}
+          shifts={cfgShifts.map((s) => ({
+            id: s.id,
+            name: s.name,
+            color: s.color,
+            enabled: enabledShiftIds.has(s.id),
+          }))}
+          onToggleShift={(id) =>
+            setEnabledShiftIds((prev) => {
+              const next = new Set(prev);
+              if (next.has(id)) next.delete(id); else next.add(id);
+              return next;
+            })
+          }
+        />
+      )}
       {cardEl &&
         showDataTable &&
         createPortal(
