@@ -1480,7 +1480,7 @@ export function LineChartConfiguration({
                 icon={<ArrowLeft size={16} />}
                 size="Small"
                 accessibilityLabel="Back"
-                onClick={() => { onBack?.(); }}
+                onClick={onBack}
               />
               <span className="lc-config__title BodyMediumSemibold">Line Chart</span>
             </div>

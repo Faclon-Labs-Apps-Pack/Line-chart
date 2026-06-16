@@ -1096,7 +1096,7 @@ export default function App() {
   return (
     <div className="app">
       <div className="app__config">
-        <LineChartConfiguration config={envelope} authentication={auth} onChange={setEnvelope} />
+        <LineChartConfiguration config={envelope} authentication={auth} onChange={setEnvelope} onBack={() => console.log('[DevHarness] onBack called')} />
       </div>
       <div className="app__widget">
         {envelope ? (
