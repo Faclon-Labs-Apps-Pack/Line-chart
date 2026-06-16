@@ -77,7 +77,7 @@
    reveals whatever's underneath, which can ALSO be white. Force them to
    paint the SAME color the user picked in the Style tab's "Background
    Color" field. The color is published as `--lcw-card-bg` on `.lcw` (see
-   `widgetStyle` in LineChart.tsx). When wrap-into-card is ON the variable
+   `widgetStyle` in LineChart.tsx). When wrap-into-card is OFF the variable
    resolves to transparent. */
 .lcw .fds-chart__title,
 .lcw .fds-chart__title:hover {
@@ -136,6 +136,13 @@
   display: inline-flex;
   align-items: center;
   gap: var(--spacing-02, 4px);
+}
+
+/* Keep actions pinned to the right edge of the header even when the title
+   is hidden (title=undefined → fds-chart__header-main is absent → without
+   this rule the flex children would left-align by default). */
+.lcw .fds-chart__actions {
+  margin-left: auto;
 }
 
 /* Data table hugs its content below the chart canvas (portalled into the card). */

@@ -179,7 +179,7 @@ const FONT_WEIGHTS: StylingFontWeight[] = ['Regular', 'Medium', 'Semi-Bold', 'Bo
 const DEFAULT_STYLING: LineChartStyling = {
   size: { preset: 'Medium', customWidth: 880, customHeight: 400, lockAspectRatio: false },
   card: {
-    wrapInCard: false,
+    wrapInCard: true,
     backgroundColor: '#FFFFFF',
     borderColor: '#EEEEEE',
     borderWidth: 1,
@@ -221,7 +221,7 @@ function normalizeStyling(raw: unknown): LineChartStyling {
       ...DEFAULT_STYLING,
       card: {
         ...DEFAULT_STYLING.card,
-        wrapInCard: typeof card.wrapInCard === 'boolean' ? card.wrapInCard : false,
+        wrapInCard: typeof card.wrapInCard === 'boolean' ? card.wrapInCard : true,
         backgroundColor:
           typeof card.bg === 'string' && card.bg.trim().length > 0
             ? card.bg
@@ -273,7 +273,20 @@ function toHostTimeConfig(t: TimeTabUIConfig): HostTimeConfig {
     allDurations: t.allDurations ?? [],
     defaultPeriodicity:
       pickerType === 'fixed' && fd?.periodicity ? fd.periodicity.toLowerCase() : t.defaultPeriodicity,
-    shifts: t.shifts ?? [],
+    shifts:
+      pickerType === 'fixed' ? (t.fixed?.shifts ?? t.shifts ?? []) : (t.shifts ?? []),
+    comparisonMode:
+      pickerType === 'fixed' ? t.fixed?.comparisonMode :
+      pickerType === 'global' ? t.global?.comparisonMode :
+      t.comparisonMode,
+    deviationPattern:
+      pickerType === 'fixed' ? t.fixed?.deviationPattern :
+      pickerType === 'global' ? t.global?.deviationPattern :
+      t.deviationPattern,
+    sourceDeviationOverrides:
+      pickerType === 'fixed' ? t.fixed?.sourceDeviationOverrides :
+      pickerType === 'global' ? t.global?.sourceDeviationOverrides :
+      t.sourceDeviationOverrides,
   };
 }
 

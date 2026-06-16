@@ -9,6 +9,7 @@ import { LineChart as DSLineChart } from '@faclon-labs/design-sdk/LineChart';
 import { Chart, exportChart } from '@faclon-labs/design-sdk/Chart';
 import { IconButton } from '@faclon-labs/design-sdk/IconButton';
 import type { ChartPlotLine, ChartPlotBand, ChartExportFormat } from '@faclon-labs/design-sdk/Chart';
+import type { ChartComparisonConfig, ComparisonSeriesInput, DeviationPattern, ChartShiftConfig, ShiftSeriesInput } from '@faclon-labs/design-sdk';
 import { ShiftLegend } from '@faclon-labs/design-sdk';
 import { Spinner } from '@faclon-labs/design-sdk/Spinner';
 import { EmptyState } from '@faclon-labs/design-sdk/EmptyState';
@@ -18,6 +19,7 @@ import { DropdownMenu } from '@faclon-labs/design-sdk/DropdownMenu';
 import { ActionListItem } from '@faclon-labs/design-sdk/ActionListItem';
 import { SelectInput } from '@faclon-labs/design-sdk/SelectInput';
 import { ChevronDown, Settings, MoreHorizontal, Info } from 'react-feather';
+import { Tooltip } from '@faclon-labs/design-sdk/Tooltip';
 import {
   Table,
   TableHeader,
@@ -94,6 +96,10 @@ interface LineChartWidgetProps {
     endTime?: number | null;
     fixedDuration?: { x?: number | string; xPeriod?: string } | null;
     shifts?: Array<{ id: string; name: string; color: string; startTime: string; endTime: string }>;
+    timezone?: string;
+    comparisonMode?: boolean;
+    deviationPattern?: string;
+    sourceDeviationOverrides?: Record<string, string>;
   };
   onEvent?: (event: WidgetEvent) => void;
 }
@@ -264,6 +270,42 @@ function finerPeriodicity(p?: string): string | null {
   }
 }
 
+// Return the time-of-day in minutes (0–1439) for a Unix ms timestamp,
+// respecting the configured timezone when provided.
+function slotMinutesOfDay(timestampMs: number, timezone?: string): number {
+  if (timezone) {
+    try {
+      const parts = new Intl.DateTimeFormat('en-US', {
+        timeZone: timezone,
+        hour: 'numeric',
+        minute: 'numeric',
+        hour12: false,
+      }).formatToParts(new Date(timestampMs));
+      const h = Number(parts.find((p) => p.type === 'hour')?.value ?? 0);
+      const m = Number(parts.find((p) => p.type === 'minute')?.value ?? 0);
+      return h * 60 + m;
+    } catch { /* fall through to local */ }
+  }
+  const d = new Date(timestampMs);
+  return d.getHours() * 60 + d.getMinutes();
+}
+
+// Return true if the slot's time-of-day falls inside the shift window.
+// Handles night shifts that cross midnight (startTime > endTime).
+function isSlotInShift(
+  timestampMs: number,
+  startTime: string,
+  endTime: string,
+  timezone?: string,
+): boolean {
+  const slotMin = slotMinutesOfDay(timestampMs, timezone);
+  const [sh, sm = 0] = startTime.split(':').map(Number);
+  const [eh, em = 0] = endTime.split(':').map(Number);
+  const s = sh * 60 + sm;
+  const e = eh * 60 + em;
+  return s < e ? slotMin >= s && slotMin < e : slotMin >= s || slotMin < e;
+}
+
 type ChartDisplay = {
   timeDrilldown: boolean;
   legends: boolean;
@@ -414,6 +456,60 @@ export function LineChart({
   }, [charts, previewChartId, config?.activeChartId]);
   const chartIndex = activeChart ? charts.findIndex((c) => c._id === activeChart._id) : -1;
 
+  // Shift state — committed (shiftToggleOn) vs draft (draftShiftOn, in-picker only).
+  // Draft is synced from committed on every open; committed is set on Apply.
+  const cfgShifts = timeConfig?.shifts ?? [];
+  const cfgShiftKey = cfgShifts.map((s) => s.id).join('|');
+  const [shiftToggleOn, setShiftToggleOn] = useState(false);
+  const [draftShiftOn, setDraftShiftOn] = useState(false);
+  useEffect(() => {
+    setShiftToggleOn(false);
+    setDraftShiftOn(false);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cfgShiftKey]);
+  // Which shift chips are toggled on in the chart legend — all enabled by default.
+  // Reset to all-on whenever the shift list changes.
+  const [enabledShiftIds, setEnabledShiftIds] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    setEnabledShiftIds(new Set(cfgShifts.map((s) => s.id)));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cfgShiftKey]);
+
+  // Comparison state — mirrors shift state: draft in-picker, committed on Apply.
+  const cfgComparisonMode = !!timeConfig?.comparisonMode;
+  const [comparisonToggleOn, setComparisonToggleOn] = useState(false);
+  const [draftComparisonOn, setDraftComparisonOn] = useState(false);
+  useEffect(() => {
+    if (!cfgComparisonMode) {
+      setComparisonToggleOn(false);
+      setDraftComparisonOn(false);
+    }
+  }, [cfgComparisonMode]);
+
+  // Shift and comparison are mutually exclusive — activating one deactivates the other.
+  const draftActivateShift = (on: boolean) => {
+    setDraftShiftOn(on);
+    if (on) setDraftComparisonOn(false);
+  };
+  const draftActivateComparison = (on: boolean) => {
+    setDraftComparisonOn(on);
+    if (on) setDraftShiftOn(false);
+  };
+  const commitToggles = () => {
+    setShiftToggleOn(draftShiftOn);
+    setComparisonToggleOn(draftComparisonOn);
+  };
+  const syncDraftFromCommitted = () => {
+    setDraftShiftOn(shiftToggleOn);
+    setDraftComparisonOn(comparisonToggleOn);
+  };
+
+  const chartMode = useMemo<'normal' | 'comparison' | 'shift'>(() => {
+    if (cfgComparisonMode && comparisonToggleOn) return 'comparison';
+    if (shiftToggleOn && cfgShifts.length > 0) return 'shift';
+    return 'normal';
+  }, [cfgComparisonMode, comparisonToggleOn, shiftToggleOn, cfgShifts.length]);
+
   // Resolve each configured series from `data` (series binding key matches the
   // configurator's: charts[ci].series[si].dataSource). Categories are the slot
   // labels of the longest series (backend returns aligned, pre-bucketed slots).
@@ -449,13 +545,17 @@ export function LineChart({
     return { series: out, categories: cats, catTimestamps: catTs };
   }, [activeChart, chartIndex, data]);
 
+  // The SDK's `shift` and `comparison` props own rendering in those modes;
+  // `series` is passed through but ignored by the chart when either prop is set.
+  const effectiveSeries = series;
+
   // Render whenever the backend returned slots for any series — even if all
   // values are null / non-numeric (the backend can return string sentinels
   // like " N/A" for compute sources, which our slot-to-number map turns into
   // null). The X-axis with time labels still renders and the user can see
   // the range / confirm the source is wired. The empty state is only for
   // when ZERO slots came back.
-  const hasSlots = series.some((s) => s.data.length > 0);
+  const hasSlots = effectiveSeries.some((s) => s.data.length > 0);
 
   // "Add Source as Tooltip" — these series stay in the dataset (shared tooltip)
   // but render no line and no legend chip. Index-aligned with `series`.
@@ -472,6 +572,117 @@ export function LineChart({
         .map((x) => x.name),
     [activeChart],
   );
+  // When shifts expand the series list, repeat the tooltip-only flag per shift copy
+  // and generate the expanded name list for legend-chip hiding.
+  const effectiveTooltipOnlyFlags = tooltipOnlyFlags;
+  const effectiveTooltipOnlyNames = tooltipOnlyNames;
+
+  // Comparison mode: build ChartComparisonConfig from current + previous period data.
+  // Previous period data is keyed as charts[ci].series[si].unsPath_comparison in data[];
+  // if absent (backend hasn't returned it yet) we fall back to null values per slot.
+  const widgetDeviationPattern: DeviationPattern =
+    (timeConfig?.deviationPattern as DeviationPattern) ?? 'green-up-positive';
+
+  const comparisonProp = useMemo<ChartComparisonConfig | undefined>(() => {
+    if (chartMode !== 'comparison') return undefined;
+    const configured = activeChart?.series ?? [];
+    if (!configured.length || !categories.length) return undefined;
+
+    const out: ComparisonSeriesInput[] = [];
+    configured.forEach((s, i) => {
+      const name = s.name || `Series ${i + 1}`;
+      const currentData = series[i]?.data ?? [];
+
+      // Previous period — try the _comparison-keyed slot from the host.
+      const compPayload = getSeriesData(`charts[${chartIndex}].series[${i}].unsPath_comparison`, data);
+      const prevData: (number | null)[] = compPayload
+        ? categories.map((_, ci) => {
+            const v = compPayload.slots[ci]?.value;
+            return typeof v === 'number' ? v : null;
+          })
+        : currentData.map(() => null);
+
+      const deviation = currentData.map((y, k) => {
+        const p = prevData[k];
+        if (y === null || p === null || p === 0) return null;
+        return Math.round(((y - p) / Math.abs(p)) * 1000) / 10;
+      });
+
+      const pattern: DeviationPattern =
+        (timeConfig?.sourceDeviationOverrides?.[`${activeChart?._id}:${s._id}`] as DeviationPattern) ??
+        widgetDeviationPattern;
+
+      const meta = { sourceId: s._id, sourceName: name, sourceIndex: i, shiftColor: s.color };
+
+      out.push({
+        ...meta,
+        shiftId: 'current',
+        shiftName: name,
+        shiftIndex: 0,
+        data: currentData,
+        seriesType: 'line',
+        showInLegend: true,
+      });
+      out.push({
+        ...meta,
+        shiftId: 'comparison',
+        shiftName: `${name} (prev)`,
+        shiftIndex: 1,
+        data: prevData,
+        dashStyle: 'Dash',
+        showInLegend: false,
+        deviation,
+        deviationPattern: pattern,
+      });
+    });
+
+    return { series: out, showDeviation: true, deviationPattern: widgetDeviationPattern, comparisonCategories: categories };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chartMode, activeChart, chartIndex, series, categories, data, widgetDeviationPattern, timeConfig?.sourceDeviationOverrides]);
+
+  // Shift mode: build ChartShiftConfig directly from slot data + shift windows.
+  // Each source × enabled shift becomes a ShiftSeriesInput; the SDK renders
+  // colored series and shows shift chips in the legend footer.
+  const shiftProp = useMemo<ChartShiftConfig | undefined>(() => {
+    if (chartMode !== 'shift' || cfgShifts.length === 0 || series.length === 0) return undefined;
+    const tz = timeConfig?.timezone;
+    const out: ShiftSeriesInput[] = [];
+    series.forEach((s, si) => {
+      cfgShifts.forEach((shift, shIdx) => {
+        if (!enabledShiftIds.has(shift.id)) return;
+        out.push({
+          sourceId: activeChart?.series[si]?._id ?? String(si),
+          sourceName: s.name,
+          sourceIndex: si,
+          shiftId: shift.id,
+          shiftName: shift.name,
+          shiftIndex: shIdx,
+          shiftColor: shift.color,
+          data: s.data.map((v, ci) => {
+            const ts = catTimestamps[ci];
+            if (!ts?.from) return null;
+            return isSlotInShift(ts.from, shift.startTime, shift.endTime, tz) ? v : null;
+          }),
+        });
+      });
+    });
+    return {
+      series: out,
+      sources: series.map((s, i) => ({ index: i, name: s.name })),
+      shifts: cfgShifts.map((s) => ({
+        id: s.id, name: s.name, color: s.color, enabled: enabledShiftIds.has(s.id),
+      })),
+      onToggleShift: (id: string) =>
+        setEnabledShiftIds((prev) => {
+          const next = new Set(prev);
+          if (next.has(id)) next.delete(id);
+          else next.add(id);
+          return next;
+        }),
+      onToggleSource: () => {},
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chartMode, cfgShiftKey, series, catTimestamps, enabledShiftIds, activeChart, timeConfig?.timezone]);
 
   // Plot lines (fixed values only — periodicity-dependent lines need the live
   // periodicity context which the host owns, so they're rendered server-side).
@@ -540,13 +751,14 @@ export function LineChart({
   const cardStyle = useMemo<React.CSSProperties | undefined>(() => {
     const card = style?.card;
     if (!card) return undefined;
-    // Background Color and Border Color / Width apply only when "Wrap Into Card"
-    // is OFF; turning the card ON drops the background and border (and zeros the
-    // outer padding). Border Radius applies in both states.
+    // Background Color and Border Color / Width apply when "Wrap Into Card"
+    // is ON (default). Turning it OFF drops the background/border/padding so
+    // the chart sits transparently inside whatever the dashboard provides.
+    // Border Radius applies in both states.
     const base: React.CSSProperties = {
       borderRadius: typeof card.borderRadius === 'number' ? card.borderRadius : undefined,
     };
-    if (card.wrapInCard === false) {
+    if (card.wrapInCard !== false) {
       return {
         ...base,
         backgroundColor: card.backgroundColor || '#FFFFFF',
@@ -638,9 +850,9 @@ export function LineChart({
     // Column Chart widget.
     opts.chart = {
       backgroundColor:
-        style?.card?.wrapInCard === false
-          ? style?.card?.backgroundColor || '#FFFFFF'
-          : 'transparent',
+        style?.card?.wrapInCard !== false
+          ? 'transparent'
+          : style?.card?.backgroundColor || '#FFFFFF',
       ...(chartDisplay.zoom ? { zoomType: 'x' } : {}),
     };
     if (multiAxis) {
@@ -662,10 +874,11 @@ export function LineChart({
     // "Add Source as Tooltip": no visible line / marker / data label and no
     // legend chip, but keep the series in the dataset (mouse-tracked) so the
     // shared tooltip reports its value when hovering other points.
-    opts.series = series.map((s: any, i) => {
+    opts.series = effectiveSeries.map((s: any, i) => {
+      const origIdx = i;
       const so: any = {};
-      if (multiAxis) so.yAxis = multiAxis.seriesAxis[i] ?? 0;
-      if (tooltipOnlyFlags[i]) {
+      if (multiAxis) so.yAxis = multiAxis.seriesAxis[origIdx] ?? 0;
+      if (effectiveTooltipOnlyFlags[i]) {
         so.lineWidth = 0;
         so.marker = { enabled: false, states: { hover: { enabled: false } } };
         so.dataLabels = { enabled: false };
@@ -711,7 +924,7 @@ export function LineChart({
       },
     };
     return opts as any;
-  }, [axisColors, miscColors, multiAxis, series, tooltipOnlyFlags, style?.card?.wrapInCard, style?.card?.backgroundColor, chartDisplay.zoom]);
+  }, [axisColors, miscColors, multiAxis, effectiveSeries, effectiveTooltipOnlyFlags, style?.card?.wrapInCard, style?.card?.backgroundColor, chartDisplay.zoom]);
 
   // The data table is portalled into the chart card (sibling of the canvas).
   const [cardEl, setCardEl] = useState<HTMLDivElement | null>(null);
@@ -745,20 +958,6 @@ export function LineChart({
     const tc = titleCase(defaultPeriodicity);
     setSelectedPeriodicity((prev) => (prev === tc ? prev : tc));
   }, [defaultPeriodicity]);
-
-  // Shift state — committed (shiftToggleOn) vs draft (draftShiftOn, in-picker only).
-  // Draft is synced from committed on every open; committed is set on Apply.
-  const cfgShifts = timeConfig?.shifts ?? [];
-  const cfgShiftKey = cfgShifts.map((s) => s.id).join('|');
-  const [shiftToggleOn, setShiftToggleOn] = useState(false);
-  const [draftShiftOn, setDraftShiftOn] = useState(false);
-  const [enabledShiftIds, setEnabledShiftIds] = useState<Set<string>>(new Set());
-  useEffect(() => {
-    setShiftToggleOn(false);
-    setDraftShiftOn(false);
-    setEnabledShiftIds(new Set());
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cfgShiftKey]);
 
   const activePreset = timeConfig?.allDurations?.find((d) => d.id === selectedPreset);
 
@@ -867,7 +1066,7 @@ export function LineChart({
   // Must live here (before any early return) to satisfy the Rules of Hooks.
   const widgetStyle = useMemo<React.CSSProperties>(() => {
     const bg =
-      style?.card?.wrapInCard === true
+      style?.card?.wrapInCard === false
         ? 'transparent'
         : style?.card?.backgroundColor || '#FFFFFF';
     return { ['--lcw-card-bg' as string]: bg } as React.CSSProperties;
@@ -913,10 +1112,11 @@ export function LineChart({
         <style>{`.lcw [class*="legend-label"] { color: ${miscColors.legend} !important; }`}</style>
       )}
       {/* Suppress legend chips for "Add Source as Tooltip" series (SDK builds
-          its HTML legend from the series prop). */}
-      {tooltipOnlyNames.length > 0 && (
+          its HTML legend from the series prop). When shifts are on, names
+          include the "(Shift Name)" suffix to match Highcharts' legend labels. */}
+      {effectiveTooltipOnlyNames.length > 0 && (
         <style>
-          {tooltipOnlyNames
+          {effectiveTooltipOnlyNames
             .map(
               (n) =>
                 `.lcw .fds-chart__scrollable-legend-item[aria-label="Toggle ${n.replace(
@@ -949,13 +1149,13 @@ export function LineChart({
             mode="range"
             isOpen={datePickerOpen}
             onOpenChange={(open) => {
-              if (open) setDraftShiftOn(shiftToggleOn);
+              if (open) syncDraftFromCommitted();
               setDatePickerOpen(open);
             }}
             rangeValue={rangeValue}
             onRangeChange={(v) => {
               setRangeValue(v);
-              setShiftToggleOn(draftShiftOn);
+              commitToggles();
               // Preset chip selection fires onRangeChange as a side-effect
               // (Apply button). The preset effect already emitted TIME_CHANGE
               // with the correct snapped periodicity — skip here to avoid a
@@ -995,7 +1195,10 @@ export function LineChart({
             placeholder="Select date range"
             showShift={cfgShifts.length > 0}
             shiftEnabled={draftShiftOn}
-            onShiftToggle={(on) => setDraftShiftOn(on)}
+            onShiftToggle={draftActivateShift}
+            showComparison={cfgComparisonMode}
+            comparisonEnabled={draftComparisonOn}
+            onComparisonToggle={draftActivateComparison}
             showPeriodicity={activeChart?.chartType !== 'Realtime'}
             periodicitySlot={
               activeChart?.chartType !== 'Realtime' ? (
@@ -1052,6 +1255,19 @@ export function LineChart({
             onDisplayChange={setChartDisplay}
           />
         }
+        // With bare={true} on DSLineChart the SDK's ShiftLegend doesn't
+        // auto-render — inject it here in the Chart's footer slot instead.
+        footer={
+          shiftProp ? (
+            <ShiftLegend
+              channel="shape"
+              sources={shiftProp.sources ?? []}
+              shifts={shiftProp.shifts ?? []}
+              onToggleShift={shiftProp.onToggleShift ?? (() => {})}
+              onToggleSource={shiftProp.onToggleSource}
+            />
+          ) : undefined
+        }
       >
         <DSLineChart
           // Highcharts updates options in-place via React props for most
@@ -1065,11 +1281,15 @@ export function LineChart({
             mc: miscColors,
             bg: highchartsOptions?.chart?.backgroundColor,
             chart: activeChart._id,
+            // chartMode changes series count/layout; force fresh Highcharts instance.
+            mode: chartMode,
           })}
           bare
           // null entries are valid Highcharts gaps; the SDK's LineSeries types
           // data as number[], so cast at the boundary.
-          series={series as any}
+          series={effectiveSeries as any}
+          comparison={chartMode === 'comparison' ? comparisonProp : undefined}
+          shift={chartMode === 'shift' ? shiftProp : undefined}
           categories={categories}
           showLegend={chartDisplay.legends}
           showDataLabels={chartDisplay.dataLabel}
@@ -1104,28 +1324,6 @@ export function LineChart({
           }}
         />
       </Chart>
-      {shiftToggleOn && cfgShifts.length > 0 && (
-        <ShiftLegend
-          channel="shape"
-          sources={(activeChart?.series ?? []).map((s, i) => ({
-            index: i,
-            name: s.name || `Series ${i + 1}`,
-          }))}
-          shifts={cfgShifts.map((s) => ({
-            id: s.id,
-            name: s.name,
-            color: s.color,
-            enabled: enabledShiftIds.has(s.id),
-          }))}
-          onToggleShift={(id) =>
-            setEnabledShiftIds((prev) => {
-              const next = new Set(prev);
-              if (next.has(id)) next.delete(id); else next.add(id);
-              return next;
-            })
-          }
-        />
-      )}
       {cardEl &&
         showDataTable &&
         createPortal(
@@ -1232,11 +1430,13 @@ function ChartActionIcons({
   return (
     <div className="lcw__chart-actions">
       {hasDescription && (
-        <IconButton
-          icon={<Info size={16} />}
-          size="Medium"
-          accessibilityLabel={description!.trim()}
-        />
+        <Tooltip bodyText={description!.trim()} placement="Bottom" isDisabled={settingsOpen || moreOpen}>
+          <IconButton
+            icon={<Info size={16} />}
+            size="Medium"
+            accessibilityLabel="Info"
+          />
+        </Tooltip>
       )}
       {showSettings && (
         <IconButton

@@ -377,6 +377,9 @@ export interface HostTimeConfig {
   allDurations: TimeTabUIConfig['allDurations'];
   defaultPeriodicity: string;
   shifts?: TimeTabUIConfig['shifts'];
+  comparisonMode?: boolean;
+  deviationPattern?: string;
+  sourceDeviationOverrides?: Record<string, string>;
 }
 
 export interface LineChartEnvelope {
