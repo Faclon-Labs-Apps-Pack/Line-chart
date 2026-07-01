@@ -10,12 +10,10 @@
   overflow: hidden;
 }
 
-/* Empty/loading states need an actual surface — the dashboard layer behind us
-   is grey, so a bare EmptyState/Spinner without a background looks broken
-   (transparent panel with stray text). Give every non-chart state a white
-   card and a soft border to match the SDK Chart frame. */
-.lcw--empty,
-.lcw--loading {
+/* Empty state needs an actual surface — the dashboard layer behind us is grey,
+   so a bare EmptyState without a background looks broken. Give it a white card
+   and a soft border to match the SDK Chart frame. */
+.lcw--empty {
   background-color: var(--background-surface-intense, #FFFFFF);
   border: 1px solid var(--border-subtle, #EEEEEE);
   border-radius: var(--radius-md, 8px);
@@ -102,6 +100,14 @@
   overflow: visible;
 }
 
+/* When chart title, settings icon, and export icon are all hidden, the header
+   has only the DatePicker (filters slot). Remove the SDK header's top/bottom
+   padding so there's no dead whitespace above the chart canvas. */
+.lcw--no-header-chrome .fds-chart__header {
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+}
+
 /* Stretch the underlying highcharts SVG so it reflows with the chart card,
    not its mount-time intrinsic size. Without this the canvas freezes at its
    first measured height when the dashboard layer resizes us. */
@@ -131,11 +137,16 @@
   justify-content: space-between;
 }
 
+/* GTP mode — hide the SDK datepicker trigger row; time is driven externally. */
+.lcw--gtp .fds-datepicker__trigger-row {
+  display: none !important;
+}
+
 /* Action icons wrapper in the SDK Chart's actions slot. */
 .lcw__chart-actions {
   display: inline-flex;
   align-items: center;
-  gap: var(--spacing-02, 4px);
+  gap: var(--spacing-03, 8px);
 }
 
 /* Keep actions pinned to the right edge of the header even when the title
@@ -145,10 +156,30 @@
   margin-left: auto;
 }
 
-/* Data table hugs its content below the chart canvas (portalled into the card). */
+/* Data table below the chart canvas (portalled into the card). */
 .lcw__data-table {
   margin-top: var(--spacing-04, 12px);
   width: 100%;
   flex: 0 0 auto;
   height: fit-content;
+}
+
+/* When the data table is shown, enforce a 70(chart)/30(table) height split so
+   the table never squeezes the chart area. The data table is portalled as a
+   direct sibling of .fds-chart__canvas inside .fds-chart. */
+.lcw--with-table .fds-chart > .fds-chart__canvas {
+  flex: 7 7 0 !important;
+  min-height: 0;
+}
+.lcw--with-table .fds-chart > .lcw__data-table {
+  flex: 3 3 0 !important;
+  height: auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* Data table rows are display-only (no row-level action) — suppress the
+   SDK's default hover highlight so they don't look interactive. */
+.lcw__data-table .fds-table__row:hover {
+  --fds-row-bg: transparent;
 }

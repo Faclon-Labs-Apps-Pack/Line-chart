@@ -1,7 +1,77 @@
 import { BindingEntry, SeriesPayload, SeriesMeta, SeriesSlot } from './types';
 
-const STAGING_BASE = 'https://stagingsv.iosense.io/api';
+// ---------------------------------------------------------------------------
+// Token + API-base capture — reads the Bearer token AND the API base URL from
+// the Angular DataLayer's own HTTP calls. Using the captured base URL (not a
+// hardcoded one) ensures our comparison fetch targets the same server the
+// DataLayer targets, regardless of environment (staging vs production).
+// ---------------------------------------------------------------------------
+let _capturedToken = '';
+let _capturedApiBase = '';
+export function getCapturedToken(): string { return _capturedToken; }
+export function getCapturedApiBase(): string { return _capturedApiBase; }
+
+function _extractBase(url: string) {
+  if (!_capturedApiBase) {
+    const m = url.match(/^(https?:\/\/[^/]+\/api)/i);
+    if (m) _capturedApiBase = m[1];
+  }
+}
+
+if (typeof window !== 'undefined') {
+  // XHR path — intercept open() for URL, setRequestHeader for token
+  const _xhrUrls = new WeakMap<XMLHttpRequest, string>();
+  const _origOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method: string, url: string, ...args: unknown[]) {
+    _xhrUrls.set(this, url);
+    return (_origOpen as Function).call(this, method, url, ...args);
+  };
+  const _origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+  XMLHttpRequest.prototype.setRequestHeader = function(name: string, value: string) {
+    if (/^authorization$/i.test(name) && /^bearer /i.test(value)) {
+      _capturedToken = value;
+      _extractBase(_xhrUrls.get(this) ?? '');
+    }
+    return _origSetHeader.call(this, name, value);
+  };
+
+  // fetch path (Angular 16+ HttpClient default)
+  const _origFetch = window.fetch.bind(window);
+  window.fetch = function(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : (input as Request).url;
+    if (init?.headers) {
+      const tryExtract = (name: string, value: string) => {
+        if (/^authorization$/i.test(name) && /^bearer /i.test(value)) {
+          _capturedToken = value;
+          _extractBase(url);
+        }
+      };
+      if (init.headers instanceof Headers) {
+        try { (init.headers as Headers).forEach((v, k) => tryExtract(k, v)); } catch { /* ignore */ }
+      } else if (Array.isArray(init.headers)) {
+        (init.headers as string[][]).forEach(([k, v]) => tryExtract(k, v));
+      } else {
+        const h = init.headers as Record<string, string>;
+        Object.keys(h).forEach((k) => tryExtract(k, h[k]));
+      }
+    }
+    return _origFetch(input, init);
+  };
+}
+
+// In dev (localhost) use the staging server. In production Lens the frontend
+// and API are on separate domains — the API is always appserver.iosense.io
+// regardless of what domain Lens is hosted on (matches DataLayer hardcoding).
+function getApiBase(): string {
+  if (typeof window === 'undefined') return 'https://stagingsv.iosense.io/api';
+  const h = window.location.hostname;
+  if (h === 'localhost' || h === '127.0.0.1') return 'https://stagingsv.iosense.io/api';
+  if (h.includes('stagingsv') || h.includes('staging')) return 'https://stagingsv.iosense.io/api';
+  return 'https://appserver.iosense.io/api';
+}
+const STAGING_BASE = getApiBase();
 const GRAPH = 'iosense_test_uns';
+
 
 // Lens injects `authentication` already prefixed with "Bearer ". Dev harness
 // stores the raw JWT. Normalize at every call site so the Authorization header
@@ -40,26 +110,15 @@ export async function resolveAndCompute(
     body.timeFrame = resolution;
     body.resolution = resolution;
   }
-  // Diagnostic log — confirms time window + resolution are actually sent on every call.
-  console.log('[API] resolveAndCompute →', {
-    startTime: new Date(startTime).toISOString(),
-    endTime: new Date(endTime).toISOString(),
-    durationMs: endTime - startTime,
-    resolution,
-    timeFrame: body.timeFrame,
-    bindingCount: config.length,
-    bindings: config.map((b) => ({
-      key: b.key,
-      type: 'type' in b ? b.type : 'scalar',
-      hasAggregation: 'aggregation' in b,
-    })),
-  });
-  const res = await fetch(`${STAGING_BASE}/account/uns/resolveAndCompute`, {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (authentication) headers.Authorization = bearer(authentication);
+
+  // Prefer the URL base captured from the DataLayer's own calls — guarantees
+  // we hit the same server that issued the token, regardless of environment.
+  const apiBase = _capturedApiBase || STAGING_BASE;
+  const res = await fetch(`${apiBase}/account/uns/resolveAndCompute`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: bearer(authentication),
-    },
+    headers,
     body: JSON.stringify(body),
   });
   if (!res.ok) {

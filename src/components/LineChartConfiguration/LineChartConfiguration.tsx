@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { UNSPathInput } from '@faclon-labs/design-sdk/UNSPathInput';
 import { ColorInput } from '@faclon-labs/design-sdk/ColorPicker';
+import { Tag } from '@faclon-labs/design-sdk/Tag';
 import { useUNSTree, UNSTree } from '../../iosense-sdk/useUNSTree';
 import {
   ArrowLeft,
@@ -51,10 +52,8 @@ import {
   LineChartPlotBand,
   LineChartSPC,
   LineChartAnomaly,
-  PlotLineType,
-  PlotLineValueType,
   PlotLineStyle,
-  PlotLinePeriodicityEntry,
+  PlotLinePeriodicityType,
   SPCProcessType,
   SPCSigmaLevel,
   AnomalyOperator,
@@ -118,6 +117,39 @@ function buildDynamicBindingPathList(
       const match = VARIABLE_REGEX.exec(raw);
       if (match) {
         paths.push({ key: `charts[${ci}].axes[${ai}].unsPath`, topic: match[1], type: 'series' });
+      }
+    });
+    chart.plotLines.forEach((p, pi) => {
+      const raw = (p.value || '').trim();
+      const match = VARIABLE_REGEX.exec(raw);
+      if (match) {
+        paths.push({ key: `charts[${ci}].plotLines[${pi}].value`, topic: match[1], type: 'series' });
+      }
+    });
+    chart.anomalies.forEach((anom, ai) => {
+      if (anom.labelMode === 'NewSource') {
+        const raw = (anom.newSourceTopic || '').trim();
+        const match = VARIABLE_REGEX.exec(raw);
+        if (match) {
+          paths.push({ key: `charts[${ci}].anomalies[${ai}].newSourceTopic`, topic: match[1], type: 'series' });
+        }
+      }
+    });
+
+    // AddNew data table columns have their own UNS topic — not linked to any
+    // chart series — so we register them separately. The widget reads the
+    // resolved payload via the same key and shows it only in the data table.
+    chart.dataTable.columns.forEach((col, colIdx) => {
+      if (col.sourceMode === 'AddNew') {
+        const raw = (col.topic || '').trim();
+        const match = VARIABLE_REGEX.exec(raw);
+        if (match) {
+          paths.push({
+            key: `charts[${ci}].dataTable.columns[${colIdx}].topic`,
+            topic: match[1],
+            type: 'series',
+          });
+        }
       }
     });
   });
@@ -214,6 +246,12 @@ function normalizeStyling(raw: unknown): LineChartStyling {
           ...styling.card,
           wrapInCard: styling.card?.wrapInCard === true,
         },
+        // Merge defaults so keys missing from old saved configs (before
+        // hideElements was introduced) always initialize to false (= visible).
+        hideElements: {
+          ...DEFAULT_STYLING.hideElements,
+          ...(styling.hideElements ?? {}),
+        },
       };
     }
     const card = (obj.card as Record<string, unknown> | undefined) ?? {};
@@ -265,6 +303,11 @@ function toHostTimeConfig(t: TimeTabUIConfig): HostTimeConfig {
     timezone: t.timezone,
     type: pickerType === 'global' ? 'local' : pickerType,
     pickerType,
+    // Preserve the GTP id so the widget can detect GTP mode even when Lens
+    // pushes a runtime timeConfig update that doesn't include pickerType.
+    ...(pickerType === 'global' && (t.global as any)?.id
+      ? { globalTimepickerId: (t.global as any).id }
+      : {}),
     cycleTime,
     startTime: null,
     endTime: null,
@@ -1342,8 +1385,20 @@ export function LineChartConfiguration({
 
   // ---- Time tab mutator ----------------------------------------------------
   function handleTimeConfigChange(next: TimeTabUIConfig) {
-    setTimeTabConfig(next);
-    emit({ timeTabConfig: next });
+    // The SDK's TimeTabConfiguration fires onChange on mount and whenever the
+    // `charts` prop changes (e.g. adding/removing a data source). Guard #1:
+    // bail out if the full value is already identical to avoid a no-op emit.
+    if (JSON.stringify(next) === JSON.stringify(timeTabConfig)) return;
+    // Guard #2: if the SDK reverted defaultPeriodicity back to a default while
+    // the user had already chosen one, keep the user's choice. This prevents
+    // adding/removing a data source from silently resetting the periodicity.
+    const merged: TimeTabUIConfig =
+      timeTabConfig?.defaultPeriodicity && next.defaultPeriodicity !== timeTabConfig.defaultPeriodicity
+        ? { ...next, defaultPeriodicity: timeTabConfig.defaultPeriodicity }
+        : next;
+    if (JSON.stringify(merged) === JSON.stringify(timeTabConfig)) return;
+    setTimeTabConfig(merged);
+    emit({ timeTabConfig: merged });
   }
 
   function handleDeviationIndicatorChange(next: DeviationIndicatorMode) {
@@ -1634,23 +1689,29 @@ export function LineChartConfiguration({
             )}
 
             {topTab === 'Time' && (
-              <div className="lc-config__time-tab" ref={timeTabRef}>
-                <TimeTabConfiguration
-                  value={timeTabConfig}
-                  onChange={handleTimeConfigChange}
-                  globalTimepickers={globalTimepickers}
-                  charts={gtpCharts}
-                />
-                {/* Deviation indicator + per-source "Advance Settings" are owned
-                    by the SDK Time tab natively (`fds-ttc__deviation` cards →
-                    timeTabConfig.deviationPattern / sourceDeviationOverrides),
-                    which the preview reads directly. Our duplicate
-                    `lc-config__deviation-indicator` and "Advance Settings"
-                    portals are removed. */}
-                {/* Replace the per-source chart Tabs with a single-select
-                    "Chart" dropdown (the SDK exposes no prop for this). */}
-                <PerSourceChartDropdownPortal scope={timeTabRef} charts={gtpCharts} />
-              </div>
+              activeChart && activeChart.series.length > 0 ? (
+                <div className="lc-config__time-tab" ref={timeTabRef}>
+                  <TimeTabConfiguration
+                    value={timeTabConfig}
+                    onChange={handleTimeConfigChange}
+                    globalTimepickers={globalTimepickers}
+                    charts={gtpCharts}
+                  />
+                  {/* Deviation indicator + per-source "Advance Settings" are owned
+                      by the SDK Time tab natively (`fds-ttc__deviation` cards →
+                      timeTabConfig.deviationPattern / sourceDeviationOverrides),
+                      which the preview reads directly. Our duplicate
+                      `lc-config__deviation-indicator` and "Advance Settings"
+                      portals are removed. */}
+                  {/* Replace the per-source chart Tabs with a single-select
+                      "Chart" dropdown (the SDK exposes no prop for this). */}
+                  <PerSourceChartDropdownPortal scope={timeTabRef} charts={gtpCharts} />
+                </div>
+              ) : (
+                <div className="lc-config__time-tab-empty">
+                  <span>Add a data source in the <strong>Data</strong> tab first.</span>
+                </div>
+              )
             )}
 
             {topTab === 'Style' && (
@@ -1741,6 +1802,7 @@ export function LineChartConfiguration({
                   key={addPanel.mode === 'edit' ? addPanel.itemId : 'new'}
                   initial={(editingItem as LineChartPlotLine | null) ?? null}
                   existingCount={plotLines.length}
+                  axes={axes}
                   unsTree={unsTree}
                   isLoadingTree={isLoadingTree}
                   loadWorkspaces={loadWorkspaces}
@@ -2421,12 +2483,12 @@ function SectionItemList({
 
         <Checkbox
           label="Transpose Table"
-          isChecked={dataTable.transposeTable}
+          checked={dataTable.transposeTable}
           onChange={(e: React.ChangeEvent<HTMLInputElement>) => onTransposeTable(e.target.checked)}
         />
         <Checkbox
           label="Show Unit"
-          isChecked={dataTable.showUnit ?? true}
+          checked={dataTable.showUnit ?? true}
           onChange={(e: React.ChangeEvent<HTMLInputElement>) => onShowUnitChange(e.target.checked)}
         />
 
@@ -3253,7 +3315,7 @@ function DataSourceEditor({
       {/* Add Source as Tooltip */}
       <Checkbox
         size="Medium"
-        isChecked={addAsTooltip}
+        checked={addAsTooltip}
         onChange={(e) => setAddAsTooltip(e.target.checked)}
       >
         Add Source as Tooltip
@@ -3393,26 +3455,26 @@ function AxisEditor({
 // Editor: Plot Line
 // ===========================================================================
 
-const PERIODICITY_OPTIONS = ['Hourly', 'Daily', 'Weekly', 'Monthly', 'Quarterly'];
 const LINE_STYLE_OPTIONS: PlotLineStyle[] = ['Solid', 'Dashed'];
-const DURATION_TYPE_OPTIONS = ['Fixed', 'Custom'];
+const PLOT_LINE_PERIODICITIES = ['hourly', 'daily', 'weekly', 'monthly'] as const;
 
 interface PlotLineEditorProps {
   initial: LineChartPlotLine | null;
   existingCount: number;
+  axes: LineChartAxis[];
   unsTree: import('@faclon-labs/design-sdk/UNSPathInput').UNSTree;
   isLoadingTree: boolean;
   loadWorkspaces: () => void;
   resolveUNSValue: (raw: string) => string;
   onSubmit: (line: LineChartPlotLine) => void;
   onReady: (b: EditorBinding) => void;
-  // When the chart is Realtime, periodicity-dependent plotlines are unavailable.
   isRealtime?: boolean;
 }
 
 function PlotLineEditor({
   initial,
   existingCount,
+  axes,
   unsTree,
   isLoadingTree,
   loadWorkspaces,
@@ -3423,117 +3485,84 @@ function PlotLineEditor({
 }: PlotLineEditorProps) {
   const [name, setName] = useState(initial?.name ?? '');
   const [color, setColor] = useState(initial?.color ?? '#3b82f6');
-  // In Realtime, only Independent plotlines exist — force the editor to that
-  // type so a previously-Dependent line edited here doesn't expose periodicity.
-  const [type, setType] = useState<PlotLineType>(
-    isRealtime ? 'Independent' : initial?.type ?? 'Independent',
-  );
-  const [valueType, setValueType] = useState<PlotLineValueType>(
-    initial?.valueType ?? 'Fixed',
-  );
-  const [valueTypeOpen, setValueTypeOpen] = useState(false);
-  const [fixedValue, setFixedValue] = useState(initial?.fixedValue ?? '');
-  const [dynamicTopic, setDynamicTopic] = useState(initial?.dynamicTopic ?? '');
-  const [dataPrecision, setDataPrecision] = useState<string>(
-    typeof initial?.dataPrecision === 'number' ? String(initial.dataPrecision) : '',
-  );
-  const [unit, setUnit] = useState(initial?.unit ?? '');
-  const [periodicities, setPeriodicities] = useState<PlotLinePeriodicityEntry[]>(
-    initial?.periodicities ?? [],
-  );
-  const [durationType, setDurationType] = useState(initial?.durationType ?? 'Custom');
-  const [durationTypeOpen, setDurationTypeOpen] = useState(false);
-  const [startDate, setStartDate] = useState<Date | null>(
-    initial?.startDate ? new Date(initial.startDate) : null,
-  );
-  const [endDate, setEndDate] = useState<Date | null>(
-    initial?.endDate ? new Date(initial.endDate) : null,
-  );
+  // Migrate from legacy fixedValue/dynamicTopic fields
+  const [value, setValue] = useState<string>(() => {
+    if (initial?.value !== undefined) return initial.value;
+    if (initial?.dynamicTopic) return initial.dynamicTopic;
+    if (initial?.fixedValue !== undefined) return initial.fixedValue;
+    return '';
+  });
+  const [axisId, setAxisId] = useState<string>(initial?.axisId ?? '');
+  const [axisDropdownOpen, setAxisDropdownOpen] = useState(false);
   const [lineWidth, setLineWidth] = useState<string>(
     typeof initial?.lineWidth === 'number' ? String(initial.lineWidth) : '1',
   );
   const [lineStyle, setLineStyle] = useState<PlotLineStyle>(initial?.lineStyle ?? 'Solid');
-  const [styleOpen, setStyleOpen] = useState(true);
   const [styleDropdownOpen, setStyleDropdownOpen] = useState(false);
-  const [openPeriodicityRow, setOpenPeriodicityRow] = useState<number | null>(null);
+  // Migrate from legacy type field
+  const [periodicityType, setPeriodicityType] = useState<PlotLinePeriodicityType>(
+    isRealtime
+      ? 'independent'
+      : initial?.periodicityType ??
+        (initial?.type === 'Dependent' ? 'dependent' : 'independent'),
+  );
+  const [periodicities, setPeriodicities] = useState<string[]>(
+    Array.isArray(initial?.periodicities)
+      ? initial!.periodicities.map((p) => (typeof p === 'string' ? p : (p as { periodicity: string }).periodicity))
+      : [],
+  );
+  const [periodicityDropdownOpen, setPeriodicityDropdownOpen] = useState(false);
+  const [currentPeriodicity, setCurrentPeriodicity] = useState('');
 
   const isValid = name.trim().length > 0;
-
-  function addPeriodicityRow() {
-    setPeriodicities((rows) => {
-      // Default the new row to the first periodicity not already chosen.
-      const used = new Set(rows.map((r) => r.periodicity));
-      const next = PERIODICITY_OPTIONS.find((p) => !used.has(p)) ?? PERIODICITY_OPTIONS[0];
-      return [...rows, { periodicity: next, value: 0 }];
-    });
-  }
-  function updatePeriodicityRow(idx: number, patch: Partial<PlotLinePeriodicityEntry>) {
-    setPeriodicities((rows) => rows.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
-  }
-  function removePeriodicityRow(idx: number) {
-    setPeriodicities((rows) => rows.filter((_, i) => i !== idx));
-  }
 
   const submit = useCallback(() => {
     if (!isValid) return;
     const widthNum = Number(lineWidth);
-    const isDynamic = valueType === 'Dynamic';
     onSubmit({
       _id: initial?._id ?? `plotline_${Date.now()}_${existingCount}`,
       name: name.trim(),
       color: color.trim() || '#3b82f6',
-      type,
-      valueType,
-      fixedValue:
-        type === 'Independent' && valueType === 'Fixed' && fixedValue !== ''
-          ? fixedValue
-          : undefined,
-      dynamicTopic: isDynamic ? dynamicTopic : undefined,
-      dataPrecision:
-        isDynamic && dataPrecision !== '' && !Number.isNaN(Number(dataPrecision))
-          ? Number(dataPrecision)
-          : undefined,
-      unit: isDynamic && unit ? unit : undefined,
-      periodicities: type === 'Dependent' && valueType === 'Fixed' ? periodicities : undefined,
-      durationType: type === 'Independent' && isDynamic ? durationType || undefined : undefined,
-      startDate: type === 'Independent' && isDynamic && startDate ? startDate.toISOString() : undefined,
-      endDate: type === 'Independent' && isDynamic && endDate ? endDate.toISOString() : undefined,
+      value,
+      axisId: axisId || undefined,
       lineWidth: Number.isFinite(widthNum) && widthNum > 0 ? widthNum : 1,
       lineStyle,
+      periodicityType,
+      periodicities: periodicityType === 'dependent' && periodicities.length > 0 ? periodicities : undefined,
     });
-  }, [
-    isValid,
-    initial,
-    existingCount,
-    name,
-    color,
-    type,
-    valueType,
-    fixedValue,
-    dynamicTopic,
-    dataPrecision,
-    unit,
-    periodicities,
-    durationType,
-    startDate,
-    endDate,
-    lineWidth,
-    lineStyle,
-    onSubmit,
-  ]);
+  }, [isValid, initial, existingCount, name, color, value, axisId, lineWidth, lineStyle, periodicityType, periodicities, onSubmit]);
 
   useEditorBinding(isValid, submit, onReady);
 
   return (
     <div className="lc-config__editor">
       <TextInput
-        label="Name"
+        label="Label"
         labelPosition="top"
-        placeholder="Enter line name"
+        placeholder="e.g. Target"
         value={name}
         necessityIndicator="required"
-        onChange={({ value }: { name: string; value: string }) => setName(value)}
+        onChange={({ value: v }: { name: string; value: string }) => setName(v)}
       />
+
+      <UNSPathInput
+        label="Value"
+        placeholder="Type a number or / to bind"
+        value={value}
+        tree={unsTree}
+        isLoading={isLoadingTree}
+        onOpen={loadWorkspaces}
+        onChange={(v: string) => {
+          const resolved = resolveUNSValue(v);
+          // If not a binding, restrict to decimal numbers only
+          const isBinding = /^\{\{.+\}\}$/.test(resolved);
+          if (!isBinding && resolved !== '' && resolved !== '-' && resolved !== '.') {
+            if (!/^-?\d*\.?\d*$/.test(resolved)) return;
+          }
+          setValue(resolved);
+        }}
+      />
+
       <ColorInput
         label="Color *"
         placeholder="Select color"
@@ -3541,257 +3570,141 @@ function PlotLineEditor({
         onChange={(hex: string) => setColor(hex)}
       />
 
-      {/* Realtime charts have no periodicity, so the "Periodicity Dependent"
-          option is hidden — only Independent plotlines are available. */}
-      {!isRealtime && (
-        <RadioGroup
-          label="Plotline Type"
-          name="plotline-type"
-          size="Medium"
-          value={type}
-          onChange={({ value }) => setType(value as PlotLineType)}
-          orientation="Vertical"
-        >
-          <Radio
-            label="Periodicity Independent"
-            helpText="Plotline uses a static value, unaffected by periodic intervals."
-            value="Independent"
-          />
-          <Radio
-            label="Periodicity Dependent"
-            helpText="Plotline values dynamically derived from the selected periodic dataset."
-            value="Dependent"
-          />
-        </RadioGroup>
-      )}
-
-      <SelectInput
-        label="Value Type *"
-        placeholder="Select"
-        value={valueType}
-        isOpen={valueTypeOpen}
-        onOpenChange={setValueTypeOpen}
-        onClick={() => setValueTypeOpen((o) => !o)}
-      >
-        <DropdownMenu>
-          {(['Fixed', 'Dynamic'] as PlotLineValueType[]).map((opt) => (
-            <ActionListItem
-              key={opt}
-              title={opt}
-              selectionType="Single"
-              isSelected={valueType === opt}
-              onClick={() => {
-                setValueType(opt);
-                setValueTypeOpen(false);
-              }}
-            />
-          ))}
-        </DropdownMenu>
-      </SelectInput>
-
-      {type === 'Independent' && valueType === 'Fixed' && (
-        <TextInput
-          label="Value"
-          labelPosition="top"
-          type="number"
-          necessityIndicator="required"
-          placeholder="Enter value"
-          value={fixedValue}
-          onChange={({ value }: { name: string; value: string }) => setFixedValue(value)}
-        />
-      )}
-
-      {valueType === 'Dynamic' && (
-        <>
-          <UNSPathInput
-            label="UNS Path"
-            placeholder="Enter UNS Path"
-            value={dynamicTopic}
-            tree={unsTree}
-            isLoading={isLoadingTree}
-            onOpen={loadWorkspaces}
-            onChange={(v: string) => setDynamicTopic(resolveUNSValue(v))}
-          />
-          <div className="lc-config__date-row">
-            <TextInput
-              label="Data Precision *"
-              labelPosition="top"
-              placeholder="Enter value"
-              value={dataPrecision}
-              onChange={({ value }: { name: string; value: string }) =>
-                setDataPrecision(value)
-              }
-            />
-            <TextInput
-              label="Unit *"
-              labelPosition="top"
-              placeholder="Enter value"
-              value={unit}
-              onChange={({ value }: { name: string; value: string }) => setUnit(value)}
-            />
-          </div>
-        </>
-      )}
-
-      {type === 'Dependent' && valueType === 'Fixed' && (
-        <div className="lc-config__sub-block">
-          <p className="lc-config__sub-block-title LabelSmallRegular">
-            Periodicity Settings
-          </p>
-          {periodicities.length === 0 && (
-            <p className="lc-config__hint BodySmallRegular">
-              No periodicities added. Click "Add Periodicity" to add one.
-            </p>
-          )}
-          {periodicities.map((row, idx) => (
-            <div className="lc-config__periodicity-row" key={idx}>
-              <SelectInput
-                label="Periodicity"
-                placeholder="Select"
-                value={row.periodicity}
-                isOpen={openPeriodicityRow === idx}
-                onOpenChange={(o) => setOpenPeriodicityRow(o ? idx : null)}
-                onClick={() =>
-                  setOpenPeriodicityRow((cur) => (cur === idx ? null : idx))
-                }
-              >
-                <DropdownMenu>
-                  {PERIODICITY_OPTIONS.filter(
-                    // Hide periodicities already chosen in other rows; keep the
-                    // current row's own selection so it stays visible/selected.
-                    (p) =>
-                      p === row.periodicity ||
-                      !periodicities.some((r, i) => i !== idx && r.periodicity === p),
-                  ).map((p) => (
-                    <ActionListItem
-                      key={p}
-                      title={p}
-                      selectionType="Single"
-                      isSelected={row.periodicity === p}
-                      onClick={() => {
-                        updatePeriodicityRow(idx, { periodicity: p });
-                        setOpenPeriodicityRow(null);
-                      }}
-                    />
-                  ))}
-                </DropdownMenu>
-              </SelectInput>
-              <TextInput
-                label="Value"
-                labelPosition="top"
-                placeholder="0"
-                value={String(row.value ?? '')}
-                onChange={({ value }: { name: string; value: string }) => {
-                  const num = Number(value);
-                  updatePeriodicityRow(idx, {
-                    value: Number.isFinite(num) ? num : 0,
-                  });
-                }}
-              />
-              <IconButton
-                icon={<Trash2 size={14} />}
-                size="Small"
-                emphasis="Intense"
-                accessibilityLabel="Remove periodicity"
-                onClick={() => removePeriodicityRow(idx)}
-              />
-            </div>
-          ))}
-          <Button
-            variant="Gray"
-            color="Primary"
-            size="Small"
-            leadingIcon={<Plus size={14} />}
-            label="Add Periodicity"
-            isDisabled={periodicities.length >= PERIODICITY_OPTIONS.length}
-            onClick={addPeriodicityRow}
-          />
-        </div>
-      )}
-
-      {type === 'Independent' && valueType === 'Dynamic' && (
-      <div className="lc-config__flat-section">
-        <p className="lc-config__flat-section-title LabelSmallSemiBold">Duration Settings</p>
+      {axes.length > 0 && (
         <SelectInput
-          label="Duration Type *"
-          placeholder="Select"
-          value={durationType}
-          isOpen={durationTypeOpen}
-          onOpenChange={setDurationTypeOpen}
-          onClick={() => setDurationTypeOpen((o) => !o)}
+          label="Axis"
+          placeholder="Select axis"
+          value={axisId ? (axes.find((a) => a._id === axisId)?.name ?? 'Left') : 'Left'}
+          isOpen={axisDropdownOpen}
+          onOpenChange={setAxisDropdownOpen}
+          onClick={() => setAxisDropdownOpen((o) => !o)}
         >
           <DropdownMenu>
-            {DURATION_TYPE_OPTIONS.map((opt) => (
+            <ActionListItem
+              title="Left"
+              selectionType="Single"
+              isSelected={!axisId}
+              onClick={() => { setAxisId(''); setAxisDropdownOpen(false); }}
+            />
+            {axes.map((a) => (
+              <ActionListItem
+                key={a._id}
+                title={a.name}
+                selectionType="Single"
+                isSelected={axisId === a._id}
+                onClick={() => { setAxisId(a._id); setAxisDropdownOpen(false); }}
+              />
+            ))}
+          </DropdownMenu>
+        </SelectInput>
+      )}
+
+      <div className="lc-config__date-row">
+        <TextInput
+          label="Width"
+          labelPosition="top"
+          placeholder="e.g. 2"
+          value={lineWidth}
+          onChange={({ value: v }: { name: string; value: string }) => setLineWidth(v)}
+        />
+        <SelectInput
+          label="Dash style"
+          placeholder="Solid"
+          value={lineStyle}
+          isOpen={styleDropdownOpen}
+          onOpenChange={setStyleDropdownOpen}
+          onClick={() => setStyleDropdownOpen((o) => !o)}
+        >
+          <DropdownMenu>
+            {LINE_STYLE_OPTIONS.map((opt) => (
               <ActionListItem
                 key={opt}
                 title={opt}
                 selectionType="Single"
-                isSelected={durationType === opt}
+                isSelected={lineStyle === opt}
                 onClick={() => {
-                  setDurationType(opt);
-                  setDurationTypeOpen(false);
+                  setLineStyle(opt);
+                  setStyleDropdownOpen(false);
                 }}
               />
             ))}
           </DropdownMenu>
         </SelectInput>
-        <div className="lc-config__duration-group__fields">
-          <DatePicker
-            mode="single"
-            label="Start Date *"
-            value={startDate}
-            onChange={(d) => setStartDate(d)}
-          />
-          <DatePicker
-            mode="single"
-            label="End Date *"
-            value={endDate}
-            onChange={(d) => setEndDate(d)}
-          />
-        </div>
       </div>
+
+      {!isRealtime && (
+        <RadioGroup
+          label="Periodicity"
+          name="plotline-periodicity"
+          size="Medium"
+          value={periodicityType}
+          onChange={({ value: v }) => {
+            setPeriodicityType(v as PlotLinePeriodicityType);
+            if (v === 'independent') {
+              setPeriodicities([]);
+              setCurrentPeriodicity('');
+              setPeriodicityDropdownOpen(false);
+            }
+          }}
+          orientation="Horizontal"
+        >
+          <Radio label="Independent" value="independent" />
+          <Radio label="Dependent" value="dependent" />
+        </RadioGroup>
       )}
 
-      <ProductAccordionItem
-        title="Style"
-        className="lc-config__plotline-style"
-        isExpanded={styleOpen}
-        isActive
-        onToggle={() => setStyleOpen((o) => !o)}
-      >
-        <div className="lc-config__editor-accordion-body">
-          <TextInput
-            label="Line Width"
-            labelPosition="top"
-            placeholder="1"
-            value={lineWidth}
-            onChange={({ value }: { name: string; value: string }) => setLineWidth(value)}
-          />
-          <SelectInput
-            label="Line Style"
-            placeholder="Select"
-            value={lineStyle}
-            isOpen={styleDropdownOpen}
-            onOpenChange={setStyleDropdownOpen}
-            onClick={() => setStyleDropdownOpen((o) => !o)}
-          >
-            <DropdownMenu>
-              {LINE_STYLE_OPTIONS.map((opt) => (
-                <ActionListItem
-                  key={opt}
-                  title={opt}
-                  selectionType="Single"
-                  isSelected={lineStyle === opt}
-                  onClick={() => {
-                    setLineStyle(opt);
-                    setStyleDropdownOpen(false);
-                  }}
+      {periodicityType === 'dependent' && !isRealtime && (
+        <>
+          <div className="lc-config__date-row lc-config__date-row--add-periodicity">
+            <SelectInput
+              label="Add periodicity"
+              placeholder="Select…"
+              value={currentPeriodicity ? currentPeriodicity.charAt(0).toUpperCase() + currentPeriodicity.slice(1) : ''}
+              isOpen={periodicityDropdownOpen}
+              onOpenChange={setPeriodicityDropdownOpen}
+              onClick={() => setPeriodicityDropdownOpen((o) => !o)}
+            >
+              <DropdownMenu>
+                {PLOT_LINE_PERIODICITIES.filter((p) => !periodicities.includes(p)).map((p) => (
+                  <ActionListItem
+                    key={p}
+                    title={p.charAt(0).toUpperCase() + p.slice(1)}
+                    selectionType="Single"
+                    isSelected={currentPeriodicity === p}
+                    onClick={() => {
+                      setCurrentPeriodicity(p);
+                      setPeriodicityDropdownOpen(false);
+                    }}
+                  />
+                ))}
+              </DropdownMenu>
+            </SelectInput>
+            <Button
+              variant="Secondary"
+              label="Add"
+              size="Small"
+              isDisabled={!currentPeriodicity}
+              onClick={() => {
+                if (currentPeriodicity) {
+                  setPeriodicities((prev) => [...prev, currentPeriodicity]);
+                  setCurrentPeriodicity('');
+                }
+              }}
+            />
+          </div>
+          {periodicities.length > 0 && (
+            <div className="lc-config__periodicity-tags">
+              {periodicities.map((p) => (
+                <Tag
+                  key={p}
+                  label={p.charAt(0).toUpperCase() + p.slice(1)}
+                  onDismiss={() => setPeriodicities((prev) => prev.filter((x) => x !== p))}
                 />
               ))}
-            </DropdownMenu>
-          </SelectInput>
-        </div>
-      </ProductAccordionItem>
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 }
@@ -3839,7 +3752,7 @@ function PlotBandEditor({
     return m;
   }, [axes]);
 
-  const axisLabel = axisId ? axesById.get(axisId)?.name ?? 'Default' : 'Default';
+  const axisLabel = axisId ? axesById.get(axisId)?.name ?? 'Left' : 'Left';
 
   const submit = useCallback(() => {
     if (!isValid) return;
@@ -3881,7 +3794,7 @@ function PlotBandEditor({
       >
         <DropdownMenu>
           <ActionListItem
-            title="Default"
+            title="Left"
             selectionType="Single"
             isSelected={!axisId}
             onClick={() => {
@@ -3910,7 +3823,10 @@ function PlotBandEditor({
           placeholder="e.g. 10"
           value={startValue}
           necessityIndicator="required"
-          onChange={({ value }: { name: string; value: string }) => setStartValue(value)}
+          onChange={({ value: v }: { name: string; value: string }) => {
+            if (v !== '' && !/^-?\d*\.?\d*$/.test(v)) return;
+            setStartValue(v);
+          }}
         />
         <TextInput
           label="End Value"
@@ -3918,7 +3834,10 @@ function PlotBandEditor({
           placeholder="e.g. 20"
           value={endValue}
           necessityIndicator="required"
-          onChange={({ value }: { name: string; value: string }) => setEndValue(value)}
+          onChange={({ value: v }: { name: string; value: string }) => {
+            if (v !== '' && !/^-?\d*\.?\d*$/.test(v)) return;
+            setEndValue(v);
+          }}
         />
       </div>
     </div>
@@ -4298,8 +4217,8 @@ function SPCEditor({
                   {SIGMA_LEVEL_OPTIONS.map((lvl) => (
                     <label className="lc-config__sigma-item" key={lvl}>
                       <Checkbox
-                        isChecked={sigmaLevels.includes(lvl)}
-                        onClick={() => toggleSigmaLevel(lvl)}
+                        checked={sigmaLevels.includes(lvl)}
+                        onChange={() => toggleSigmaLevel(lvl)}
                       >
                         {SIGMA_LEVEL_LABELS[lvl]}
                       </Checkbox>
@@ -4559,7 +4478,10 @@ function AnomalyEditor({
           placeholder="e.g. 50"
           value={thresholdValue}
           necessityIndicator="required"
-          onChange={({ value }: { name: string; value: string }) => setThresholdValue(value)}
+          onChange={({ value: v }: { name: string; value: string }) => {
+            if (v !== '' && v !== '-' && v !== '.' && !/^-?\d*\.?\d*$/.test(v)) return;
+            setThresholdValue(v);
+          }}
         />
       )}
     </div>
@@ -5009,24 +4931,24 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
           <Checkbox
             label="Setting Icon"
             size="Medium"
-            isChecked={value.hideElements.settingsIcon}
-            onClick={() =>
+            checked={value.hideElements.settingsIcon}
+            onChange={() =>
               update('hideElements', { settingsIcon: !value.hideElements.settingsIcon })
             }
           />
           <Checkbox
             label="Export Icon"
             size="Medium"
-            isChecked={value.hideElements.exportIcon}
-            onClick={() =>
+            checked={value.hideElements.exportIcon}
+            onChange={() =>
               update('hideElements', { exportIcon: !value.hideElements.exportIcon })
             }
           />
           <Checkbox
             label="Chart Title"
             size="Medium"
-            isChecked={value.hideElements.chartTitle}
-            onClick={() =>
+            checked={value.hideElements.chartTitle}
+            onChange={() =>
               update('hideElements', { chartTitle: !value.hideElements.chartTitle })
             }
           />
@@ -5048,6 +4970,7 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
 
       {value.advancedEnabled && (
         <>
+          {!value.hideElements.chartTitle && (
           <div className="lc-config__style-tab__block">
             <Divider />
             <p className="LabelMediumSemibold lc-config__style-tab__block-title">
@@ -5074,6 +4997,7 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
               onChange={(v) => update('chartTitle', { fontWeight: v })}
             />
           </div>
+          )}
 
           <div className="lc-config__style-tab__block">
             <Divider />

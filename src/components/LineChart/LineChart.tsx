@@ -11,14 +11,13 @@ import { IconButton } from '@faclon-labs/design-sdk/IconButton';
 import type { ChartPlotLine, ChartPlotBand, ChartExportFormat } from '@faclon-labs/design-sdk/Chart';
 import type { ChartComparisonConfig, ComparisonSeriesInput, DeviationPattern, ChartShiftConfig, ShiftSeriesInput } from '@faclon-labs/design-sdk';
 import { ShiftLegend } from '@faclon-labs/design-sdk';
-import { Spinner } from '@faclon-labs/design-sdk/Spinner';
-import { EmptyState } from '@faclon-labs/design-sdk/EmptyState';
+import { EmptyState, NoDataOneIllustration } from '@faclon-labs/design-sdk/EmptyState';
 import { DatePicker } from '@faclon-labs/design-sdk/DatePicker';
 import type { DateRange, DatePresetOption } from '@faclon-labs/design-sdk/DatePicker';
 import { DropdownMenu } from '@faclon-labs/design-sdk/DropdownMenu';
 import { ActionListItem } from '@faclon-labs/design-sdk/ActionListItem';
 import { SelectInput } from '@faclon-labs/design-sdk/SelectInput';
-import { ChevronDown, Settings, MoreHorizontal, Info } from 'react-feather';
+import { ChevronDown, Settings, Menu, Download, Info } from 'react-feather';
 import { Tooltip } from '@faclon-labs/design-sdk/Tooltip';
 import {
   Table,
@@ -30,6 +29,8 @@ import {
   TableCell,
 } from '@faclon-labs/design-sdk/Table';
 import { getSeriesData } from '../../iosense-sdk/mini-engine';
+import { resolveAndCompute, getCapturedToken } from '../../iosense-sdk/api';
+import { resolveDurationWindow } from '../../iosense-sdk/time';
 import type {
   LineChartUIConfig,
   DataEntry,
@@ -38,6 +39,7 @@ import type {
   DataTableColumn,
   DataTableOperator,
   LineChartSeries,
+  SeriesPayload,
   WidgetEvent,
 } from '../../iosense-sdk/types';
 import '@faclon-labs/design-sdk/styles.css';
@@ -83,18 +85,15 @@ interface LineChartWidgetProps {
   timeConfig?: {
     type?: string;
     pickerType?: string;
+    /** Set by Lens at runtime when a Global Timepicker widget drives this widget's time. */
+    globalTimepickerId?: string;
+    cycleTime?: import('../../iosense-sdk/types').CycleTime | null;
     defaultDurationId?: string;
-    allDurations?: Array<{
-      id: string;
-      x?: number;
-      xPeriod?: string;
-      calendarType?: string;
-      periodicities?: string[];
-    }>;
+    allDurations?: import('../../iosense-sdk/types').Duration[];
     defaultPeriodicity?: string;
     startTime?: number | null;
     endTime?: number | null;
-    fixedDuration?: { x?: number | string; xPeriod?: string } | null;
+    fixedDuration?: import('../../iosense-sdk/types').Duration | null;
     shifts?: Array<{ id: string; name: string; color: string; startTime: string; endTime: string }>;
     timezone?: string;
     comparisonMode?: boolean;
@@ -102,6 +101,10 @@ interface LineChartWidgetProps {
     sourceDeviationOverrides?: Record<string, string>;
   };
   onEvent?: (event: WidgetEvent) => void;
+  // Bearer token for comparison data fetch. Lens injects this for widgets that
+  // declare it; dev harness passes it from auth state. Falls back to
+  // localStorage when not provided (covers both dev and production Lens).
+  authentication?: string;
 }
 
 const FONT_WEIGHT: Record<string, number> = {
@@ -199,63 +202,6 @@ function getPresetPeriodicities(
   return null;
 }
 
-// Derive an approximate DateRange from a preset so periodicityOptions stays
-// accurate as soon as a preset is selected (before the user clicks "Apply").
-// Handles both x/xPeriod offsets and calendarType fixed-boundary presets.
-function rangeFromPreset(preset: { x?: number; xPeriod?: string; calendarType?: string } | undefined): DateRange | null {
-  if (!preset) return null;
-
-  // Calendar-boundary presets (today, yesterday, current/previous week/month)
-  if (preset.calendarType) {
-    const now = new Date();
-    const start = new Date(now);
-    const end = new Date(now);
-    switch (preset.calendarType) {
-      case 'today':
-        start.setHours(0, 0, 0, 0);
-        break;
-      case 'yesterday':
-        start.setDate(start.getDate() - 1); start.setHours(0, 0, 0, 0);
-        end.setDate(end.getDate() - 1);     end.setHours(23, 59, 59, 999);
-        break;
-      case 'current_week':
-        start.setDate(start.getDate() - start.getDay()); start.setHours(0, 0, 0, 0);
-        break;
-      case 'previous_week': {
-        const dow = now.getDay();
-        start.setDate(now.getDate() - dow - 7); start.setHours(0, 0, 0, 0);
-        end.setDate(now.getDate() - dow - 1);   end.setHours(23, 59, 59, 999);
-        break;
-      }
-      case 'current_month':
-        start.setDate(1); start.setHours(0, 0, 0, 0);
-        break;
-      case 'previous_month':
-        start.setMonth(start.getMonth() - 1); start.setDate(1); start.setHours(0, 0, 0, 0);
-        end.setDate(0); end.setHours(23, 59, 59, 999); // day 0 = last day of prev month
-        break;
-      default:
-        return null;
-    }
-    return { start, end };
-  }
-
-  // Relative offset presets (x units of xPeriod before now)
-  if (typeof preset.x !== 'number' || !preset.xPeriod) return null;
-  const end = new Date();
-  const start = new Date(end);
-  const x = preset.x;
-  switch (preset.xPeriod) {
-    case 'minute': start.setMinutes(start.getMinutes() - x); break;
-    case 'hour':   start.setHours(start.getHours() - x);     break;
-    case 'day':    start.setDate(start.getDate() - x);        break;
-    case 'week':   start.setDate(start.getDate() - x * 7);    break;
-    case 'month':  start.setMonth(start.getMonth() - x);      break;
-    case 'year':   start.setFullYear(start.getFullYear() - x); break;
-    default: return null;
-  }
-  return { start, end };
-}
 
 // Next finer periodicity for "Time drilldown" — clicking a point narrows the
 // range to that bucket and steps one level down for a re-query.
@@ -307,13 +253,10 @@ function isSlotInShift(
 }
 
 type ChartDisplay = {
-  timeDrilldown: boolean;
   legends: boolean;
   dataLabel: boolean;
   clipping: boolean;
   zoom: boolean;
-  scrollBehavior: boolean;
-  inexactMultiple: boolean;
 };
 
 function columnLabel(col: DataTableColumn, seriesById: Map<string, LineChartSeries>): string {
@@ -330,50 +273,28 @@ function columnLabel(col: DataTableColumn, seriesById: Map<string, LineChartSeri
   return 'Source';
 }
 
-// Compute startTime/endTime from a host-shape timeConfig. Mirrors the
-// deployed Column Chart widget's `rn()` helper.
+// Compute startTime/endTime from a host-shape timeConfig, using
+// resolveDurationWindow so cycleTime boundaries are honoured.
 function computeRange(tc?: LineChartWidgetProps['timeConfig']): {
   startTime: number;
   endTime: number;
 } {
   const now = Date.now();
-  // If host pre-computed explicit timestamps, use them.
+  // Explicit timestamps (host-resolved) take priority.
   if (tc?.startTime && tc?.endTime) {
     return { startTime: tc.startTime, endTime: tc.endTime };
   }
-  // Otherwise, derive from the active preset (defaultDurationId → allDurations).
-  const presetId = tc?.defaultDurationId;
-  const preset = tc?.allDurations?.find((d) => d.id === presetId);
-  const PERIOD_MS: Record<string, number> = {
-    minute: 60_000,
-    hour: 3_600_000,
-    day: 86_400_000,
-    week: 7 * 86_400_000,
-    month: 30 * 86_400_000,
-    year: 365 * 86_400_000,
-  };
-  if (preset?.x && preset.xPeriod && PERIOD_MS[preset.xPeriod]) {
-    return { startTime: now - preset.x * PERIOD_MS[preset.xPeriod], endTime: now };
+  // Fixed-mode: use the fixed duration directly — skip preset lookup so that
+  // a stale defaultDurationId from a previous local-mode config doesn't win.
+  if (tc?.pickerType === 'fixed' && tc?.fixedDuration) {
+    return resolveDurationWindow(tc.fixedDuration, now, tc?.cycleTime ?? undefined);
   }
-  if (preset?.calendarType === 'today') {
-    const s = new Date();
-    s.setHours(0, 0, 0, 0);
-    return { startTime: s.getTime(), endTime: now };
-  }
-  if (preset?.calendarType === 'yesterday') {
-    const s = new Date();
-    s.setDate(s.getDate() - 1);
-    s.setHours(0, 0, 0, 0);
-    const e = new Date(s);
-    e.setHours(23, 59, 59, 999);
-    return { startTime: s.getTime(), endTime: e.getTime() };
-  }
-  // Fixed-mode duration as last resort.
-  const fd = tc?.fixedDuration;
-  if (fd?.x && fd.xPeriod && PERIOD_MS[fd.xPeriod]) {
-    return { startTime: now - Number(fd.x) * PERIOD_MS[fd.xPeriod], endTime: now };
-  }
-  // Final fallback: last 24h.
+  // Active preset via resolveDurationWindow (handles cycleTime + all duration shapes).
+  const preset = tc?.allDurations?.find((d) => d.id === tc?.defaultDurationId);
+  if (preset) return resolveDurationWindow(preset, now, tc?.cycleTime ?? undefined);
+  // Fixed-mode duration (fallback when pickerType not set on legacy envelopes).
+  if (tc?.fixedDuration) return resolveDurationWindow(tc.fixedDuration, now, tc?.cycleTime ?? undefined);
+  // Fallback: last 24h.
   return { startTime: now - 86_400_000, endTime: now };
 }
 
@@ -382,7 +303,17 @@ export function LineChart({
   data = [],
   timeConfig,
   onEvent,
+  authentication,
 }: LineChartWidgetProps) {
+  // Auth for comparison fetch. Priority:
+  // 1. authentication prop (dev harness passes it explicitly)
+  // 2. Token intercepted from Angular DataLayer's XHR calls (production Lens)
+  // 3. localStorage fallback (dev sessions without active harness)
+  const effectiveAuth = authentication
+    || getCapturedToken()
+    || (typeof localStorage !== 'undefined'
+      ? (localStorage.getItem('iosense_bearer_token') ?? localStorage.getItem('bearer_token') ?? '')
+      : '');
   // Emit TIME_CHANGE once on mount so the host's data layer registers this
   // widget for query dispatch. Refs hold the latest values so the mount-only
   // effect can read them without listing them as deps — if we re-emitted on
@@ -400,7 +331,6 @@ export function LineChart({
     if (!tc?.defaultDurationId && !tc?.fixedDuration) return;
     const { startTime, endTime } = computeRange(tc);
     const periodicity = (tc.defaultPeriodicity || 'hourly').toLowerCase();
-    console.log('[LineChart] emit TIME_CHANGE (mount) →', { startTime, endTime, periodicity });
     ev({
       type: 'TIME_CHANGE',
       payload: {
@@ -418,25 +348,6 @@ export function LineChart({
     rawConfig && typeof rawConfig === 'object' && 'uiConfig' in rawConfig && rawConfig.uiConfig
       ? rawConfig.uiConfig
       : (rawConfig as LineChartUIConfig | undefined);
-  // One-time diagnostic per render — tells us what shape the host actually
-  // passes for `config` (envelope vs uiConfig) and `data` (wrapped vs raw),
-  // plus per-series resolution status. Strip in a future pass if too chatty.
-  console.log('[LineChart] props →', {
-    configShape: rawConfig && typeof rawConfig === 'object' && 'uiConfig' in rawConfig ? 'envelope' : 'uiConfig',
-    chartCount: config?.charts?.length ?? 0,
-    activeChartId: config?.activeChartId ?? null,
-    dataEntryCount: data.length,
-    firstDataEntry: data[0]
-      ? {
-          key: (data[0] as { key?: string }).key,
-          hasValue: (data[0] as { value?: unknown }).value !== undefined,
-          hasSlots: Array.isArray((data[0] as unknown as { slots?: unknown }).slots),
-          slotCount: Array.isArray((data[0] as unknown as { slots?: unknown[] }).slots)
-            ? (data[0] as unknown as { slots: unknown[] }).slots.length
-            : null,
-        }
-      : null,
-  });
   const charts = config?.charts ?? [];
   // Per-widget runtime override for which chart is shown. Lets the user
   // switch between configured charts via the title dropdown WITHOUT writing
@@ -577,9 +488,29 @@ export function LineChart({
   const effectiveTooltipOnlyFlags = tooltipOnlyFlags;
   const effectiveTooltipOnlyNames = tooltipOnlyNames;
 
+  // Comparison mode — fetch previous-period data directly from the API.
+  // Lens's DataLayer only resolves the current period; it doesn't inject
+  // _comparison entries automatically. The widget fetches the shifted window
+  // itself using the resolved UNS paths from the current data entries.
+  // rangeStart/rangeEnd and the fetch effect are declared AFTER rangeValue and
+  // selectedPeriodicity state are initialised (below the DatePicker state block).
+  const [comparisonSeriesData, setComparisonSeriesData] = useState<Map<string, SeriesPayload>>(new Map());
+
+  // Derive the resolved UNS topic path for each series from the uiConfig.
+  // Reading from config (not from data entry.path) guarantees uns:wsId://path
+  // format in both dev and production Lens — entry.path format varies by host.
+  const SERIES_UNS_RE = /^\{\{(.+)\}\}$/;
+  const seriesUNSPaths = useMemo<string[]>(() => {
+    if (!activeChart) return [];
+    return activeChart.series.map((s) => {
+      const raw = (s.unsPath || '').trim();
+      const match = SERIES_UNS_RE.exec(raw);
+      return match ? match[1] : '';
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeChart?._id, activeChart?.series]);
+
   // Comparison mode: build ChartComparisonConfig from current + previous period data.
-  // Previous period data is keyed as charts[ci].series[si].unsPath_comparison in data[];
-  // if absent (backend hasn't returned it yet) we fall back to null values per slot.
   const widgetDeviationPattern: DeviationPattern =
     (timeConfig?.deviationPattern as DeviationPattern) ?? 'green-up-positive';
 
@@ -593,14 +524,27 @@ export function LineChart({
       const name = s.name || `Series ${i + 1}`;
       const currentData = series[i]?.data ?? [];
 
-      // Previous period — try the _comparison-keyed slot from the host.
-      const compPayload = getSeriesData(`charts[${chartIndex}].series[${i}].unsPath_comparison`, data);
-      const prevData: (number | null)[] = compPayload
-        ? categories.map((_, ci) => {
-            const v = compPayload.slots[ci]?.value;
-            return typeof v === 'number' ? v : null;
-          })
-        : currentData.map(() => null);
+      // Previous period — use data fetched by the comparison effect above.
+      // Falls back to null per slot while the fetch is in-flight.
+      const compPayload = comparisonSeriesData.get(`charts[${chartIndex}].series[${i}].unsPath`);
+      const prevData: (number | null)[] = (() => {
+        if (!compPayload) return currentData.map(() => null);
+        // Build a from→value map and align by timestamp offset rather than by
+        // array index. Index alignment breaks when periods have different slot
+        // counts (e.g. comparing a 31-day month against a 28-day month at daily
+        // resolution). The offset is derived from the actual slot origins so no
+        // dependency on rangeStart/rangeEnd is needed here.
+        const prevSlotMap = new Map(compPayload.slots.map(sl => [sl.from, sl.value]));
+        const prevOrigin = compPayload.slots[0]?.from;
+        const currOrigin = catTimestamps[0]?.from;
+        const offset = prevOrigin != null && currOrigin != null ? currOrigin - prevOrigin : null;
+        return categories.map((_, ci) => {
+          const ts = catTimestamps[ci];
+          if (!ts?.from || offset === null) return null;
+          const v = prevSlotMap.get(ts.from - offset);
+          return typeof v === 'number' ? v : null;
+        });
+      })();
 
       const deviation = currentData.map((y, k) => {
         const p = prevData[k];
@@ -638,7 +582,7 @@ export function LineChart({
 
     return { series: out, showDeviation: true, deviationPattern: widgetDeviationPattern, comparisonCategories: categories };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chartMode, activeChart, chartIndex, series, categories, data, widgetDeviationPattern, timeConfig?.sourceDeviationOverrides]);
+  }, [chartMode, activeChart, chartIndex, series, categories, catTimestamps, data, widgetDeviationPattern, timeConfig?.sourceDeviationOverrides, comparisonSeriesData]);
 
   // Shift mode: build ChartShiftConfig directly from slot data + shift windows.
   // Each source × enabled shift becomes a ShiftSeriesInput; the SDK renders
@@ -687,32 +631,142 @@ export function LineChart({
   // Plot lines (fixed values only — periodicity-dependent lines need the live
   // periodicity context which the host owns, so they're rendered server-side).
   const plotLines = useMemo<ChartPlotLine[]>(() => {
+    const BINDING_RE = /^\{\{.+\}\}$/;
     const out: ChartPlotLine[] = [];
-    for (const p of activeChart?.plotLines ?? []) {
-      if (p.valueType !== 'Fixed') continue;
-      const v = Number(p.fixedValue);
-      if (!Number.isFinite(v)) continue;
-      out.push({
-        value: v,
-        color: p.color,
-        width: p.lineWidth,
-        dashStyle: p.lineStyle === 'Dashed' ? 'Dash' : 'Solid',
-        label: p.name,
-      });
-    }
-    return out;
-  }, [activeChart]);
+    (activeChart?.plotLines ?? []).forEach((p, pi) => {
+      const rawValue = p.value ?? p.fixedValue ?? p.dynamicTopic ?? '';
+      const isBinding = BINDING_RE.test(rawValue);
 
-  const plotBands = useMemo<ChartPlotBand[]>(
+      if (isBinding) {
+        const key = `charts[${chartIndex}].plotLines[${pi}].value`;
+        const entry = (data ?? []).find((d) => d.key === key);
+        if (!entry) return;
+        const payload = entry.value as SeriesPayload | null;
+        if (!payload || payload.__type !== 'series') return;
+        const slots = payload.slots.filter((s) => s.value !== null);
+        if (slots.length === 0) return;
+        const v = slots[slots.length - 1].value!;
+        out.push({ value: v, color: p.color, width: p.lineWidth, dashStyle: p.lineStyle === 'Dashed' ? 'Dash' : 'Solid', label: p.name, _axisId: p.axisId ?? '' } as any);
+      } else {
+        const v = Number(rawValue);
+        if (!Number.isFinite(v)) return;
+        out.push({ value: v, color: p.color, width: p.lineWidth, dashStyle: p.lineStyle === 'Dashed' ? 'Dash' : 'Solid', label: p.name, _axisId: p.axisId ?? '' } as any);
+      }
+    });
+    return out;
+  }, [activeChart, chartIndex, data]);
+
+  const plotBands = useMemo<(ChartPlotBand & { _axisId?: string })[]>(
     () =>
       (activeChart?.plotBands ?? []).map((b) => ({
         from: b.startValue,
         to: b.endValue,
         color: b.color,
         label: b.name,
+        _axisId: b.axisId ?? '',
       })),
     [activeChart],
   );
+
+  // Anomaly highlighting: for each configured anomaly evaluate its condition
+  // against resolved series data and produce per-point halo markers plus
+  // vertical x-axis plotLines at the matching time buckets.
+  const anomalyOverlay = useMemo(() => {
+    const configured = activeChart?.series ?? [];
+    const anomalies = activeChart?.anomalies ?? [];
+    if (!anomalies.length || !configured.length || !series.length) return null;
+
+    const idxById = new Map(configured.map((s, i) => [s._id, i]));
+
+    const cmp = (a: number, op: string, b: number): boolean => {
+      switch (op) {
+        case '>':  return a > b;
+        case '<':  return a < b;
+        case '>=': return a >= b;
+        case '<=': return a <= b;
+        case '==': return a === b;
+        case '!=': return a !== b;
+        default: return false;
+      }
+    };
+
+    const HALO_RED = 'rgba(239,68,68,0.3)';
+    const xPlotLines: Array<Record<string, unknown>> = [];
+    // seriesIdx → (pointIdx → anomaly colour)
+    const marked = new Map<number, Map<number, string>>();
+
+    anomalies.forEach((anom, ai) => {
+      const si = idxById.get(anom.applyToSeriesId);
+      if (si === undefined) return;
+      const color = anom.color || '#ef4444';
+      const seriesData = series[si]?.data ?? [];
+
+      for (let pi = 0; pi < seriesData.length; pi++) {
+        const pointVal = seriesData[pi];
+        if (pointVal === null || !Number.isFinite(pointVal)) continue;
+
+        let threshold: number | undefined;
+        if (anom.labelMode === 'Value') {
+          threshold = anom.thresholdValue;
+        } else if (anom.labelMode === 'Existing' && anom.existingSeriesId) {
+          const ei = idxById.get(anom.existingSeriesId);
+          if (ei === undefined) continue;
+          const v = series[ei]?.data[pi];
+          if (v === null || v === undefined || !Number.isFinite(v)) continue;
+          threshold = v as number;
+        } else if (anom.labelMode === 'NewSource') {
+          const key = `charts[${chartIndex}].anomalies[${ai}].newSourceTopic`;
+          const entry = (data ?? []).find((d) => d.key === key);
+          if (!entry) continue;
+          const payload = entry.value as SeriesPayload | null;
+          if (!payload || payload.__type !== 'series') continue;
+          const v = payload.slots[pi]?.value;
+          if (v === null || v === undefined || !Number.isFinite(v as number)) continue;
+          threshold = v as number;
+        } else {
+          continue;
+        }
+
+        if (threshold === undefined || !Number.isFinite(Number(threshold))) continue;
+        if (!cmp(pointVal, anom.operator, Number(threshold))) continue;
+
+        if (!marked.has(si)) marked.set(si, new Map());
+        marked.get(si)!.set(pi, color);
+
+        xPlotLines.push({
+          value: pi,
+          color,
+          width: 2,
+          zIndex: 5,
+        });
+      }
+    });
+
+    if (!xPlotLines.length && !marked.size) return null;
+
+    // Rebuild per-series data with explicit per-point marker objects. Setting
+    // marker:enabled=false explicitly (not just omitting it) is what allows
+    // Highcharts to clear stale halos when an anomaly is removed in-place.
+    const seriesData = series.map((s, i) => {
+      const marks = marked.get(i);
+      return s.data.map((y, pi) =>
+        marks?.has(pi)
+          ? {
+              y: y as number,
+              marker: {
+                enabled: true,
+                radius: 5,
+                fillColor: marks.get(pi),
+                lineColor: HALO_RED,
+                lineWidth: 8,
+              },
+            }
+          : { y: y as any, marker: { enabled: false } },
+      );
+    });
+
+    return { xPlotLines, seriesData };
+  }, [activeChart, chartIndex, series, data]);
 
   const leftAxisTitle = useMemo(() => {
     const leftAxis = (activeChart?.axes ?? []).find(
@@ -731,13 +785,15 @@ export function LineChart({
       const idx = rightAxes.findIndex((a) => (a.linkedSeriesIds ?? []).includes(s._id));
       return idx === -1 ? 0 : idx + 1;
     });
+    const leftPlotLines = plotLines.filter((p) => !(p as any)._axisId);
+    const leftPlotBands = plotBands.filter((b) => !b._axisId);
     const leftAxis = {
       title: { text: leftAxisTitle },
-      ...(plotLines.length
-        ? { plotLines: plotLines.map((p) => ({ value: p.value, color: p.color, width: p.width, dashStyle: p.dashStyle, ...(p.label ? { label: { text: p.label } } : {}) })) }
+      ...(leftPlotLines.length
+        ? { plotLines: leftPlotLines.map((p) => ({ value: p.value, color: p.color, width: p.width, dashStyle: p.dashStyle, ...(p.label ? { label: { text: p.label } } : {}) })) }
         : {}),
-      ...(plotBands.length
-        ? { plotBands: plotBands.map((b) => ({ from: b.from, to: b.to, color: b.color, ...(b.label ? { label: { text: b.label } } : {}) })) }
+      ...(leftPlotBands.length
+        ? { plotBands: leftPlotBands.map((b) => ({ from: b.from, to: b.to, color: b.color, ...(b.label ? { label: { text: b.label } } : {}) })) }
         : {}),
     };
     const rightYAxes = rightAxes.map((a) => ({ title: { text: a.name || 'Axis' }, opposite: true }));
@@ -819,17 +875,11 @@ export function LineChart({
   }, [style?.dataTable]);
 
   // Per-chart in-widget UI overrides: NOT written back to the envelope (these
-  // are end-user view affordances). Mirrors the combine line chart's Settings
-  // menu: Time Control (timeDrilldown) + Chart Control (legends, dataLabel,
-  // clipping, zoom, scrollBehavior, inexactMultiple).
   const [chartDisplay, setChartDisplay] = useState<ChartDisplay>({
-    timeDrilldown: true,
     legends: true,
     dataLabel: false,
     clipping: false,
     zoom: true,
-    scrollBehavior: false,
-    inexactMultiple: false,
   });
 
   const highchartsOptions = useMemo(() => {
@@ -839,6 +889,9 @@ export function LineChart({
     if (axisColors.xLabel) xAxis.labels = { style: { color: axisColors.xLabel } };
     if (axisColors.xLine) xAxis.lineColor = axisColors.xLine;
     if (miscColors.grid) xAxis.gridLineColor = miscColors.grid;
+    // Anomaly vertical markers — only in normal mode (shift/comparison series
+    // indices don't align with the anomaly-evaluated series indices).
+    xAxis.plotLines = chartMode === 'normal' ? (anomalyOverlay?.xPlotLines ?? []) : [];
 
     const opts: any = { xAxis };
     // Highcharts paints `<rect class="highcharts-background">` with an
@@ -853,10 +906,18 @@ export function LineChart({
         style?.card?.wrapInCard !== false
           ? 'transparent'
           : style?.card?.backgroundColor || '#FFFFFF',
-      ...(chartDisplay.zoom ? { zoomType: 'x' } : {}),
+      // The SDK hardcodes zooming: { type: 'x' } internally; override here
+      // explicitly so disabling zoom via the gear menu actually takes effect.
+      zooming: { type: chartDisplay.zoom ? 'x' : (null as any) },
+      clip: chartDisplay.clipping,
     };
+    // startOnTick/endOnTick ensure Highcharts always pads above and below
+    // the data range, preventing a single-tick collapsed axis when all
+    // data points share the same value (flat/constant data).
+    const yAxisBase: any = { startOnTick: true, endOnTick: true };
     if (multiAxis) {
       opts.yAxis = multiAxis.yAxis.map((a: any) => ({
+        ...yAxisBase,
         ...a,
         title: {
           ...(a.title || {}),
@@ -866,9 +927,13 @@ export function LineChart({
         ...(miscColors.grid ? { gridLineColor: miscColors.grid } : {}),
       }));
     } else {
-      const yAxis: any = { title: { style: { ...titleEllipsis, ...(axisColors.yTitle ? { color: axisColors.yTitle } : {}) } } };
+      const yAxis: any = { ...yAxisBase, title: { style: { ...titleEllipsis, ...(axisColors.yTitle ? { color: axisColors.yTitle } : {}) } } };
       if (axisColors.yLabel) yAxis.labels = { style: { color: axisColors.yLabel } };
       if (miscColors.grid) yAxis.gridLineColor = miscColors.grid;
+      const yMin = activeChart?.defaultAxis?.yAxisMin;
+      const yMax = activeChart?.defaultAxis?.yAxisMax;
+      if (yMin !== null && yMin !== undefined) yAxis.min = yMin;
+      if (yMax !== null && yMax !== undefined) yAxis.max = yMax;
       opts.yAxis = yAxis;
     }
     // "Add Source as Tooltip": no visible line / marker / data label and no
@@ -878,6 +943,10 @@ export function LineChart({
       const origIdx = i;
       const so: any = {};
       if (multiAxis) so.yAxis = multiAxis.seriesAxis[origIdx] ?? 0;
+      // Anomaly per-point marker overrides — normal mode only.
+      if (chartMode === 'normal' && anomalyOverlay?.seriesData?.[i]) {
+        so.data = anomalyOverlay.seriesData[i];
+      }
       if (effectiveTooltipOnlyFlags[i]) {
         so.lineWidth = 0;
         so.marker = { enabled: false, states: { hover: { enabled: false } } };
@@ -895,36 +964,46 @@ export function LineChart({
     // is actually applied. The SDK renders c.y as a raw number via a custom HTML
     // formatter that ignores Highcharts' valueDecimals. We replicate its exact
     // HTML/SVG structure but call c.y.toFixed(precision) per series.
-    const TOOLTIP_FONT = "'Noto Sans Variable', 'Noto Sans', sans-serif";
-    opts.tooltip = {
-      shared: true,
-      useHTML: true,
-      formatter(this: any) {
-        const root = typeof document !== 'undefined' ? document.documentElement : null;
-        const cs = root ? getComputedStyle(root) : null;
-        const primary = cs?.getPropertyValue('--text-gray-primary').trim() || '#192839';
-        const secondary = cs?.getPropertyValue('--text-gray-secondary').trim() || '#40566d';
-        const points: any[] = (this as any).points ?? [this];
-        const rows = points.map((c: any) => {
-          const rawColor = c.color ?? c.series?.color ?? primary;
-          const color = typeof rawColor === 'string' ? rawColor : primary;
-          const name: string = c.series?.name ?? '';
-          const precision = Math.max(0, Math.min(20, c.series?.options?.tooltip?.valueDecimals ?? 2));
-          const yVal = typeof c.y === 'number' ? c.y.toFixed(precision) : '—';
-          const dashStyle: string = c.series?.options?.dashStyle ?? 'Solid';
-          let lineRect = `<rect x="0" y="5" width="16" height="2" rx="1" fill="${color}"/>`;
-          if (dashStyle !== 'Solid') {
-            lineRect = [0, 7, 13].map((x) => `<rect x="${x}" y="5" width="4" height="2" fill="${color}"/>`).join('');
-          }
-          const svg = `<svg width="16" height="12" viewBox="0 0 16 12" style="flex:0 0 auto;vertical-align:-2px">${lineRect}<circle cx="8" cy="6" r="3" fill="${color}"/></svg>`;
-          return `<div style="display:flex;align-items:center;gap:6px;padding:1px 0;white-space:nowrap;font-family:${TOOLTIP_FONT}"><span style="display:inline-flex">${svg}</span><span style="font:400 13px/1.2 ${TOOLTIP_FONT};color:${primary}">${name} : </span><span style="font:700 13px/1.2 ${TOOLTIP_FONT};color:${primary}">${yVal}</span></div>`;
-        });
-        const cat = (points[0] as any)?.point?.category ?? (this as any).x ?? '';
-        return rows.join('') + `<div style="margin-top:4px;font:400 12px/1.2 ${TOOLTIP_FONT};color:${secondary};white-space:nowrap">${cat}</div>`;
-      },
-    };
+    //
+    // In shift/comparison modes the SDK provides its own shift/comparison tooltip
+    // formatters (deviation %, "vs …" footer, etc.). Passing opts.tooltip here
+    // would P.merge-override those formatters — so we skip it in those modes and
+    // let the SDK handle everything.
+    if (chartMode === 'normal') {
+      const TOOLTIP_FONT = "'Noto Sans Variable', 'Noto Sans', sans-serif";
+      // Read CSS tokens once per memo recompute — not on every tooltip hover.
+      // getComputedStyle forces a style recalc; calling it inside the formatter
+      // would run it on every mouse-move over a data point (layout thrashing).
+      const root = typeof document !== 'undefined' ? document.documentElement : null;
+      const cs = root ? getComputedStyle(root) : null;
+      const primary = cs?.getPropertyValue('--text-gray-primary').trim() || '#192839';
+      const secondary = cs?.getPropertyValue('--text-gray-secondary').trim() || '#40566d';
+      opts.tooltip = {
+        shared: true,
+        useHTML: true,
+        formatter(this: any) {
+          const points: any[] = (this as any).points ?? [this];
+          const rows = points.map((c: any) => {
+            const rawColor = c.color ?? c.series?.color ?? primary;
+            const color = typeof rawColor === 'string' ? rawColor : primary;
+            const name: string = c.series?.name ?? '';
+            const precision = Math.max(0, Math.min(20, c.series?.options?.tooltip?.valueDecimals ?? 2));
+            const yVal = typeof c.y === 'number' ? c.y.toFixed(precision) : '—';
+            const dashStyle: string = c.series?.options?.dashStyle ?? 'Solid';
+            let lineRect = `<rect x="0" y="5" width="16" height="2" rx="1" fill="${color}"/>`;
+            if (dashStyle !== 'Solid') {
+              lineRect = [0, 7, 13].map((x) => `<rect x="${x}" y="5" width="4" height="2" fill="${color}"/>`).join('');
+            }
+            const svg = `<svg width="16" height="12" viewBox="0 0 16 12" style="flex:0 0 auto;vertical-align:-2px">${lineRect}<circle cx="8" cy="6" r="3" fill="${color}"/></svg>`;
+            return `<div style="display:flex;align-items:center;gap:6px;padding:1px 0;white-space:nowrap;font-family:${TOOLTIP_FONT}"><span style="display:inline-flex">${svg}</span><span style="font:400 13px/1.2 ${TOOLTIP_FONT};color:${primary}">${name} : </span><span style="font:700 13px/1.2 ${TOOLTIP_FONT};color:${primary}">${yVal}</span></div>`;
+          });
+          const cat = (points[0] as any)?.point?.category ?? (this as any).x ?? '';
+          return rows.join('') + `<div style="margin-top:4px;font:400 12px/1.2 ${TOOLTIP_FONT};color:${secondary};white-space:nowrap">${cat}</div>`;
+        },
+      };
+    }
     return opts as any;
-  }, [axisColors, miscColors, multiAxis, effectiveSeries, effectiveTooltipOnlyFlags, style?.card?.wrapInCard, style?.card?.backgroundColor, chartDisplay.zoom]);
+  }, [axisColors, miscColors, multiAxis, effectiveSeries, effectiveTooltipOnlyFlags, style?.card?.wrapInCard, style?.card?.backgroundColor, chartDisplay.zoom, chartDisplay.clipping, anomalyOverlay, chartMode, plotLines, plotBands, activeChart]);
 
   // The data table is portalled into the chart card (sibling of the canvas).
   const [cardEl, setCardEl] = useState<HTMLDivElement | null>(null);
@@ -936,7 +1015,16 @@ export function LineChart({
     const { startTime, endTime } = computeRange(timeConfig);
     return { start: new Date(startTime), end: new Date(endTime) };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [timeConfig?.defaultDurationId, timeConfig?.pickerType]);
+  }, [
+    timeConfig?.defaultDurationId,
+    timeConfig?.type,
+    timeConfig?.pickerType,
+    timeConfig?.startTime,
+    timeConfig?.endTime,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    JSON.stringify(timeConfig?.fixedDuration ?? null),
+    JSON.stringify(timeConfig?.cycleTime ?? null),
+  ]);
   const [rangeValue, setRangeValue] = useState<DateRange | null>(initialRange);
   // Keep `rangeValue` in sync if the host pushes a new preset down.
   useEffect(() => {
@@ -946,6 +1034,13 @@ export function LineChart({
   const [selectedPreset, setSelectedPreset] = useState<string>(
     timeConfig?.defaultDurationId ?? '',
   );
+  // Sync selectedPreset when the configurator changes the default duration.
+  // The existing preset effect then fires, updates rangeValue, and emits TIME_CHANGE.
+  const defaultDurationId = timeConfig?.defaultDurationId;
+  useEffect(() => {
+    if (!defaultDurationId) return;
+    setSelectedPreset(defaultDurationId);
+  }, [defaultDurationId]);
 
   const [periodicityOpen, setPeriodicityOpen] = useState(false);
   const [selectedPeriodicity, setSelectedPeriodicity] = useState<string>(
@@ -975,16 +1070,22 @@ export function LineChart({
   useEffect(() => {
     if (!selectedPreset || !allDurations) return;
     const preset = allDurations.find((d) => d.id === selectedPreset);
-    const derived = rangeFromPreset(preset);
-    if (derived) setRangeValue(derived);
+    let derived: DateRange | null = null;
+    if (preset) {
+      const { startTime, endTime } = resolveDurationWindow(
+        preset,
+        Date.now(),
+        timeConfig?.cycleTime ?? undefined,
+      );
+      derived = { start: new Date(startTime), end: new Date(endTime) };
+      setRangeValue(derived);
+    }
 
     if (!presetInitialized.current) {
       presetInitialized.current = true;
       return; // initial mount — mount effect handles the first TIME_CHANGE
     }
 
-    // Use derived range when possible; fall back to existing rangeValue so
-    // onEvent always fires even for preset formats rangeFromPreset can't parse.
     const eventRange = derived ?? rangeValue;
     if (!eventRange) return;
 
@@ -1006,7 +1107,7 @@ export function LineChart({
       },
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedPreset, allDurations]);
+  }, [selectedPreset, allDurations, JSON.stringify(timeConfig?.cycleTime ?? null)]);
 
   const periodicityOptions = useMemo(() => {
     return getPresetPeriodicities(activePreset) ?? getValidPeriodicities(rangeValue);
@@ -1019,37 +1120,165 @@ export function LineChart({
     setSelectedPeriodicity(periodicityOptions[0]);
   }, [periodicityOptions, selectedPeriodicity]);
 
+  // Comparison data fetch — runs after rangeValue and selectedPeriodicity are initialised.
+  // Fetches the previous period (same duration, shifted back) for each series.
+  const rangeStart = rangeValue?.start instanceof Date ? rangeValue.start.getTime() : 0;
+  const rangeEnd   = rangeValue?.end   instanceof Date ? rangeValue.end.getTime()   : 0;
+
+  useEffect(() => {
+    if (chartMode !== 'comparison') {
+      setComparisonSeriesData(new Map());
+      return;
+    }
+    if (!rangeStart || !rangeEnd) return;
+
+    const validBindings = (activeChart?.series ?? [])
+      .map((_, si) => ({
+        key: `charts[${chartIndex}].series[${si}].unsPath`,
+        topic: seriesUNSPaths[si] ?? '',
+        type: 'series' as const,
+        aggregation: { operator: 'mean', downscale: 1,
+          resolution: (() => {
+            switch (selectedPeriodicity.toLowerCase()) {
+              case 'minute':  return 'minute';
+              case 'hourly':  return 'hour';
+              case 'daily':   return 'day';
+              case 'weekly':  return 'week';
+              case 'monthly': return 'month';
+              default:        return 'hour';
+            }
+          })(),
+        },
+      }))
+      .filter((b) => b.topic);
+
+    if (!validBindings.length) return;
+
+    // Previous period = same duration window, shifted back in time.
+    const resolution = validBindings[0].aggregation.resolution;
+    const duration = rangeEnd - rangeStart;
+    const prevEnd   = rangeStart;
+    const prevStart = prevEnd - duration;
+
+    let cancelled = false;
+    resolveAndCompute(effectiveAuth, validBindings, prevStart, prevEnd, resolution)
+      .then((items) => {
+        if (cancelled) return;
+        const map = new Map<string, SeriesPayload>();
+        items.forEach((item) => {
+          const v = item.value;
+          if (v && typeof v === 'object' && (v as SeriesPayload).__type === 'series') {
+            map.set(item.key, v as SeriesPayload);
+          }
+        });
+        setComparisonSeriesData(map);
+      })
+      .catch((err) => {
+        if (!cancelled) console.error('[LC comparison fetch]', err);
+      });
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chartMode, effectiveAuth, rangeStart, rangeEnd, chartIndex, selectedPeriodicity, activeChart?._id, seriesUNSPaths.join(',')]);
+
   // Highcharts instance handle for the export menu and fullscreen toggle.
+  // chartInitKey increments each time onChartReady fires so the plotLine effect
+  // re-runs against the freshly created chart instance.
   const chartInstanceRef = useRef<
     { reflow: () => void; fdsToggleFullscreen?: () => void } | null
   >(null);
+  const [chartInitKey, setChartInitKey] = useState(0);
 
   // Root element ref for the ResizeObserver — triggers chart.reflow() when the
   // dashboard resizes or repositions this widget so Highcharts recalculates
   // tick positions and label layout rather than stretching the mount-time SVG.
   const lcwRef = useRef<HTMLDivElement | null>(null);
+  const resizeRafRef = useRef<number | undefined>(undefined);
   useEffect(() => {
     const el = lcwRef.current;
     if (!el || typeof ResizeObserver === 'undefined') return;
     const ro = new ResizeObserver(() => {
       const chart = chartInstanceRef.current;
       if (!chart) return;
-      try { chart.reflow(); } catch { /* chart destroyed mid-resize */ }
+      // Batch reflow to one per animation frame — prevents layout thrashing when
+      // the dashboard fires many resize events in a single frame.
+      if (resizeRafRef.current !== undefined) cancelAnimationFrame(resizeRafRef.current);
+      resizeRafRef.current = requestAnimationFrame(() => {
+        resizeRafRef.current = undefined;
+        try { chart.reflow(); } catch { /* chart destroyed mid-resize */ }
+      });
     });
     ro.observe(el);
-    return () => ro.disconnect();
+    return () => {
+      ro.disconnect();
+      if (resizeRafRef.current !== undefined) cancelAnimationFrame(resizeRafRef.current);
+    };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Apply plotLines/plotBands imperatively via the Highcharts axis API.
+  // Re-runs on periodicity change and data arrival (categories.length) because
+  // Highcharts rebuilds axis objects during chart.update(), which clears any
+  // previously imperative-added lines/bands. The RAF call re-applies after the
+  // update settles.
+  useEffect(() => {
+    const chart = chartInstanceRef.current as any;
+    if (!chart) return;
+
+    // Build axisId → Highcharts yAxis index map for plot-line axis routing.
+    // Left axis (default) is always index 0; each right axis follows in order.
+    const rightAxesList = (activeChart?.axes ?? []).filter((a) => a.position === 'Right');
+    const axisIdToHcIdx = new Map<string, number>([['', 0]]);
+    rightAxesList.forEach((a, i) => axisIdToHcIdx.set(a._id, i + 1));
+
+    // Same for plot bands — LineChartPlotBand already has axisId.
+    const bandAxisIds = (activeChart?.plotBands ?? []).map((b) => b.axisId ?? '');
+
+    const applyPlotLines = () => {
+      const hcAxes: any[] = chart.yAxis ?? [];
+      hcAxes.forEach((ax: any, axIdx: number) => {
+        for (let i = 0; i < 50; i++) {
+          ax.removePlotLine?.(`__lc_pl_${axIdx}_${i}`);
+          ax.removePlotBand?.(`__lc_pb_${axIdx}_${i}`);
+        }
+        plotLines.forEach((p, i) => {
+          const targetIdx = axisIdToHcIdx.get((p as any)._axisId ?? '') ?? 0;
+          if (targetIdx !== axIdx) return;
+          ax.addPlotLine({
+            id: `__lc_pl_${axIdx}_${i}`,
+            value: p.value,
+            color: p.color,
+            width: p.width ?? 2,
+            dashStyle: p.dashStyle ?? 'Dash',
+            zIndex: 5,
+            ...(p.label ? { label: { text: p.label, align: 'right', style: { color: p.color } } } : {}),
+          });
+        });
+        plotBands.forEach((b, i) => {
+          const targetIdx = axisIdToHcIdx.get(bandAxisIds[i] ?? '') ?? 0;
+          if (targetIdx !== axIdx) return;
+          ax.addPlotBand({ id: `__lc_pb_${axIdx}_${i}`, from: b.from, to: b.to, color: b.color, ...(b.label ? { label: { text: b.label } } : {}) });
+        });
+      });
+    };
+
+    applyPlotLines();
+    const raf = requestAnimationFrame(applyPlotLines);
+    return () => cancelAnimationFrame(raf);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [plotLines, plotBands, chartInitKey, selectedPeriodicity, categories.length]);
 
   // Date presets surfaced in the DatePicker's preset rail. Derived from the
   // host-passed allDurations so what's offered here matches what was
   // configured in the configurator's Time tab.
   const datePresets = useMemo<DatePresetOption[]>(
-    () =>
-      (timeConfig?.allDurations ?? []).map((d) => ({
+    () => [
+      // "Custom" is always first — lets the user pick a free-form date range.
+      { value: 'custom', label: 'Custom' },
+      ...(timeConfig?.allDurations ?? []).map((d) => ({
         value: d.id,
         label: (d as { label?: string }).label || d.id,
       })),
+    ],
     [timeConfig?.allDurations],
   );
 
@@ -1069,45 +1298,62 @@ export function LineChart({
       style?.card?.wrapInCard === false
         ? 'transparent'
         : style?.card?.backgroundColor || '#FFFFFF';
-    return { ['--lcw-card-bg' as string]: bg } as React.CSSProperties;
+    return { '--lcw-card-bg': bg } as React.CSSProperties;
   }, [style?.card?.wrapInCard, style?.card?.backgroundColor]);
 
   // ----- Render states ------------------------------------------------------
-  // No envelope / no charts configured at all — host hasn't pushed a config.
+  // No charts added yet — show a clean, header-less empty state.
   if (!activeChart) {
     return (
       <div className="lcw lcw--empty">
-        <EmptyState title="No widget to display" description="This chart has no configuration." />
-      </div>
-    );
-  }
-
-  // Chart exists but no data sources added — distinct from a loading state, so
-  // we never show an indefinite spinner just because the user hasn't picked a
-  // UNS topic yet.
-  if (configuredSeriesCount === 0) {
-    return (
-      <div className="lcw lcw--empty">
         <EmptyState
-          title="No data source configured"
-          description="Add a data source to display the chart."
+          illustration={<NoDataOneIllustration />}
+          title="No chart configured"
+          description="Add a chart from the configurator's Chart Settings section to get started."
         />
       </div>
     );
   }
 
-  // Data sources configured, host hasn't delivered resolved data yet — true
-  // loading state (the host's engine call is in flight).
-  if (data.length === 0) {
-    return (
-      <div className="lcw lcw--loading">
-        <Spinner />
-      </div>
-    );
-  }
+  // Chart exists but no data source configured yet — show header chrome with
+  // DatePicker normally, but replace the canvas with "No data found" via status.
+  const hasAnySeries = activeChart.series.length > 0;
+
+  // Fixed-time mode: the window is set externally — hide the DatePicker and
+  // show a duration label in the header instead (mirrors the Column Chart pattern).
+  // GTP (Global Timepicker) mode: time is controlled by an external timepicker
+  // widget — the internal DatePicker is redundant and should not be shown.
+  // Hide the internal DatePicker when time is controlled externally:
+  //   'fixed'  — window set in configurator, no runtime picker needed
+  //   'global' — a Global Timepicker widget drives this widget (pickerType signal)
+  // Lens also sets `globalTimepickerId` at runtime when a GTP is connected
+  // (it may not preserve `pickerType` across updates), so we check both.
+  const hideDatePicker =
+    timeConfig?.pickerType === 'fixed' ||
+    timeConfig?.pickerType === 'global' ||
+    timeConfig?.type === 'global' ||
+    !!timeConfig?.globalTimepickerId;
+  const durationSlot =
+    timeConfig?.pickerType === 'fixed'
+      ? `${timeConfig?.fixedDuration?.label || 'Fixed'}: ${selectedPeriodicity}`
+      : undefined;
+
+  const allHeaderItemsHidden =
+    style?.hideElements?.chartTitle === true &&
+    style?.hideElements?.settingsIcon === true &&
+    style?.hideElements?.exportIcon === true;
 
   return (
-    <div className="lcw" style={widgetStyle} ref={lcwRef}>
+    <div
+      className={[
+        'lcw',
+        hideDatePicker ? 'lcw--gtp' : '',
+        showDataTable ? 'lcw--with-table' : '',
+        allHeaderItemsHidden ? 'lcw--no-header-chrome' : '',
+      ].filter(Boolean).join(' ')}
+      style={widgetStyle}
+      ref={lcwRef}
+    >
       {miscColors.legend && (
         <style>{`.lcw [class*="legend-label"] { color: ${miscColors.legend} !important; }`}</style>
       )}
@@ -1130,6 +1376,8 @@ export function LineChart({
       <Chart
         ref={setCardEl}
         style={cardStyle}
+        status={hasAnySeries ? undefined : 'not-configured'}
+        duration={durationSlot}
         title={
           style?.hideElements?.chartTitle ? undefined : charts.length > 1 ? (
             <ChartTitleSwitcher
@@ -1142,9 +1390,9 @@ export function LineChart({
             <span style={titleStyle}>{activeChart.title || 'Line Chart'}</span>
           )
         }
-        // DatePicker in the filters slot — per-widget local time picker.
-        // Hidden if the widget has no data sources (nothing to time-filter).
-        filters={
+        // DatePicker in the filters slot — hidden for fixed-time mode and when
+        // no data source is configured yet (nothing to time-filter).
+        filters={hideDatePicker ? undefined : (
           <DatePicker
             mode="range"
             isOpen={datePickerOpen}
@@ -1193,7 +1441,7 @@ export function LineChart({
               setSelectedPreset(v);
             }}
             placeholder="Select date range"
-            showShift={cfgShifts.length > 0}
+            showShift={cfgShifts.length > 0 && ['minute', 'hourly'].includes(selectedPeriodicity)}
             shiftEnabled={draftShiftOn}
             onShiftToggle={draftActivateShift}
             showComparison={cfgComparisonMode}
@@ -1239,21 +1487,27 @@ export function LineChart({
               ) : undefined
             }
           />
-        }
+        )}
         // Info / Settings / Export icons — matches the deployed Column
         // Chart's chrome. Settings exposes legend + data-label toggles;
         // Export downloads PNG/JPEG/SVG/CSV/XLSX or toggles fullscreen.
         // Honors style.hideElements.{settingsIcon,exportIcon}; icons are shown
         // by default when hideElements is absent or false (not explicitly true).
         actions={
-          <ChartActionIcons
-            description={activeChart.description}
-            showSettings={style?.hideElements?.settingsIcon !== true}
-            showMore={style?.hideElements?.exportIcon !== true}
-            chartRef={chartInstanceRef}
-            display={chartDisplay}
-            onDisplayChange={setChartDisplay}
-          />
+          // Pass undefined when nothing is visible — SDK Chart skips the
+          // header entirely (no empty-div gap above the canvas).
+          (style?.hideElements?.settingsIcon === true &&
+           style?.hideElements?.exportIcon === true &&
+           !activeChart.description?.trim()) ? undefined : (
+            <ChartActionIcons
+              description={activeChart.description}
+              showSettings={style?.hideElements?.settingsIcon !== true}
+              showMore={style?.hideElements?.exportIcon !== true}
+              chartRef={chartInstanceRef}
+              display={chartDisplay}
+              onDisplayChange={setChartDisplay}
+            />
+          )
         }
         // With bare={true} on DSLineChart the SDK's ShiftLegend doesn't
         // auto-render — inject it here in the Chart's footer slot instead.
@@ -1283,6 +1537,9 @@ export function LineChart({
             chart: activeChart._id,
             // chartMode changes series count/layout; force fresh Highcharts instance.
             mode: chartMode,
+            // Force remount when anomaly rules are added/removed so Highcharts
+            // clears stale per-point marker objects from the old config.
+            anomalyCount: activeChart.anomalies?.length ?? 0,
           })}
           bare
           // null entries are valid Highcharts gaps; the SDK's LineSeries types
@@ -1291,18 +1548,20 @@ export function LineChart({
           comparison={chartMode === 'comparison' ? comparisonProp : undefined}
           shift={chartMode === 'shift' ? shiftProp : undefined}
           categories={categories}
-          showLegend={chartDisplay.legends}
+          // ShiftLegend (footer) already renders source names + shift toggles
+          // when active — suppress the internal scrollable legend to avoid
+          // showing the series list twice.
+          showLegend={shiftProp ? false : chartDisplay.legends}
           showDataLabels={chartDisplay.dataLabel}
           showMarkers={false}
           smooth
-          scrollable={chartDisplay.scrollBehavior}
-          scrollableMinWidth={800}
-          plotLines={multiAxis ? [] : plotLines}
-          plotBands={multiAxis ? [] : plotBands}
+          plotLines={[]}
+          plotBands={[]}
+          xAxisTitle={activeChart?.defaultAxis?.xAxisLabel || undefined}
           yAxisTitle={leftAxisTitle}
           highchartsOptions={highchartsOptions}
           onPointClick={(ctx) => {
-            if (!chartDisplay.timeDrilldown || !onEvent) return;
+            if (!onEvent) return;
             const bucket = catTimestamps[ctx.pointIndex];
             const finer = finerPeriodicity(selectedPeriodicity);
             if (!bucket?.from || !bucket?.to || !finer) return;
@@ -1321,6 +1580,13 @@ export function LineChart({
           }}
           onChartReady={(inst: { reflow: () => void; fdsToggleFullscreen?: () => void }) => {
             chartInstanceRef.current = inst;
+            setChartInitKey((k) => k + 1);
+            // Reflow on the next animation frame so Highcharts measures the
+            // container AFTER the DOM settles. Without this, key-driven
+            // remounts during config editing can initialize at a stale size.
+            requestAnimationFrame(() => {
+              try { inst.reflow(); } catch { /* chart destroyed before frame */ }
+            });
           }}
         />
       </Chart>
@@ -1400,22 +1666,16 @@ function ChartActionIcons({
 
   const settingGroups: Array<{ heading: string; items: Array<{ key: keyof ChartDisplay; label: string }> }> = [
     {
-      heading: 'Time Control',
-      items: [{ key: 'timeDrilldown', label: 'Time drilldown' }],
-    },
-    {
       heading: 'Chart Control',
       items: [
-        { key: 'legends',         label: 'Legends' },
-        { key: 'dataLabel',       label: 'Data Labels' },
-        { key: 'clipping',        label: 'Clipping' },
-        { key: 'zoom',            label: 'Zoom' },
-        { key: 'scrollBehavior',  label: 'Scroll' },
-        { key: 'inexactMultiple', label: 'Inexact Multiple' },
+        { key: 'legends',   label: 'Legends' },
+        { key: 'dataLabel', label: 'Data Labels' },
+        { key: 'clipping',  label: 'Clipping' },
+        { key: 'zoom',      label: 'Zoom' },
       ],
     },
   ];
-  const exportFormats: ChartExportFormat[] = ['PNG', 'JPEG', 'SVG', 'CSV', 'XLSX'];
+  const exportFormats: ChartExportFormat[] = ['SVG', 'PNG', 'JPEG', 'CSV', 'XLSX'];
   const hasDescription = !!description?.trim();
 
   const backdropStyle: React.CSSProperties = { position: 'fixed', inset: 0, zIndex: 9999 };
@@ -1448,7 +1708,7 @@ function ChartActionIcons({
       )}
       {showMore && (
         <IconButton
-          icon={<MoreHorizontal size={16} />}
+          icon={<Menu size={16} />}
           size="Medium"
           accessibilityLabel="Export"
           onClick={(e) => { capturePos(e); setMoreOpen((o) => !o); setSettingsOpen(false); }}
@@ -1484,10 +1744,12 @@ function ChartActionIcons({
           <div style={backdropStyle} onClick={() => setMoreOpen(false)} />
           <div style={menuStyle}>
             <DropdownMenu>
+              <ActionListItem title="View in full screen" selectionType="None" onClick={toggleFullscreen} />
+              <ActionListItem contentType="Separator" />
+              <ActionListItem contentType="SectionHeading" title="Download Type" />
               {exportFormats.map((f) => (
-                <ActionListItem key={f} title={`Download ${f}`} selectionType="None" onClick={() => doExport(f)} />
+                <ActionListItem key={f} title={f} selectionType="None" onClick={() => doExport(f)} />
               ))}
-              <ActionListItem title="Full Screen" selectionType="None" onClick={toggleFullscreen} />
             </DropdownMenu>
           </div>
         </>,
@@ -1608,7 +1870,7 @@ function DataTablePreview({
   // Per-column label + resolved values (aggregation applied per operator below).
   const cols = useMemo(
     () =>
-      dataTable.columns.map((col) => {
+      dataTable.columns.map((col, colIdx) => {
         const baseLabel = columnLabel(col, seriesById);
         const unit =
           col.sourceMode === 'Existing' && col.seriesId
@@ -1616,8 +1878,6 @@ function DataTablePreview({
             : col.unit;
         const label = dataTable.showUnit && unit ? `${baseLabel} (${unit})` : baseLabel;
 
-        // Only Existing columns map to a resolved series; AddNew columns have no
-        // binding in dynamicBindingPathList, so they have no resolved values.
         let values: number[] = [];
         if (col.sourceMode === 'Existing' && col.seriesId) {
           const si = series.findIndex((s) => s._id === col.seriesId);
@@ -1629,6 +1889,17 @@ function DataTablePreview({
               .map((slot) => slot.value)
               .filter((v): v is number => typeof v === 'number');
           }
+        } else if (col.sourceMode === 'AddNew') {
+          // AddNew columns are fetched via their own binding key (not tied to
+          // any chart series). The configurator registers the binding as
+          // `charts[ci].dataTable.columns[colIdx].topic` in dynamicBindingPathList.
+          const payload = getSeriesData(
+            `charts[${chartIndex}].dataTable.columns[${colIdx}].topic`,
+            data,
+          );
+          values = (payload?.slots ?? [])
+            .map((slot) => slot.value)
+            .filter((v): v is number => typeof v === 'number');
         }
         const prec = Number.isFinite(col.dataPrecision) ? col.dataPrecision : 2;
         return { id: col._id, label, values, prec };

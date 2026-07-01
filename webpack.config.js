@@ -77,7 +77,7 @@ export default (env, argv) => {
     ...(!isProd && {
       devServer: {
         static: path.resolve(__dirname, 'public'),
-        port: 3000,
+        port: 3005,
         hot: true,
         open: false,
         historyApiFallback: true,

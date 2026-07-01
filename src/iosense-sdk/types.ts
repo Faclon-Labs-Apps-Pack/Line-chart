@@ -57,18 +57,39 @@ export interface DataEntry {
 export interface Duration {
   id: string;
   label?: string;
+  navigation?: string;
   x?: number;
-  xPeriod: string; // "minute" | "hour" | "day" | "week" | "month" | "year"
+  xPeriod?: string;
+  xEvent?: string;
+  y?: number;
+  yPeriod?: string;
+  yEvent?: string;
+  calendarType?: string;
+  periodicities?: string[];
+}
+
+export interface CycleTime {
+  identifier?: string;
+  hour?: string | number;
+  minute?: string | number;
+  dayOfWeek?: number | null;
+  date?: string | number;
+  month?: string;
 }
 
 export interface TimeConfig {
   timezone: string;
   type: 'local' | 'fixed' | string;
+  pickerType?: 'local' | 'fixed' | 'global';
+  cycleTime?: CycleTime;
   startTime: number | null;
   endTime: number | null;
+  fixedDuration?: Duration;
   defaultDurationId: string;
   allDurations: Duration[];
   defaultPeriodicity: 'minute' | 'hourly' | 'daily' | 'weekly' | 'monthly';
+  globalTimepickerId?: string;
+  globalTimepickerName?: string;
 }
 
 export type WidgetEvent =
@@ -142,33 +163,35 @@ export interface LineChartAxis {
   linkedSeriesIds: string[];  // legacy fallback for renderer; kept for backward compat
 }
 
-export type PlotLineType = 'Independent' | 'Dependent';
-export type PlotLineValueType = 'Fixed' | 'Dynamic';
 export type PlotLineStyle = 'Solid' | 'Dashed';
-
-export interface PlotLinePeriodicityEntry {
-  periodicity: string;
-  value: number;
-}
+export type PlotLinePeriodicityType = 'independent' | 'dependent';
 
 export interface LineChartPlotLine {
   _id: string;
   name: string;
   color: string;
-  type: PlotLineType;
-  valueType: PlotLineValueType;
-  fixedValue?: string;
-  dynamicTopic?: string;
-  downsampling?: string;
-  downsamplingUnit?: string;
-  dataPrecision?: number;
-  unit?: string;
-  periodicities?: PlotLinePeriodicityEntry[];
-  durationType?: string;
-  startDate?: string;
-  endDate?: string;
+  /** Numeric string ("1.5") or {{uns:...}} binding template */
+  value: string;
   lineWidth: number;
   lineStyle: PlotLineStyle;
+  /** Y-axis to draw on. Empty/undefined = default left axis. Matches LineChartAxis._id for right axes. */
+  axisId?: string;
+  periodicityType?: PlotLinePeriodicityType;
+  /** Active periodicities when type is 'dependent' */
+  periodicities?: string[];
+  // Legacy fields — migration only, kept so old envelopes don't lose data
+  /** @deprecated Use `value`. */
+  fixedValue?: string;
+  /** @deprecated Use `value`. */
+  dynamicTopic?: string;
+  /** @deprecated Use `periodicityType`. */
+  type?: string;
+  /** @deprecated */
+  valueType?: string;
+  /** @deprecated */
+  dataPrecision?: number;
+  /** @deprecated */
+  unit?: string;
 }
 
 export interface LineChartPlotBand {
@@ -317,8 +340,10 @@ export type {
   GTPCycleTimeConfig,
 };
 
-// Not publicly re-exported by the SDK index — mirrored from the SDK's internal
-// types (see node_modules/@faclon-labs/design-sdk/.../TimeTabConfiguration/types.d.ts).
+// SDK 0.7.3 — now public. GTPCycleTimeType drives the first dropdown in the
+// Cycle Time accordion: 'calendar' | 'financial' | 'custom'.
+export type { GTPCycleTimeType } from '@faclon-labs/design-sdk/TimeTabConfiguration';
+
 export type GTPTimeType = 'fixed' | 'local' | 'global';
 
 export interface GTPGlobalTimepicker {

@@ -26,6 +26,21 @@
   min-height: 100%;
 }
 
+/* Strip the SDK accordion body-inner wrapper's built-in padding across the
+   entire configurator — we own spacing via our own section classes. */
+.lc-config .fds-pa-item__body-inner {
+  padding: 0 !important;
+}
+
+/* fds-checkbox renders as inline-flex (shrinks to content width). Force full
+   width so standalone checkboxes in accordion bodies and editor panels stay
+   left-aligned instead of floating to the center of their flex container. */
+.lc-config .fds-pa-item__body-inner > .fds-checkbox,
+.lc-config__editor > .fds-checkbox {
+  width: 100%;
+  flex-direction: row;
+}
+
 /* ===========================================================================
    Column 1 — section accordion list
    =========================================================================== */
@@ -92,6 +107,14 @@
 .lc-config__accordion {
   display: flex;
   flex-direction: column;
+  gap: var(--spacing-03, 8px);
+}
+
+/* Gap between items (ItemCards / form controls) inside any accordion section body. */
+.lc-config__accordion .fds-pa-item__body-inner {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-02, 4px);
 }
 
 .lc-config__empty {
@@ -128,16 +151,12 @@
   gap: var(--spacing-04, 12px);
 }
 
-/* Popover z-index lifts — SelectInput / UNSPathInput / DropdownMenu inside the
-   modal must layer above the modal stacking context. */
-.fds-modal__backdrop .fds-select-input__popover,
-.fds-modal__backdrop .fds-uns-path-input__popover,
+/* SelectInput, ColorInput, UNSPathInput portal their popovers to <body> —
+   they are root-level siblings of .fds-modal__backdrop so they win via the
+   10001 rule below. The DropdownMenu used inline (inside the modal DOM) still
+   needs a local lift so it clears the modal's own content layer. */
 .fds-modal__backdrop .fds-dropdown-menu {
-  z-index: var(--global-z-index-modal, 500);
-}
-
-.fds-uns-path-input__popover {
-  z-index: 9999 !important;
+  z-index: 10002 !important;
 }
 
 /* Per-source deviation section: hide the SDK's chart Tabs strip — we replace it
@@ -155,20 +174,28 @@
    configurator. The SDK Modal renders inline (no createPortal), so it inherits
    whatever stacking context its ancestors create. `position: fixed` escapes
    most containers (except ancestors with `transform`/`filter`/etc.); pair it
-   with a huge z-index so we win against any host overlay. `inset: 0` makes
+   with a high z-index so we win against any host overlay. `inset: 0` makes
    the backdrop a full-viewport click-catcher; the inner `.fds-modal` still
    positions itself via its inline `left`/`top` from the SDK Modal's
    positionX/positionY props.
-   Inner SelectInput / ColorInput popovers ride one layer higher so the
-   dropdowns inside the modal stay usable. */
+
+   IMPORTANT — must stay below 10001: SDK components (SelectInput, ColorInput,
+   UNSPathInput) portal their popover menus to <body> rather than rendering
+   inside the modal. That makes the popover a ROOT-level sibling of this
+   backdrop in the stacking context, so the popover's z-index must exceed the
+   backdrop's. We use 10000 here and 10001 for the popovers so they always
+   float on top of any open modal. */
 .fds-modal__backdrop {
   position: fixed !important;
   inset: 0 !important;
-  z-index: 2147483647 !important;
+  z-index: 10000 !important;
 }
+/* SelectInput, ColorInput, and UNSPathInput portal their popover to <body>.
+   At root level they must beat the modal backdrop (10000). */
 .fds-select-input__popover,
-.fds-color-input__popover {
-  z-index: 2147483600 !important;
+.fds-color-input__popover,
+.fds-uns-path-input__popover {
+  z-index: 10001 !important;
 }
 
 /* SDK TimeTabConfiguration's Add Duration / Add Shift popups are actually
@@ -269,6 +296,19 @@
   align-items: center;
 }
 
+/* Periodicity select + Add button row inside the plotline editor */
+.lc-config__date-row--add-periodicity {
+  grid-template-columns: 1fr auto;
+  align-items: flex-end;
+}
+
+/* Tag chips for selected periodicities */
+.lc-config__periodicity-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-02, 4px);
+}
+
 .lc-config__date-row {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -337,19 +377,7 @@
   padding-top: var(--spacing-02, 4px);
 }
 
-/* Plotline "Style" accordion: drop the SDK accordion body's horizontal padding
-   so Line Width / Line Style align flush with the rest of the editor fields.
-   The SDK wraps content in `.fds-pa-item__body-inner` (which holds the 16px
-   horizontal + bottom inset), so zero both the body and its inner wrapper. */
-.lc-config__plotline-style .fds-pa-item__body,
-.lc-config__plotline-style .fds-pa-item__body-inner {
-  padding-left: 0;
-  padding-right: 0;
-}
-/* Drop the body's bottom padding and the SDK's bottom divider line. */
-.lc-config__plotline-style .fds-pa-item__body-inner {
-  padding-bottom: 0;
-}
+/* Drop the bottom divider line from the plotline Style sub-accordion. */
 .lc-config__plotline-style .fds-pa-item__body {
   border-bottom: none;
 }
@@ -404,6 +432,16 @@
 .lc-config__time-tab {
   padding: 0;
   overflow-y: auto;
+}
+
+.lc-config__time-tab-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--spacing-08, 32px) var(--spacing-06, 20px);
+  text-align: center;
+  color: var(--content-tertiary, #6B7280);
+  font-size: var(--font-size-02, 14px);
 }
 
 /* ----- Deviation indicator selector (custom, post-TimeTabConfiguration) --- */
