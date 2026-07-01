@@ -317,7 +317,9 @@ function toHostTimeConfig(t: TimeTabUIConfig): HostTimeConfig {
     defaultPeriodicity:
       pickerType === 'fixed' && fd?.periodicity ? fd.periodicity.toLowerCase() : t.defaultPeriodicity,
     shifts:
-      pickerType === 'fixed' ? (t.fixed?.shifts ?? t.shifts ?? []) : (t.shifts ?? []),
+      pickerType === 'fixed' ? (t.fixed?.shifts ?? t.shifts ?? []) :
+      pickerType === 'global' ? ((t.global as any)?.shifts ?? t.shifts ?? []) :
+      (t.shifts ?? []),
     comparisonMode:
       pickerType === 'fixed' ? t.fixed?.comparisonMode :
       pickerType === 'global' ? t.global?.comparisonMode :

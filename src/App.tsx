@@ -76,12 +76,21 @@ export default function App() {
               ? { startTime: ovr.comparisonStartTime, endTime: ovr.comparisonEndTime }
               : undefined,
         });
+        // When the resolve errored out and returned no data, keep the previous
+        // resolvedData so widgets that have already rendered (e.g. with anomaly
+        // highlighting) don't lose their visual state. A common trigger: a newly
+        // added data-table column whose topic binding hasn't resolved yet causes
+        // resolveAndCompute to fail for ALL bindings, wiping the series data and
+        // making anomaly overlays disappear.
+        if (result.error && result.data.length === 0) {
+          console.warn('[dev-harness] resolve returned error — keeping previous data:', result.error);
+          return;
+        }
         setResolvedData(result.data);
       } catch (err) {
         // Without a valid token the API 401s — keep the widget rendered with no
         // data rather than crashing the harness.
         console.warn('[dev-harness] resolve failed:', err);
-        setResolvedData([]);
       }
     },
     [],

@@ -10,7 +10,6 @@ import { Chart, exportChart } from '@faclon-labs/design-sdk/Chart';
 import { IconButton } from '@faclon-labs/design-sdk/IconButton';
 import type { ChartPlotLine, ChartPlotBand, ChartExportFormat } from '@faclon-labs/design-sdk/Chart';
 import type { ChartComparisonConfig, ComparisonSeriesInput, DeviationPattern, ChartShiftConfig, ShiftSeriesInput } from '@faclon-labs/design-sdk';
-import { ShiftLegend } from '@faclon-labs/design-sdk';
 import { EmptyState, NoDataOneIllustration } from '@faclon-labs/design-sdk/EmptyState';
 import { DatePicker } from '@faclon-labs/design-sdk/DatePicker';
 import type { DateRange, DatePresetOption } from '@faclon-labs/design-sdk/DatePicker';
@@ -151,21 +150,40 @@ const PERIODICITY_MS: Record<string, number> = {
 };
 const PERIODICITY_ORDER = ['Minute', 'Hourly', 'Daily', 'Weekly', 'Monthly'];
 
+// Rank from finest (0) to coarsest. Used to present periodicity options in
+// decremental order (Monthly → Minute) so the dropdown always reads high-to-low
+// and the default selection (options[0]) is the highest-order option available.
+const PERIODICITY_RANK: Record<string, number> = {
+  Minute: 0, Hourly: 1, Daily: 2, Weekly: 3, Monthly: 4,
+};
+function orderDescending(list: string[]): string[] {
+  return [...list].sort((a, b) => (PERIODICITY_RANK[b] ?? 0) - (PERIODICITY_RANK[a] ?? 0));
+}
+
+// Choose the effective periodicity for a set of (descending-ordered) options.
+// Until the user manually picks one we default to the highest-order (coarsest)
+// option; afterwards we keep their choice unless it's no longer valid.
+function pickPeriodicity(options: string[], current: string, touched: boolean): string {
+  if (!options.length) return current;
+  if (!touched) return options[0];
+  return options.includes(current) ? current : options[0];
+}
+
 function titleCase(s: string): string {
   if (!s) return s;
   return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
 }
 
 function getValidPeriodicities(range: DateRange | null): string[] {
-  if (!range?.start || !range?.end) return PERIODICITY_ORDER.slice();
+  if (!range?.start || !range?.end) return orderDescending(PERIODICITY_ORDER);
   const span = new Date(range.end).getTime() - new Date(range.start).getTime();
-  if (span <= 0) return PERIODICITY_ORDER.slice();
+  if (span <= 0) return orderDescending(PERIODICITY_ORDER);
   const MAX_BUCKETS = 1_000;
   const valid = PERIODICITY_ORDER.filter((p) => {
     const ms = PERIODICITY_MS[p];
     return span >= ms && span / ms <= MAX_BUCKETS;
   });
-  return valid.length ? valid : ['Minute'];
+  return orderDescending(valid.length ? valid : ['Minute']);
 }
 
 // Derive valid periodicities from a preset's definition — not from range span.
@@ -178,27 +196,28 @@ function getPresetPeriodicities(
   preset: { x?: number; xPeriod?: string; calendarType?: string; periodicities?: string[] } | undefined,
 ): string[] | null {
   if (!preset) return null;
-  if (preset.periodicities?.length) return preset.periodicities.map(titleCase);
-  if (preset.calendarType) {
+  let raw: string[] | null = null;
+  if (preset.periodicities?.length) {
+    raw = preset.periodicities.map(titleCase);
+  } else if (preset.calendarType) {
     switch (preset.calendarType) {
       case 'today':
-      case 'yesterday':      return ['Hourly'];
+      case 'yesterday':      raw = ['Hourly']; break;
       case 'current_week':
-      case 'previous_week':  return ['Hourly', 'Daily'];
+      case 'previous_week':  raw = ['Hourly', 'Daily']; break;
       case 'current_month':
-      case 'previous_month': return ['Daily'];
+      case 'previous_month': raw = ['Daily']; break;
       default: return null;
     }
-  }
-  if (typeof preset.x === 'number' && preset.xPeriod) {
+  } else if (typeof preset.x === 'number' && preset.xPeriod) {
     const mins = preset.x * (PRESET_MINS[preset.xPeriod] ?? 1440);
-    if (mins <= 60)    return ['Minute', 'Hourly'];
-    if (mins <= 1440)  return ['Hourly'];
-    if (mins <= 10080) return ['Hourly', 'Daily'];
-    if (mins <= 43200) return ['Daily'];
-    return ['Daily', 'Monthly'];
+    if (mins <= 60)         raw = ['Minute', 'Hourly'];
+    else if (mins <= 1440)  raw = ['Hourly'];
+    else if (mins <= 10080) raw = ['Hourly', 'Daily'];
+    else if (mins <= 43200) raw = ['Daily'];
+    else                    raw = ['Daily', 'Monthly'];
   }
-  return null;
+  return raw ? orderDescending(raw) : null;
 }
 
 
@@ -297,6 +316,23 @@ function computeRange(tc?: LineChartWidgetProps['timeConfig']): {
   return { startTime: now - 86_400_000, endTime: now };
 }
 
+// The periodicity a freshly-loaded widget should default to: the highest-order
+// (coarsest) option available for the configured preset/range — e.g. Daily when
+// only Daily+Hourly are valid. Fixed-time mode honors its explicitly-configured
+// periodicity instead (the periodicity dropdown is hidden there).
+function computeDefaultPeriodicity(tc?: LineChartWidgetProps['timeConfig']): string {
+  if (tc?.pickerType === 'fixed' && tc?.defaultPeriodicity) {
+    return titleCase(tc.defaultPeriodicity);
+  }
+  const preset = tc?.allDurations?.find((d) => d.id === tc?.defaultDurationId);
+  let options = getPresetPeriodicities(preset);
+  if (!options) {
+    const { startTime, endTime } = computeRange(tc);
+    options = getValidPeriodicities({ start: new Date(startTime), end: new Date(endTime) });
+  }
+  return options[0] ?? titleCase(tc?.defaultPeriodicity || 'Hourly');
+}
+
 // Previous-period window for comparison mode: same duration as the current
 // window, shifted back so it ends exactly where the current window starts.
 // Returned as the TIME_CHANGE fields the data layer forwards to resolveAndCompute.
@@ -330,7 +366,7 @@ export function LineChart({
     const tc = timeConfigRef.current;
     if (!tc?.defaultDurationId && !tc?.fixedDuration) return;
     const { startTime, endTime } = computeRange(tc);
-    const periodicity = (tc.defaultPeriodicity || 'hourly').toLowerCase();
+    const periodicity = computeDefaultPeriodicity(tc).toLowerCase();
     ev({
       type: 'TIME_CHANGE',
       payload: {
@@ -371,11 +407,30 @@ export function LineChart({
   // Draft is synced from committed on every open; committed is set on Apply.
   const cfgShifts = timeConfig?.shifts ?? [];
   const cfgShiftKey = cfgShifts.map((s) => s.id).join('|');
-  const [shiftToggleOn, setShiftToggleOn] = useState(false);
-  const [draftShiftOn, setDraftShiftOn] = useState(false);
+  const isExternalTime =
+    timeConfig?.pickerType === 'fixed' ||
+    timeConfig?.pickerType === 'global' ||
+    timeConfig?.type === 'global' ||
+    !!timeConfig?.globalTimepickerId;
+  // Whether this widget is driven by a Global Time Picker (GTP).
+  // Lens always sends shift definitions in timeConfig.shifts even when the
+  // GTP's own shift toggle is OFF — so cfgShifts.length > 0 cannot be used
+  // as an "shifts are active" signal in GTP mode. Only auto-enable shifts for
+  // local/fixed time pickers where the user explicitly added shifts themselves.
+  const isGTPMode =
+    timeConfig?.pickerType === 'global' ||
+    timeConfig?.type === 'global' ||
+    !!timeConfig?.globalTimepickerId;
+  // Keep a ref so the cfgShiftKey effect always reads the latest value without
+  // listing isGTPMode as a dep (which would re-run and stomp manual toggles).
+  const isGTPModeRef = useRef(isGTPMode);
+  isGTPModeRef.current = isGTPMode;
+  const [shiftToggleOn, setShiftToggleOn] = useState(() => cfgShifts.length > 0 && !isGTPMode);
+  const [draftShiftOn, setDraftShiftOn] = useState(() => cfgShifts.length > 0 && !isGTPMode);
   useEffect(() => {
-    setShiftToggleOn(false);
-    setDraftShiftOn(false);
+    const autoOn = cfgShifts.length > 0 && !isGTPModeRef.current;
+    setShiftToggleOn(autoOn);
+    setDraftShiftOn(autoOn);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cfgShiftKey]);
   // Which shift chips are toggled on in the chart legend — all enabled by default.
@@ -415,11 +470,27 @@ export function LineChart({
     setDraftComparisonOn(comparisonToggleOn);
   };
 
+  // Comparison is driven by DATA, not the toggle: whenever the resolved series
+  // carry comparisonSlots values, render the comparison chart. The config flag +
+  // Compare toggle only govern whether the widget REQUESTS the previous period
+  // (see comparisonActiveRef / the TIME_CHANGE emitters) — once that data
+  // arrives, the comparison view shows regardless of the current toggle state.
+  const hasComparisonData = useMemo(() => {
+    const configured = activeChart?.series ?? [];
+    return configured.some((_, i) => {
+      const payload =
+        getSeriesData(`charts[${chartIndex}].series[${i}].unsPath`, data) ??
+        getSeriesData(`charts[${chartIndex}].series[${i}].dataSource`, data);
+      const cs = payload?.comparisonSlots;
+      return Array.isArray(cs) && cs.some((slot) => typeof slot?.value === 'number');
+    });
+  }, [activeChart, chartIndex, data]);
+
   const chartMode = useMemo<'normal' | 'comparison' | 'shift'>(() => {
-    if (cfgComparisonMode && comparisonToggleOn) return 'comparison';
+    if (hasComparisonData) return 'comparison';
     if (shiftToggleOn && cfgShifts.length > 0) return 'shift';
     return 'normal';
-  }, [cfgComparisonMode, comparisonToggleOn, shiftToggleOn, cfgShifts.length]);
+  }, [hasComparisonData, shiftToggleOn, cfgShifts.length]);
 
   // Latest committed comparison flag for TIME_CHANGE emitters that fire from
   // effects/callbacks whose dependency lists don't track it.
@@ -1029,14 +1100,20 @@ export function LineChart({
 
   const [periodicityOpen, setPeriodicityOpen] = useState(false);
   const [selectedPeriodicity, setSelectedPeriodicity] = useState<string>(
-    () => titleCase(timeConfig?.defaultPeriodicity || 'Hourly'),
+    () => computeDefaultPeriodicity(timeConfig),
   );
-  // Sync with host-pushed defaultPeriodicity (on initial load or reset)
+  // Once the user manually picks a periodicity (dropdown or drilldown) we stop
+  // auto-defaulting to the coarsest option so their choice sticks.
+  const periodicityTouchedRef = useRef(false);
+  // Host pushed a new configured periodicity (initial load or config reset):
+  // clear the manual-pick flag and re-derive the highest-order default.
   const defaultPeriodicity = timeConfig?.defaultPeriodicity;
   useEffect(() => {
     if (!defaultPeriodicity) return;
-    const tc = titleCase(defaultPeriodicity);
-    setSelectedPeriodicity((prev) => (prev === tc ? prev : tc));
+    periodicityTouchedRef.current = false;
+    const next = computeDefaultPeriodicity(timeConfig);
+    setSelectedPeriodicity((prev) => (prev === next ? prev : next));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [defaultPeriodicity]);
 
   const activePreset = timeConfig?.allDurations?.find((d) => d.id === selectedPreset);
@@ -1078,9 +1155,9 @@ export function LineChart({
     // list / minute-band), NOT bucket-count heuristic. Bucket count allows
     // Hourly for a partial-month range — the preset definition is the authority.
     const nextOptions = getPresetPeriodicities(preset) ?? getValidPeriodicities(eventRange);
-    const nextPeriodicity = nextOptions.includes(selectedPeriodicity)
-      ? selectedPeriodicity
-      : (nextOptions[0] ?? selectedPeriodicity);
+    const nextPeriodicity = pickPeriodicity(
+      nextOptions, selectedPeriodicity, periodicityTouchedRef.current,
+    );
     if (nextPeriodicity !== selectedPeriodicity) setSelectedPeriodicity(nextPeriodicity);
 
     const evStart = new Date(eventRange.start).getTime();
@@ -1101,11 +1178,15 @@ export function LineChart({
     return getPresetPeriodicities(activePreset) ?? getValidPeriodicities(rangeValue);
   }, [activePreset, rangeValue]);
 
-  // If the active selection isn't valid for the current range/preset, snap to first valid
+  // Keep the selection in step with the available options: default to the
+  // highest-order (coarsest) option until the user picks one, then hold their
+  // choice unless the range renders it invalid.
   useEffect(() => {
     if (!periodicityOptions.length) return;
-    if (periodicityOptions.includes(selectedPeriodicity)) return;
-    setSelectedPeriodicity(periodicityOptions[0]);
+    const next = pickPeriodicity(
+      periodicityOptions, selectedPeriodicity, periodicityTouchedRef.current,
+    );
+    if (next !== selectedPeriodicity) setSelectedPeriodicity(next);
   }, [periodicityOptions, selectedPeriodicity]);
 
   // Highcharts instance handle for the export menu and fullscreen toggle.
@@ -1345,9 +1426,9 @@ export function LineChart({
               // first (calendarType / explicit list / minute-band), then fall
               // back to bucket-count heuristic for fully custom ranges.
               const nextOptions = getPresetPeriodicities(activePreset) ?? getValidPeriodicities(v);
-              const nextPeriodicity = nextOptions.includes(selectedPeriodicity)
-                ? selectedPeriodicity
-                : (nextOptions[0] ?? selectedPeriodicity);
+              const nextPeriodicity = pickPeriodicity(
+                nextOptions, selectedPeriodicity, periodicityTouchedRef.current,
+              );
               if (nextPeriodicity !== selectedPeriodicity) {
                 setSelectedPeriodicity(nextPeriodicity);
               }
@@ -1401,6 +1482,7 @@ export function LineChart({
                         selectionType="Single"
                         isSelected={opt === selectedPeriodicity}
                         onClick={() => {
+                          periodicityTouchedRef.current = true;
                           setSelectedPeriodicity(opt);
                           setPeriodicityOpen(false);
                           if (!onEvent || !rangeValue) return;
@@ -1447,19 +1529,6 @@ export function LineChart({
             />
           )
         }
-        // With bare={true} on DSLineChart the SDK's ShiftLegend doesn't
-        // auto-render — inject it here in the Chart's footer slot instead.
-        footer={
-          shiftProp ? (
-            <ShiftLegend
-              channel="shape"
-              sources={shiftProp.sources ?? []}
-              shifts={shiftProp.shifts ?? []}
-              onToggleShift={shiftProp.onToggleShift ?? (() => {})}
-              onToggleSource={shiftProp.onToggleSource}
-            />
-          ) : undefined
-        }
       >
         <DSLineChart
           // Highcharts updates options in-place via React props for most
@@ -1486,9 +1555,8 @@ export function LineChart({
           comparison={chartMode === 'comparison' ? comparisonProp : undefined}
           shift={chartMode === 'shift' ? shiftProp : undefined}
           categories={categories}
-          // ShiftLegend (footer) already renders source names + shift toggles
-          // when active — suppress the internal scrollable legend to avoid
-          // showing the series list twice.
+          // SDK renders its own ShiftLegend inside the viewport in shift mode;
+          // suppress the scrollable series legend so it doesn't show alongside.
           showLegend={shiftProp ? false : chartDisplay.legends}
           showDataLabels={chartDisplay.dataLabel}
           showMarkers={false}
@@ -1506,6 +1574,7 @@ export function LineChart({
             const newRange = { start: new Date(bucket.from), end: new Date(bucket.to) };
             setRangeValue(newRange);
             setSelectedPreset('');
+            periodicityTouchedRef.current = true;
             setSelectedPeriodicity(finer);
             onEvent({
               type: 'TIME_CHANGE',
