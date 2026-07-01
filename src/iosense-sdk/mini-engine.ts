@@ -7,6 +7,10 @@ interface MiniEngineCtx {
   /** Periodicity override from the widget's periodicity dropdown.
    *  Sent to backend so all series aggregate at the picked granularity. */
   periodicity?: string;
+  /** Previous-period window. When set, resolveAndCompute runs comparison mode
+   *  and returns `comparisonSlots` on each series alongside the current `slots`
+   *  — one call, no separate comparison fetch. */
+  comparison?: { startTime: number; endTime: number };
 }
 
 export interface MiniEngineResult {
@@ -73,6 +77,7 @@ export async function resolve(
       startTime,
       endTime,
       resolution,
+      ctx.comparison,
     );
     const data: DataEntry[] = items.map((item) => ({ key: item.key, value: item.value }));
     // Diagnostic — summarize series payload shape per key so we can see the
@@ -128,6 +133,9 @@ export function getSeriesData(key: string, data: DataEntry[]): SeriesPayload | n
       meta: entry.meta as SeriesPayload['meta'],
       range: entry.range as SeriesPayload['range'],
       slots: entry.slots as SeriesPayload['slots'],
+      ...(Array.isArray(entry.comparisonSlots)
+        ? { comparisonSlots: entry.comparisonSlots as SeriesPayload['slots'] }
+        : {}),
     };
   }
   return null;

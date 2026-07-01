@@ -37,6 +37,10 @@ export interface SeriesPayload {
   meta: SeriesMeta;
   range: { from: number; to: number };
   slots: SeriesSlot[];
+  /** Previous-period buckets — present only when resolveAndCompute is called
+   *  with comparison params (comparisonMode + comparisonStartTime/EndTime).
+   *  Index-aligned to `slots` (comparisonSlots[i] pairs with slots[i]). */
+  comparisonSlots?: SeriesSlot[];
 }
 
 export interface ScalarBinding { key: string; topic: string; }
@@ -93,7 +97,19 @@ export interface TimeConfig {
 }
 
 export type WidgetEvent =
-  | { type: 'TIME_CHANGE'; payload: { startTime: string; endTime: string; periodicity: string } }
+  | {
+      type: 'TIME_CHANGE';
+      payload: {
+        startTime: string;
+        endTime: string;
+        periodicity: string;
+        /** Present only when comparison mode is active — the previous-period
+         *  window. The data layer forwards these to resolveAndCompute so the
+         *  same call returns `comparisonSlots` alongside the current `slots`. */
+        comparisonStartTime?: string;
+        comparisonEndTime?: string;
+      };
+    }
   | { type: 'FILTER_CHANGE'; payload: Record<string, unknown> };
 
 // ---------------------------------------------------------------------------
@@ -340,9 +356,10 @@ export type {
   GTPCycleTimeConfig,
 };
 
-// SDK 0.7.3 — now public. GTPCycleTimeType drives the first dropdown in the
-// Cycle Time accordion: 'calendar' | 'financial' | 'custom'.
-export type { GTPCycleTimeType } from '@faclon-labs/design-sdk/TimeTabConfiguration';
+// GTPCycleTimeType drives the first dropdown in the Cycle Time accordion.
+// The SDK defines it internally but does not re-export it from the
+// `TimeTabConfiguration` subpath entry, so we mirror the union locally.
+export type GTPCycleTimeType = 'calendar' | 'financial' | 'custom';
 
 export type GTPTimeType = 'fixed' | 'local' | 'global';
 

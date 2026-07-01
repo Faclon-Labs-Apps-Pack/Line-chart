@@ -59,17 +59,16 @@ if (typeof window !== 'undefined') {
   };
 }
 
-// In dev (localhost) use the staging server. In production Lens the frontend
-// and API are on separate domains — the API is always appserver.iosense.io
-// regardless of what domain Lens is hosted on (matches DataLayer hardcoding).
+// The API is always appserver.iosense.io — in dev (localhost) and in production
+// Lens alike (the frontend and API are on separate domains; matches DataLayer
+// hardcoding). Explicit staging hosts still target the staging API.
 function getApiBase(): string {
-  if (typeof window === 'undefined') return 'https://stagingsv.iosense.io/api';
+  if (typeof window === 'undefined') return 'https://appserver.iosense.io/api';
   const h = window.location.hostname;
-  if (h === 'localhost' || h === '127.0.0.1') return 'https://stagingsv.iosense.io/api';
   if (h.includes('stagingsv') || h.includes('staging')) return 'https://stagingsv.iosense.io/api';
   return 'https://appserver.iosense.io/api';
 }
-const STAGING_BASE = getApiBase();
+const API_BASE = getApiBase();
 const GRAPH = 'iosense_test_uns';
 
 
@@ -85,16 +84,6 @@ function isRawSeriesItem(item: Record<string, unknown>): boolean {
   return Array.isArray(item.slots);
 }
 
-export async function validateSSOToken(ssoToken: string): Promise<string> {
-  const res = await fetch(`${STAGING_BASE}/account/validateSSO`, {
-    method: 'GET',
-    headers: { token: ssoToken },
-  });
-  const json = await res.json();
-  if (!json.success || !json.token) throw new Error('SSO validation failed');
-  return json.token;
-}
-
 export async function resolveAndCompute(
   authentication: string,
   config: Array<BindingEntry>,
@@ -102,6 +91,11 @@ export async function resolveAndCompute(
   endTime: number,
   /** Backend resolution value (e.g. 'hour', 'day') — mapped from widget periodicity in the mini-engine. */
   resolution?: string,
+  /** Comparison window. When provided, the backend resolves the previous period
+   *  in the SAME call and returns it as `comparisonSlots[]` on each series item
+   *  (index-aligned to `slots`). This is the native comparison path — no second
+   *  request needed. */
+  comparison?: { startTime: number; endTime: number },
 ): Promise<Array<{ key: string; value: string | number | null | SeriesPayload }>> {
   const body: Record<string, unknown> = { graph: GRAPH, config, startTime, endTime };
   if (resolution) {
@@ -110,12 +104,17 @@ export async function resolveAndCompute(
     body.timeFrame = resolution;
     body.resolution = resolution;
   }
+  if (comparison) {
+    body.comparisonMode = true;
+    body.comparisonStartTime = comparison.startTime;
+    body.comparisonEndTime = comparison.endTime;
+  }
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (authentication) headers.Authorization = bearer(authentication);
 
   // Prefer the URL base captured from the DataLayer's own calls — guarantees
   // we hit the same server that issued the token, regardless of environment.
-  const apiBase = _capturedApiBase || STAGING_BASE;
+  const apiBase = _capturedApiBase || API_BASE;
   const res = await fetch(`${apiBase}/account/uns/resolveAndCompute`, {
     method: 'POST',
     headers,
@@ -139,6 +138,10 @@ export async function resolveAndCompute(
           meta: item.meta as SeriesMeta,
           range: item.range as { from: number; to: number },
           slots: item.slots as SeriesSlot[],
+          // Present only when the request carried comparison params.
+          ...(Array.isArray(item.comparisonSlots)
+            ? { comparisonSlots: item.comparisonSlots as SeriesSlot[] }
+            : {}),
         } satisfies SeriesPayload,
       };
     }
@@ -156,7 +159,7 @@ export async function fetchUNSNodes(
   const params = new URLSearchParams({ graph, limit: String(limit) });
   if (label) params.set('label', label);
   if (expandPostfix) params.set('expandPostfix', 'true');
-  const res = await fetch(`${STAGING_BASE}/account/uns/nodes?${params}`, {
+  const res = await fetch(`${API_BASE}/account/uns/nodes?${params}`, {
     headers: { Authorization: bearer(authentication) },
   });
   // Without an explicit ok check, a 401/403 returning `{ success: false }` would

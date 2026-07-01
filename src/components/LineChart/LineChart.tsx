@@ -29,7 +29,6 @@ import {
   TableCell,
 } from '@faclon-labs/design-sdk/Table';
 import { getSeriesData } from '../../iosense-sdk/mini-engine';
-import { resolveAndCompute, getCapturedToken } from '../../iosense-sdk/api';
 import { resolveDurationWindow } from '../../iosense-sdk/time';
 import type {
   LineChartUIConfig,
@@ -298,22 +297,23 @@ function computeRange(tc?: LineChartWidgetProps['timeConfig']): {
   return { startTime: now - 86_400_000, endTime: now };
 }
 
+// Previous-period window for comparison mode: same duration as the current
+// window, shifted back so it ends exactly where the current window starts.
+// Returned as the TIME_CHANGE fields the data layer forwards to resolveAndCompute.
+function comparisonWindowPayload(
+  startMs: number,
+  endMs: number,
+): { comparisonStartTime: string; comparisonEndTime: string } {
+  const dur = endMs - startMs;
+  return { comparisonStartTime: String(startMs - dur), comparisonEndTime: String(startMs) };
+}
+
 export function LineChart({
   config: rawConfig,
   data = [],
   timeConfig,
   onEvent,
-  authentication,
 }: LineChartWidgetProps) {
-  // Auth for comparison fetch. Priority:
-  // 1. authentication prop (dev harness passes it explicitly)
-  // 2. Token intercepted from Angular DataLayer's XHR calls (production Lens)
-  // 3. localStorage fallback (dev sessions without active harness)
-  const effectiveAuth = authentication
-    || getCapturedToken()
-    || (typeof localStorage !== 'undefined'
-      ? (localStorage.getItem('iosense_bearer_token') ?? localStorage.getItem('bearer_token') ?? '')
-      : '');
   // Emit TIME_CHANGE once on mount so the host's data layer registers this
   // widget for query dispatch. Refs hold the latest values so the mount-only
   // effect can read them without listing them as deps — if we re-emitted on
@@ -421,6 +421,11 @@ export function LineChart({
     return 'normal';
   }, [cfgComparisonMode, comparisonToggleOn, shiftToggleOn, cfgShifts.length]);
 
+  // Latest committed comparison flag for TIME_CHANGE emitters that fire from
+  // effects/callbacks whose dependency lists don't track it.
+  const comparisonActiveRef = useRef(false);
+  comparisonActiveRef.current = cfgComparisonMode && comparisonToggleOn;
+
   // Resolve each configured series from `data` (series binding key matches the
   // configurator's: charts[ci].series[si].dataSource). Categories are the slot
   // labels of the longest series (backend returns aligned, pre-bucketed slots).
@@ -488,27 +493,11 @@ export function LineChart({
   const effectiveTooltipOnlyFlags = tooltipOnlyFlags;
   const effectiveTooltipOnlyNames = tooltipOnlyNames;
 
-  // Comparison mode — fetch previous-period data directly from the API.
-  // Lens's DataLayer only resolves the current period; it doesn't inject
-  // _comparison entries automatically. The widget fetches the shifted window
-  // itself using the resolved UNS paths from the current data entries.
-  // rangeStart/rangeEnd and the fetch effect are declared AFTER rangeValue and
-  // selectedPeriodicity state are initialised (below the DatePicker state block).
-  const [comparisonSeriesData, setComparisonSeriesData] = useState<Map<string, SeriesPayload>>(new Map());
-
-  // Derive the resolved UNS topic path for each series from the uiConfig.
-  // Reading from config (not from data entry.path) guarantees uns:wsId://path
-  // format in both dev and production Lens — entry.path format varies by host.
-  const SERIES_UNS_RE = /^\{\{(.+)\}\}$/;
-  const seriesUNSPaths = useMemo<string[]>(() => {
-    if (!activeChart) return [];
-    return activeChart.series.map((s) => {
-      const raw = (s.unsPath || '').trim();
-      const match = SERIES_UNS_RE.exec(raw);
-      return match ? match[1] : '';
-    });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeChart?._id, activeChart?.series]);
+  // Comparison mode — the previous-period buckets arrive as `comparisonSlots`
+  // on each series in the `data` prop. When comparison is active the widget
+  // emits the previous-period window in its TIME_CHANGE event; the data layer
+  // forwards it to resolveAndCompute so the SAME call returns comparisonSlots
+  // alongside the current slots. No separate widget-side fetch.
 
   // Comparison mode: build ChartComparisonConfig from current + previous period data.
   const widgetDeviationPattern: DeviationPattern =
@@ -524,24 +513,20 @@ export function LineChart({
       const name = s.name || `Series ${i + 1}`;
       const currentData = series[i]?.data ?? [];
 
-      // Previous period — use data fetched by the comparison effect above.
-      // Falls back to null per slot while the fetch is in-flight.
-      const compPayload = comparisonSeriesData.get(`charts[${chartIndex}].series[${i}].unsPath`);
+      // Previous period — read `comparisonSlots` off the SAME resolved series
+      // payload that produced the current line (the data layer ran comparison
+      // mode in one resolveAndCompute call). The backend index-aligns
+      // comparisonSlots to the current window's buckets (comparisonSlots[k] is
+      // the previous-period value for the SAME bucket k), so pair by index.
+      // Null per slot until the comparison-enabled response arrives.
+      const compPayload =
+        getSeriesData(`charts[${chartIndex}].series[${i}].unsPath`, data) ??
+        getSeriesData(`charts[${chartIndex}].series[${i}].dataSource`, data);
       const prevData: (number | null)[] = (() => {
-        if (!compPayload) return currentData.map(() => null);
-        // Build a from→value map and align by timestamp offset rather than by
-        // array index. Index alignment breaks when periods have different slot
-        // counts (e.g. comparing a 31-day month against a 28-day month at daily
-        // resolution). The offset is derived from the actual slot origins so no
-        // dependency on rangeStart/rangeEnd is needed here.
-        const prevSlotMap = new Map(compPayload.slots.map(sl => [sl.from, sl.value]));
-        const prevOrigin = compPayload.slots[0]?.from;
-        const currOrigin = catTimestamps[0]?.from;
-        const offset = prevOrigin != null && currOrigin != null ? currOrigin - prevOrigin : null;
-        return categories.map((_, ci) => {
-          const ts = catTimestamps[ci];
-          if (!ts?.from || offset === null) return null;
-          const v = prevSlotMap.get(ts.from - offset);
+        const cs = compPayload?.comparisonSlots;
+        if (!cs) return currentData.map(() => null);
+        return currentData.map((_, ci) => {
+          const v = cs[ci]?.value;
           return typeof v === 'number' ? v : null;
         });
       })();
@@ -582,7 +567,7 @@ export function LineChart({
 
     return { series: out, showDeviation: true, deviationPattern: widgetDeviationPattern, comparisonCategories: categories };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chartMode, activeChart, chartIndex, series, categories, catTimestamps, data, widgetDeviationPattern, timeConfig?.sourceDeviationOverrides, comparisonSeriesData]);
+  }, [chartMode, activeChart, chartIndex, series, categories, catTimestamps, data, widgetDeviationPattern, timeConfig?.sourceDeviationOverrides]);
 
   // Shift mode: build ChartShiftConfig directly from slot data + shift windows.
   // Each source × enabled shift becomes a ShiftSeriesInput; the SDK renders
@@ -1098,12 +1083,15 @@ export function LineChart({
       : (nextOptions[0] ?? selectedPeriodicity);
     if (nextPeriodicity !== selectedPeriodicity) setSelectedPeriodicity(nextPeriodicity);
 
+    const evStart = new Date(eventRange.start).getTime();
+    const evEnd = new Date(eventRange.end).getTime();
     onEventRef.current?.({
       type: 'TIME_CHANGE',
       payload: {
-        startTime: String(new Date(eventRange.start).getTime()),
-        endTime: String(new Date(eventRange.end).getTime()),
+        startTime: String(evStart),
+        endTime: String(evEnd),
         periodicity: nextPeriodicity.toLowerCase(),
+        ...(comparisonActiveRef.current ? comparisonWindowPayload(evStart, evEnd) : {}),
       },
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1119,66 +1107,6 @@ export function LineChart({
     if (periodicityOptions.includes(selectedPeriodicity)) return;
     setSelectedPeriodicity(periodicityOptions[0]);
   }, [periodicityOptions, selectedPeriodicity]);
-
-  // Comparison data fetch — runs after rangeValue and selectedPeriodicity are initialised.
-  // Fetches the previous period (same duration, shifted back) for each series.
-  const rangeStart = rangeValue?.start instanceof Date ? rangeValue.start.getTime() : 0;
-  const rangeEnd   = rangeValue?.end   instanceof Date ? rangeValue.end.getTime()   : 0;
-
-  useEffect(() => {
-    if (chartMode !== 'comparison') {
-      setComparisonSeriesData(new Map());
-      return;
-    }
-    if (!rangeStart || !rangeEnd) return;
-
-    const validBindings = (activeChart?.series ?? [])
-      .map((_, si) => ({
-        key: `charts[${chartIndex}].series[${si}].unsPath`,
-        topic: seriesUNSPaths[si] ?? '',
-        type: 'series' as const,
-        aggregation: { operator: 'mean', downscale: 1,
-          resolution: (() => {
-            switch (selectedPeriodicity.toLowerCase()) {
-              case 'minute':  return 'minute';
-              case 'hourly':  return 'hour';
-              case 'daily':   return 'day';
-              case 'weekly':  return 'week';
-              case 'monthly': return 'month';
-              default:        return 'hour';
-            }
-          })(),
-        },
-      }))
-      .filter((b) => b.topic);
-
-    if (!validBindings.length) return;
-
-    // Previous period = same duration window, shifted back in time.
-    const resolution = validBindings[0].aggregation.resolution;
-    const duration = rangeEnd - rangeStart;
-    const prevEnd   = rangeStart;
-    const prevStart = prevEnd - duration;
-
-    let cancelled = false;
-    resolveAndCompute(effectiveAuth, validBindings, prevStart, prevEnd, resolution)
-      .then((items) => {
-        if (cancelled) return;
-        const map = new Map<string, SeriesPayload>();
-        items.forEach((item) => {
-          const v = item.value;
-          if (v && typeof v === 'object' && (v as SeriesPayload).__type === 'series') {
-            map.set(item.key, v as SeriesPayload);
-          }
-        });
-        setComparisonSeriesData(map);
-      })
-      .catch((err) => {
-        if (!cancelled) console.error('[LC comparison fetch]', err);
-      });
-    return () => { cancelled = true; };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chartMode, effectiveAuth, rangeStart, rangeEnd, chartIndex, selectedPeriodicity, activeChart?._id, seriesUNSPaths.join(',')]);
 
   // Highcharts instance handle for the export menu and fullscreen toggle.
   // chartInitKey increments each time onChartReady fires so the plotLine effect
@@ -1423,12 +1351,19 @@ export function LineChart({
               if (nextPeriodicity !== selectedPeriodicity) {
                 setSelectedPeriodicity(nextPeriodicity);
               }
+              // Comparison is committed synchronously above (commitToggles) —
+              // use the draft value being committed since the ref hasn't
+              // re-rendered yet at this point.
+              const vStart = new Date(v.start).getTime();
+              const vEnd = new Date(v.end).getTime();
+              const compActive = cfgComparisonMode && draftComparisonOn;
               onEvent({
                 type: 'TIME_CHANGE',
                 payload: {
-                  startTime: String(new Date(v.start).getTime()),
-                  endTime: String(new Date(v.end).getTime()),
+                  startTime: String(vStart),
+                  endTime: String(vEnd),
                   periodicity: nextPeriodicity.toLowerCase(),
+                  ...(compActive ? comparisonWindowPayload(vStart, vEnd) : {}),
                 },
               });
             }}
@@ -1477,6 +1412,9 @@ export function LineChart({
                               startTime: String(startTime),
                               endTime: String(endTime),
                               periodicity: opt.toLowerCase(),
+                              ...(comparisonActiveRef.current
+                                ? comparisonWindowPayload(startTime, endTime)
+                                : {}),
                             },
                           });
                         }}
