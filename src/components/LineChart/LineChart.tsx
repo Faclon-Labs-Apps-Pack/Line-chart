@@ -1866,10 +1866,7 @@ function ChartActionIcons({
       items: [
         { key: 'legends',         label: 'Legends' },
         { key: 'dataLabel',       label: 'Data Labels' },
-        // Clipping & Inexact Multiple are mutually exclusive (mirrors
-        // ColumnChart): Clipping is disabled while Inexact Multiple is on.
-        { key: 'clipping',        label: 'Clipping', disabledWhen: 'inexactMultiple' },
-        { key: 'inexactMultiple', label: 'Inexact Multiple' },
+        { key: 'clipping',        label: 'Clipping' },
         { key: 'zoom',            label: 'Zoom' },
       ],
     },
