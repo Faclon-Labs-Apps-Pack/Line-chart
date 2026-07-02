@@ -1276,15 +1276,17 @@ export function LineChart({
 
     const evStart = new Date(eventRange.start).getTime();
     const evEnd = new Date(eventRange.end).getTime();
-    onEventRef.current?.({
-      type: 'TIME_CHANGE',
-      payload: {
-        startTime: String(evStart),
-        endTime: String(evEnd),
-        periodicity: nextPeriodicity.toLowerCase(),
-        ...modeEventFields(evStart, evEnd),
-      },
+    const presetPayload = {
+      startTime: String(evStart),
+      endTime: String(evEnd),
+      periodicity: nextPeriodicity.toLowerCase(),
+      ...modeEventFields(evStart, evEnd),
+    };
+    console.log('[LineChart] emitting TIME_CHANGE (preset select)', {
+      selectedPreset,
+      payload: presetPayload,
     });
+    onEventRef.current?.({ type: 'TIME_CHANGE', payload: presetPayload });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedPreset, allDurations, JSON.stringify(timeConfig?.cycleTime ?? null)]);
 
@@ -1525,6 +1527,11 @@ export function LineChart({
             }}
             rangeValue={rangeValue}
             onRangeChange={(v) => {
+              console.log('[LineChart] DatePicker onRangeChange fired', {
+                value: v,
+                presetSelecting: presetSelectingRef.current,
+                hasOnEvent: !!onEvent,
+              });
               setRangeValue(v);
               commitToggles();
               // Preset chip selection fires onRangeChange as a side-effect
@@ -1533,9 +1540,16 @@ export function LineChart({
               // second fetch with the old (un-snapped) periodicity.
               if (presetSelectingRef.current) {
                 presetSelectingRef.current = false;
+                console.log('[LineChart] onRangeChange skipped — presetSelecting guard');
                 return;
               }
-              if (!v || !onEvent) return;
+              if (!v || !onEvent) {
+                console.log('[LineChart] onRangeChange bailed — no value or no onEvent', {
+                  hasValue: !!v,
+                  hasOnEvent: !!onEvent,
+                });
+                return;
+              }
               // Manual range pick: snap using preset-definition periodicities
               // first (calendarType / explicit list / minute-band), then fall
               // back to bucket-count heuristic for fully custom ranges.
@@ -1555,19 +1569,18 @@ export function LineChart({
               // committed refs haven't re-rendered yet, so read the drafts here.
               const shiftActive = draftShiftOn && cfgShifts.length > 0;
               const compActive = cfgComparisonMode && draftComparisonOn;
-              onEvent({
-                type: 'TIME_CHANGE',
-                payload: {
-                  startTime: String(vStart),
-                  endTime: String(vEnd),
-                  periodicity: nextPeriodicity.toLowerCase(),
-                  ...(shiftActive
-                    ? shiftEventPayload(cfgShifts, cfgShiftAggregator)
-                    : compActive
-                      ? comparisonWindowPayload(vStart, vEnd)
-                      : {}),
-                },
-              });
+              const manualPayload = {
+                startTime: String(vStart),
+                endTime: String(vEnd),
+                periodicity: nextPeriodicity.toLowerCase(),
+                ...(shiftActive
+                  ? shiftEventPayload(cfgShifts, cfgShiftAggregator)
+                  : compActive
+                    ? comparisonWindowPayload(vStart, vEnd)
+                    : {}),
+              };
+              console.log('[LineChart] emitting TIME_CHANGE (manual range pick)', manualPayload);
+              onEvent({ type: 'TIME_CHANGE', payload: manualPayload });
             }}
             showPresets={datePresets.length > 0}
             showPresetChip={datePresets.length > 0}
