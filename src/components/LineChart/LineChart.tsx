@@ -148,14 +148,16 @@ const PERIODICITY_MS: Record<string, number> = {
   Daily: 86_400_000,
   Weekly: 7 * 86_400_000,
   Monthly: 28 * 86_400_000,
+  Quarterly: 90 * 86_400_000,
+  Yearly: 365 * 86_400_000,
 };
-const PERIODICITY_ORDER = ['Minute', 'Hourly', 'Daily', 'Weekly', 'Monthly'];
+const PERIODICITY_ORDER = ['Minute', 'Hourly', 'Daily', 'Weekly', 'Monthly', 'Quarterly', 'Yearly'];
 
 // Rank from finest (0) to coarsest. Used to present periodicity options in
-// decremental order (Monthly → Minute) so the dropdown always reads high-to-low
+// decremental order (Yearly → Minute) so the dropdown always reads high-to-low
 // and the default selection (options[0]) is the highest-order option available.
 const PERIODICITY_RANK: Record<string, number> = {
-  Minute: 0, Hourly: 1, Daily: 2, Weekly: 3, Monthly: 4,
+  Minute: 0, Hourly: 1, Daily: 2, Weekly: 3, Monthly: 4, Quarterly: 5, Yearly: 6,
 };
 function orderDescending(list: string[]): string[] {
   return [...list].sort((a, b) => (PERIODICITY_RANK[b] ?? 0) - (PERIODICITY_RANK[a] ?? 0));
@@ -199,26 +201,33 @@ function getPresetPeriodicities(
   if (!preset) return null;
   let raw: string[] | null = null;
   if (preset.periodicities?.length) {
+    // Explicit mapping on the duration (SDK- or configurator-authored) is the
+    // authority — surface every periodicity mapped to it, unabridged.
     raw = preset.periodicities.map(titleCase);
   } else if (preset.calendarType) {
+    // Fallback for durations that arrive without an explicit `periodicities`
+    // list (e.g. a Global Time Picker duration pushed at runtime). Mirrors the
+    // SDK TimeTabConfiguration's own built-in calendar → periodicity roster so
+    // the dropdown offers the full mapped set, not a single coarsest option.
     switch (preset.calendarType) {
       case 'today':
       case 'yesterday':      raw = ['Hourly']; break;
       case 'current_week':
       case 'previous_week':  raw = ['Hourly', 'Daily']; break;
       case 'current_month':
-      case 'previous_month': raw = ['Daily']; break;
+      case 'previous_month': raw = ['Hourly', 'Daily', 'Weekly']; break;
       case 'current_year':
-      case 'previous_year':  raw = ['Daily', 'Monthly']; break;
+      case 'previous_year':  raw = ['Daily', 'Weekly', 'Monthly', 'Quarterly']; break;
       default: return null;
     }
   } else if (typeof preset.x === 'number' && preset.xPeriod) {
     const mins = preset.x * (PRESET_MINS[preset.xPeriod] ?? 1440);
-    if (mins <= 60)         raw = ['Minute', 'Hourly'];
-    else if (mins <= 1440)  raw = ['Hourly'];
-    else if (mins <= 10080) raw = ['Hourly', 'Daily'];
-    else if (mins <= 43200) raw = ['Daily'];
-    else                    raw = ['Daily', 'Monthly'];
+    if (mins <= 60)          raw = ['Minute', 'Hourly'];
+    else if (mins <= 1440)   raw = ['Minute', 'Hourly'];
+    else if (mins <= 10080)  raw = ['Hourly', 'Daily'];
+    else if (mins <= 43200)  raw = ['Hourly', 'Daily', 'Weekly'];
+    else if (mins <= 129600) raw = ['Daily', 'Weekly', 'Monthly'];
+    else                     raw = ['Daily', 'Weekly', 'Monthly', 'Quarterly'];
   }
   return raw ? orderDescending(raw) : null;
 }
@@ -228,11 +237,12 @@ function getPresetPeriodicities(
 // range to that bucket and steps one level down for a re-query.
 function finerPeriodicity(p?: string): string | null {
   switch ((p || '').toLowerCase()) {
-    case 'yearly':  return 'Monthly';
-    case 'monthly': return 'Daily';
-    case 'weekly':  return 'Daily';
-    case 'daily':   return 'Hourly';
-    case 'hourly':  return 'Minute';
+    case 'yearly':    return 'Quarterly';
+    case 'quarterly': return 'Monthly';
+    case 'monthly':   return 'Daily';
+    case 'weekly':    return 'Daily';
+    case 'daily':     return 'Hourly';
+    case 'hourly':    return 'Minute';
     default: return null;
   }
 }
