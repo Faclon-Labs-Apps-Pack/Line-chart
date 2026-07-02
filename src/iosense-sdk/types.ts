@@ -93,7 +93,10 @@ export interface CycleTime {
   minute?: string | number;
   dayOfWeek?: number | null;
   date?: string | number;
-  month?: string;
+  // 1-based month number (1 = January … 4 = April), as emitted by design-sdk
+  // ≥0.7.8. Legacy envelopes may still hold a month NAME string ("April") —
+  // both are resolved via monthIndex() in time.ts.
+  month?: string | number | null;
 }
 
 export interface TimeConfig {
@@ -129,6 +132,13 @@ export type WidgetEvent =
          *  when shift is off, so the same call returns the normal series. */
         shifts?: ShiftWindow[];
         shiftAggregator?: string;
+        /** Chart-control toggles from the settings menu. These ride on every
+         *  TIME_CHANGE (not a separate event) so the host always refetches the
+         *  current window with the flags applied. `clipping` trims partial
+         *  edge buckets to the exact window; `inexactMultiple` allows a
+         *  non-whole number of buckets across the range. Mutually exclusive. */
+        clipping?: boolean;
+        inexactMultiple?: boolean;
       };
     }
   | { type: 'FILTER_CHANGE'; payload: Record<string, unknown> };

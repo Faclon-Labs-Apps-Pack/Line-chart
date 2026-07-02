@@ -20,6 +20,16 @@ const MONTH_NAMES = [
   'July', 'August', 'September', 'October', 'November', 'December',
 ];
 
+// Resolve the cycle month to a 0-based JS month index (0 = January). design-sdk
+// ≥0.7.8 emits `month` as a 1-based number (4 = April); legacy envelopes stored
+// the month NAME ("April"). Handle both, defaulting to January (0).
+function monthIndex(month: string | number | null | undefined): number {
+  if (month === undefined || month === null || month === '') return 0;
+  const asNum = typeof month === 'number' ? month : Number(month);
+  if (!Number.isNaN(asNum)) return Math.min(11, Math.max(0, asNum - 1)); // 1-based → 0-based
+  return Math.max(0, MONTH_NAMES.indexOf(String(month)));                // legacy name
+}
+
 function addPeriodToDate(d: Date, n: number, period: string): Date {
   const r = new Date(d);
   switch (period) {
@@ -61,7 +71,7 @@ function getPeriodAsPerCycle(period: string, event: string, cycleTime: CycleTime
       break;
     }
     case 'year': {
-      const selMonth = Math.max(0, MONTH_NAMES.indexOf(cycleTime.month ?? ''));
+      const selMonth = monthIndex(cycleTime.month);
       const selDate  = Number(cycleTime.date || 1);
       base = new Date(now.getFullYear(), selMonth, selDate, ch, cm, 0, 0);
       break;
@@ -74,7 +84,7 @@ function getPeriodAsPerCycle(period: string, event: string, cycleTime: CycleTime
   return base;
 }
 
-function cycleBoundary(period: 'day' | 'week' | 'month', cycleTime: CycleTime | undefined, now: Date): Date {
+function cycleBoundary(period: 'day' | 'week' | 'month' | 'year', cycleTime: CycleTime | undefined, now: Date): Date {
   const ch = Number(cycleTime?.hour   || 0);
   const cm = Number(cycleTime?.minute || 0);
   const y = now.getFullYear(), mo = now.getMonth(), d = now.getDate();
@@ -98,6 +108,17 @@ function cycleBoundary(period: 'day' | 'week' | 'month', cycleTime: CycleTime | 
       if (now < base) base = addPeriodToDate(base, -1, 'month');
       return base;
     }
+    // Year boundary snapped to the configured cycle month (financial-year
+    // start). Cycle month "April" ⇒ the year window begins on 1 April at the
+    // cycle hour/minute; if `now` is before that anchor (e.g. February), roll
+    // back to the previous April so "current year" always contains `now`.
+    case 'year': {
+      const selMonth = monthIndex(cycleTime?.month);
+      const selDate  = Number(cycleTime?.date || 1);
+      let base = new Date(y, selMonth, selDate, ch, cm, 0, 0);
+      if (now < base) base = addPeriodToDate(base, -1, 'year');
+      return base;
+    }
   }
 }
 
@@ -113,7 +134,8 @@ function resolveWindowInner(
     const dayStart   = cycleBoundary('day',   cycleTime, nowD).getTime();
     const weekStart  = cycleBoundary('week',  cycleTime, nowD).getTime();
     const monthStart = cycleBoundary('month', cycleTime, nowD).getTime();
-    const prev = (anchor: number, period: 'day' | 'week' | 'month') =>
+    const yearStart  = cycleBoundary('year',  cycleTime, nowD).getTime();
+    const prev = (anchor: number, period: 'day' | 'week' | 'month' | 'year') =>
       addPeriodToDate(new Date(anchor), -1, period).getTime();
     switch (dur.calendarType) {
       case 'today':          return { startTime: dayStart,                  endTime: ms };
@@ -122,6 +144,8 @@ function resolveWindowInner(
       case 'previous_week':  return { startTime: prev(weekStart, 'week'),   endTime: weekStart };
       case 'current_month':  return { startTime: monthStart,                endTime: ms };
       case 'previous_month': return { startTime: prev(monthStart, 'month'), endTime: monthStart };
+      case 'current_year':   return { startTime: yearStart,                 endTime: ms };
+      case 'previous_year':  return { startTime: prev(yearStart, 'year'),   endTime: yearStart };
     }
   }
 

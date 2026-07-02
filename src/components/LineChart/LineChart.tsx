@@ -208,6 +208,8 @@ function getPresetPeriodicities(
       case 'previous_week':  raw = ['Hourly', 'Daily']; break;
       case 'current_month':
       case 'previous_month': raw = ['Daily']; break;
+      case 'current_year':
+      case 'previous_year':  raw = ['Daily', 'Monthly']; break;
       default: return null;
     }
   } else if (typeof preset.x === 'number' && preset.xPeriod) {
@@ -275,6 +277,10 @@ type ChartDisplay = {
   legends: boolean;
   dataLabel: boolean;
   clipping: boolean;
+  // Time-control flag mirrored from ColumnChart. Rides on TIME_CHANGE so the
+  // host refetches with a non-whole bucket count allowed across the window.
+  // Mutually exclusive with `clipping` (Clipping is disabled while this is on).
+  inexactMultiple: boolean;
   zoom: boolean;
 };
 
@@ -408,6 +414,7 @@ export function LineChart({
         endTime: String(endTime),
         periodicity,
         ...(shiftOn ? shiftEventPayload(shifts, tc?.shiftAggregator) : {}),
+        ...controlFlags(),
       },
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1041,7 +1048,18 @@ export function LineChart({
     legends: true,
     dataLabel: false,
     clipping: false,
+    inexactMultiple: false,
     zoom: true,
+  });
+  // Latest control flags for the scattered TIME_CHANGE emit sites (mount,
+  // preset, periodicity, drilldown) whose closures read via a ref.
+  const chartDisplayRef = useRef(chartDisplay);
+  chartDisplayRef.current = chartDisplay;
+  // Control flags appended to every TIME_CHANGE payload so the host always
+  // refetches with the current Clipping / Inexact Multiple state.
+  const controlFlags = () => ({
+    clipping: chartDisplayRef.current.clipping,
+    inexactMultiple: chartDisplayRef.current.inexactMultiple,
   });
 
   const highchartsOptions = useMemo(() => {
@@ -1071,7 +1089,6 @@ export function LineChart({
       // The SDK hardcodes zooming: { type: 'x' } internally; override here
       // explicitly so disabling zoom via the gear menu actually takes effect.
       zooming: { type: chartDisplay.zoom ? 'x' : (null as any) },
-      clip: chartDisplay.clipping,
     };
     // Shift mode — connectNulls depends on granularity:
     //  • Sub-daily (minute/hourly): OFF. Each shift carries its own buckets plus
@@ -1176,7 +1193,7 @@ export function LineChart({
       };
     }
     return opts as any;
-  }, [axisColors, miscColors, multiAxis, effectiveSeries, effectiveTooltipOnlyFlags, style?.card?.wrapInCard, style?.card?.backgroundColor, chartDisplay.zoom, chartDisplay.clipping, anomalyOverlay, chartMode, plotLines, plotBands, activeChart, shiftSubDaily]);
+  }, [axisColors, miscColors, multiAxis, effectiveSeries, effectiveTooltipOnlyFlags, style?.card?.wrapInCard, style?.card?.backgroundColor, chartDisplay.zoom, anomalyOverlay, chartMode, plotLines, plotBands, activeChart, shiftSubDaily]);
 
   // The data table is portalled into the chart card (sibling of the canvas).
   const [cardEl, setCardEl] = useState<HTMLDivElement | null>(null);
@@ -1281,6 +1298,7 @@ export function LineChart({
       endTime: String(evEnd),
       periodicity: nextPeriodicity.toLowerCase(),
       ...modeEventFields(evStart, evEnd),
+      ...controlFlags(),
     };
     console.log('[LineChart] emitting TIME_CHANGE (preset select)', {
       selectedPreset,
@@ -1289,6 +1307,29 @@ export function LineChart({
     onEventRef.current?.({ type: 'TIME_CHANGE', payload: presetPayload });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedPreset, allDurations, JSON.stringify(timeConfig?.cycleTime ?? null)]);
+
+  // Clipping / Inexact Multiple toggles (settings menu) re-emit TIME_CHANGE for
+  // the CURRENT on-screen window so the host refetches with the new flags. No
+  // window move — mirrors ColumnChart's control-toggle emit. Skips the initial
+  // mount (the mount effect already sent the first TIME_CHANGE).
+  const controlsInitRef = useRef(false);
+  useEffect(() => {
+    if (!controlsInitRef.current) { controlsInitRef.current = true; return; }
+    const ev = onEventRef.current;
+    if (!ev || !rangeValue) return;
+    const startTime = new Date(rangeValue.start).getTime();
+    const endTime = new Date(rangeValue.end).getTime();
+    const payload = {
+      startTime: String(startTime),
+      endTime: String(endTime),
+      periodicity: selectedPeriodicity.toLowerCase(),
+      ...modeEventFields(startTime, endTime),
+      ...controlFlags(),
+    };
+    console.log('[LineChart] emitting TIME_CHANGE (control toggle)', payload);
+    ev({ type: 'TIME_CHANGE', payload });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chartDisplay.clipping, chartDisplay.inexactMultiple]);
 
   const periodicityOptions = useMemo(() => {
     return getPresetPeriodicities(activePreset) ?? getValidPeriodicities(rangeValue);
@@ -1578,6 +1619,7 @@ export function LineChart({
                   : compActive
                     ? comparisonWindowPayload(vStart, vEnd)
                     : {}),
+                ...controlFlags(),
               };
               console.log('[LineChart] emitting TIME_CHANGE (manual range pick)', manualPayload);
               onEvent({ type: 'TIME_CHANGE', payload: manualPayload });
@@ -1629,6 +1671,7 @@ export function LineChart({
                               endTime: String(endTime),
                               periodicity: opt.toLowerCase(),
                               ...modeEventFields(startTime, endTime),
+                              ...controlFlags(),
                             },
                           });
                         }}
@@ -1714,6 +1757,7 @@ export function LineChart({
                 startTime: String(bucket.from),
                 endTime: String(bucket.to),
                 periodicity: finer.toLowerCase(),
+                ...controlFlags(),
               },
             });
           }}
@@ -1803,14 +1847,20 @@ function ChartActionIcons({
     setMoreOpen(false);
   };
 
-  const settingGroups: Array<{ heading: string; items: Array<{ key: keyof ChartDisplay; label: string }> }> = [
+  const settingGroups: Array<{
+    heading: string;
+    items: Array<{ key: keyof ChartDisplay; label: string; disabledWhen?: keyof ChartDisplay }>;
+  }> = [
     {
       heading: 'Chart Control',
       items: [
-        { key: 'legends',   label: 'Legends' },
-        { key: 'dataLabel', label: 'Data Labels' },
-        { key: 'clipping',  label: 'Clipping' },
-        { key: 'zoom',      label: 'Zoom' },
+        { key: 'legends',         label: 'Legends' },
+        { key: 'dataLabel',       label: 'Data Labels' },
+        // Clipping & Inexact Multiple are mutually exclusive (mirrors
+        // ColumnChart): Clipping is disabled while Inexact Multiple is on.
+        { key: 'clipping',        label: 'Clipping', disabledWhen: 'inexactMultiple' },
+        { key: 'inexactMultiple', label: 'Inexact Multiple' },
+        { key: 'zoom',            label: 'Zoom' },
       ],
     },
   ];
@@ -1868,6 +1918,7 @@ function ChartActionIcons({
                       title={it.label}
                       selectionType="Multiple"
                       isSelected={display[it.key]}
+                      isDisabled={it.disabledWhen ? display[it.disabledWhen] : undefined}
                       onClick={() => toggle(it.key)}
                     />
                   ))}
