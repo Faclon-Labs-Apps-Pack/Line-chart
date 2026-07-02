@@ -13,6 +13,10 @@ export interface SeriesSlot {
   value: number | null;
   quality: string;
   isPartial?: boolean;
+  /** Shift name this bucket belongs to — set by the backend when the request
+   *  carried a `shifts` array. Used to plot each bucket under the correct shift
+   *  series instead of re-deriving the window client-side. */
+  shift?: string;
 }
 
 export interface SeriesAggregation {
@@ -41,6 +45,17 @@ export interface SeriesPayload {
    *  with comparison params (comparisonMode + comparisonStartTime/EndTime).
    *  Index-aligned to `slots` (comparisonSlots[i] pairs with slots[i]). */
   comparisonSlots?: SeriesSlot[];
+}
+
+// A single shift window (time-of-day range). Mirrors the SDK's GTPShift shape
+// that the configurator stores in timeTabConfig.shifts. Forwarded verbatim to
+// resolveAndCompute so the backend can bucket series into shift windows.
+export interface ShiftWindow {
+  id: string;
+  name: string;
+  color: string;
+  startTime: string; // "HH:mm"
+  endTime: string;   // "HH:mm"
 }
 
 export interface ScalarBinding { key: string; topic: string; }
@@ -108,6 +123,12 @@ export type WidgetEvent =
          *  same call returns `comparisonSlots` alongside the current `slots`. */
         comparisonStartTime?: string;
         comparisonEndTime?: string;
+        /** Present only when the shift toggle is active. The data layer forwards
+         *  these to resolveAndCompute so the backend buckets each series into the
+         *  configured shift windows (aggregated by `shiftAggregator`). Omitted
+         *  when shift is off, so the same call returns the normal series. */
+        shifts?: ShiftWindow[];
+        shiftAggregator?: string;
       };
     }
   | { type: 'FILTER_CHANGE'; payload: Record<string, unknown> };
@@ -419,6 +440,10 @@ export interface HostTimeConfig {
   allDurations: TimeTabUIConfig['allDurations'];
   defaultPeriodicity: string;
   shifts?: TimeTabUIConfig['shifts'];
+  /** Aggregation operator applied within each shift window (Sum/Average/Min/
+   *  Max/First/Last as configured in the Time tab's Shift Aggregator dropdown).
+   *  Read by the widget and forwarded to resolveAndCompute when shift is on. */
+  shiftAggregator?: string;
   comparisonMode?: boolean;
   deviationPattern?: string;
   sourceDeviationOverrides?: Record<string, string>;

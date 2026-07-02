@@ -320,6 +320,10 @@ function toHostTimeConfig(t: TimeTabUIConfig): HostTimeConfig {
       pickerType === 'fixed' ? (t.fixed?.shifts ?? t.shifts ?? []) :
       pickerType === 'global' ? ((t.global as any)?.shifts ?? t.shifts ?? []) :
       (t.shifts ?? []),
+    shiftAggregator:
+      pickerType === 'fixed' ? ((t.fixed as any)?.shiftAggregator ?? (t as any).shiftAggregator) :
+      pickerType === 'global' ? ((t.global as any)?.shiftAggregator ?? (t as any).shiftAggregator) :
+      (t as any).shiftAggregator,
     comparisonMode:
       pickerType === 'fixed' ? t.fixed?.comparisonMode :
       pickerType === 'global' ? t.global?.comparisonMode :

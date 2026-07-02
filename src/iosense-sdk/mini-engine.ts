@@ -1,4 +1,4 @@
-import { LineChartEnvelope, LineChartUIConfig, DataEntry, SeriesPayload, GTPPreset } from './types';
+import { LineChartEnvelope, LineChartUIConfig, DataEntry, SeriesPayload, GTPPreset, ShiftWindow } from './types';
 import { resolveAndCompute } from './api';
 
 interface MiniEngineCtx {
@@ -11,6 +11,13 @@ interface MiniEngineCtx {
    *  and returns `comparisonSlots` on each series alongside the current `slots`
    *  — one call, no separate comparison fetch. */
   comparison?: { startTime: number; endTime: number };
+  /** Shift windows. When set, resolveAndCompute buckets each series into these
+   *  time-of-day windows, aggregated by `shiftAggregator`. Sent only while the
+   *  widget's shift toggle is on. */
+  shifts?: ShiftWindow[];
+  /** Aggregation operator applied within each shift window (backend vocab, e.g.
+   *  'mean'). Paired with `shifts`. */
+  shiftAggregator?: string;
 }
 
 export interface MiniEngineResult {
@@ -78,6 +85,9 @@ export async function resolve(
       endTime,
       resolution,
       ctx.comparison,
+      ctx.shifts && ctx.shifts.length
+        ? { shifts: ctx.shifts, shiftAggregator: ctx.shiftAggregator }
+        : undefined,
     );
     const data: DataEntry[] = items.map((item) => ({ key: item.key, value: item.value }));
     // Diagnostic — summarize series payload shape per key so we can see the

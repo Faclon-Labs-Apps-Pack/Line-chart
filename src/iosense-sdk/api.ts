@@ -1,4 +1,4 @@
-import { BindingEntry, SeriesPayload, SeriesMeta, SeriesSlot } from './types';
+import { BindingEntry, SeriesPayload, SeriesMeta, SeriesSlot, ShiftWindow } from './types';
 
 // ---------------------------------------------------------------------------
 // Token + API-base capture — reads the Bearer token AND the API base URL from
@@ -96,6 +96,10 @@ export async function resolveAndCompute(
    *  (index-aligned to `slots`). This is the native comparison path — no second
    *  request needed. */
   comparison?: { startTime: number; endTime: number },
+  /** Shift config. When provided, the backend buckets each series into the given
+   *  time-of-day windows, aggregated by `shiftAggregator`. Sent only while the
+   *  widget's shift toggle is on. */
+  shift?: { shifts: ShiftWindow[]; shiftAggregator?: string },
 ): Promise<Array<{ key: string; value: string | number | null | SeriesPayload }>> {
   const body: Record<string, unknown> = { graph: GRAPH, config, startTime, endTime };
   if (resolution) {
@@ -108,6 +112,12 @@ export async function resolveAndCompute(
     body.comparisonMode = true;
     body.comparisonStartTime = comparison.startTime;
     body.comparisonEndTime = comparison.endTime;
+  }
+  if (shift && shift.shifts.length) {
+    // Shift-aware request: the backend groups each series' points into these
+    // time-of-day windows and aggregates within each by `shiftAggregator`.
+    body.shifts = shift.shifts;
+    if (shift.shiftAggregator) body.shiftAggregator = shift.shiftAggregator;
   }
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (authentication) headers.Authorization = bearer(authentication);

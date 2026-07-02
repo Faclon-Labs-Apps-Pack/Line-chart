@@ -93,6 +93,7 @@ interface LineChartWidgetProps {
     endTime?: number | null;
     fixedDuration?: import('../../iosense-sdk/types').Duration | null;
     shifts?: Array<{ id: string; name: string; color: string; startTime: string; endTime: string }>;
+    shiftAggregator?: string;
     timezone?: string;
     comparisonMode?: boolean;
     deviationPattern?: string;
@@ -344,6 +345,35 @@ function comparisonWindowPayload(
   return { comparisonStartTime: String(startMs - dur), comparisonEndTime: String(startMs) };
 }
 
+// Map the configurator's Shift Aggregator label (Sum/Average/Min/Max/First/Last)
+// to the backend operator vocabulary used by resolveAndCompute's aggregation
+// (`mean` for Average; the rest pass through lowercased).
+const SHIFT_AGGREGATOR_OPERATOR: Record<string, string> = {
+  sum: 'sum',
+  average: 'mean',
+  mean: 'mean',
+  min: 'min',
+  max: 'max',
+  first: 'first',
+  last: 'last',
+};
+function shiftAggregatorOperator(label?: string): string | undefined {
+  if (!label) return undefined;
+  return SHIFT_AGGREGATOR_OPERATOR[label.toLowerCase()] ?? label.toLowerCase();
+}
+
+// Shift fields for a TIME_CHANGE payload — the configured shift windows plus the
+// resolved aggregator operator. The data layer forwards these to
+// resolveAndCompute so the backend buckets each series into the shift windows.
+// Returns {} when there are no shifts (nothing to send).
+function shiftEventPayload(
+  shifts: Array<{ id: string; name: string; color: string; startTime: string; endTime: string }>,
+  aggregator?: string,
+): { shifts?: typeof shifts; shiftAggregator?: string } {
+  if (!shifts.length) return {};
+  return { shifts, shiftAggregator: shiftAggregatorOperator(aggregator) };
+}
+
 export function LineChart({
   config: rawConfig,
   data = [],
@@ -367,12 +397,17 @@ export function LineChart({
     if (!tc?.defaultDurationId && !tc?.fixedDuration) return;
     const { startTime, endTime } = computeRange(tc);
     const periodicity = computeDefaultPeriodicity(tc).toLowerCase();
+    // Shift auto-defaults on when the widget loads with shifts configured
+    // (non-GTP), so include the shift fields in the first request.
+    const shifts = tc?.shifts ?? [];
+    const shiftOn = shifts.length > 0 && !isGTPModeRef.current;
     ev({
       type: 'TIME_CHANGE',
       payload: {
         startTime: String(startTime),
         endTime: String(endTime),
         periodicity,
+        ...(shiftOn ? shiftEventPayload(shifts, tc?.shiftAggregator) : {}),
       },
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -406,6 +441,7 @@ export function LineChart({
   // Shift state — committed (shiftToggleOn) vs draft (draftShiftOn, in-picker only).
   // Draft is synced from committed on every open; committed is set on Apply.
   const cfgShifts = timeConfig?.shifts ?? [];
+  const cfgShiftAggregator = timeConfig?.shiftAggregator;
   const cfgShiftKey = cfgShifts.map((s) => s.id).join('|');
   const isExternalTime =
     timeConfig?.pickerType === 'fixed' ||
@@ -486,21 +522,69 @@ export function LineChart({
     });
   }, [activeChart, chartIndex, data]);
 
+  // Shift is driven by DATA, not the toggle — same contract as comparison above:
+  // whenever the resolved series carry backend-tagged shift slots (slot.shift),
+  // render the shift chart. The Shift toggle + config shifts only govern whether
+  // the widget REQUESTS shift bucketing (see shiftActiveRef / the TIME_CHANGE
+  // emitters); once shift-tagged data arrives, the shift view shows regardless
+  // of the current toggle state.
+  const hasShiftData = useMemo(() => {
+    const configured = activeChart?.series ?? [];
+    return configured.some((_, i) => {
+      const payload =
+        getSeriesData(`charts[${chartIndex}].series[${i}].unsPath`, data) ??
+        getSeriesData(`charts[${chartIndex}].series[${i}].dataSource`, data);
+      const slots = payload?.slots;
+      return Array.isArray(slots) &&
+        slots.some((slot) => typeof slot?.shift === 'string' && slot.shift.length > 0);
+    });
+  }, [activeChart, chartIndex, data]);
+
   const chartMode = useMemo<'normal' | 'comparison' | 'shift'>(() => {
     if (hasComparisonData) return 'comparison';
-    if (shiftToggleOn && cfgShifts.length > 0) return 'shift';
+    if (hasShiftData) return 'shift';
     return 'normal';
-  }, [hasComparisonData, shiftToggleOn, cfgShifts.length]);
+  }, [hasComparisonData, hasShiftData]);
 
   // Latest committed comparison flag for TIME_CHANGE emitters that fire from
   // effects/callbacks whose dependency lists don't track it.
   const comparisonActiveRef = useRef(false);
   comparisonActiveRef.current = cfgComparisonMode && comparisonToggleOn;
 
+  // Latest committed shift flag for TIME_CHANGE emitters that fire from
+  // effects/callbacks whose dependency lists don't track it. Shift and
+  // comparison are mutually exclusive, so a payload carries at most one.
+  const shiftActiveRef = useRef(false);
+  shiftActiveRef.current = shiftToggleOn && cfgShifts.length > 0;
+
+  // Extra TIME_CHANGE fields for the currently committed mode. Shift and
+  // comparison are mutually exclusive — send at most one. Used by the emit
+  // sites whose closures read the latest committed flags via refs (mount,
+  // preset, periodicity, drilldown). onRangeChange builds these inline from
+  // the just-committed draft values instead (refs haven't re-rendered yet).
+  const modeEventFields = (startMs: number, endMs: number) =>
+    shiftActiveRef.current
+      ? shiftEventPayload(cfgShifts, cfgShiftAggregator)
+      : comparisonActiveRef.current
+        ? comparisonWindowPayload(startMs, endMs)
+        : {};
+
+  // Active periodicity (declared here — ahead of the shift/highcharts memos that
+  // read it — so shift rendering can branch on granularity). The DatePicker's
+  // periodicity dropdown drives it; effects further below keep it in sync.
+  const [selectedPeriodicity, setSelectedPeriodicity] = useState<string>(
+    () => computeDefaultPeriodicity(timeConfig),
+  );
+  // Sub-daily granularity (minute/hourly): shifts are contiguous time-of-day
+  // blocks that should join into ONE continuous line (boundary bridging +
+  // connectNulls off). At Daily and coarser each shift is its own trend line
+  // across days, connected across gaps (connectNulls on, no bridging).
+  const shiftSubDaily = ['minute', 'hourly'].includes(selectedPeriodicity.toLowerCase());
+
   // Resolve each configured series from `data` (series binding key matches the
   // configurator's: charts[ci].series[si].dataSource). Categories are the slot
   // labels of the longest series (backend returns aligned, pre-bucketed slots).
-  const { series, categories, catTimestamps } = useMemo(() => {
+  const { series, categories, catTimestamps, catShifts } = useMemo(() => {
     const configured = activeChart?.series ?? [];
     const resolved = configured.map((s, si) => {
       const payload =
@@ -512,12 +596,16 @@ export function LineChart({
     });
     const longest = resolved.reduce(
       (best, r) => (r.slots.length > best.length ? r.slots : best),
-      [] as { label: string; value: number | null; from: number; to: number }[],
+      [] as { label: string; value: number | null; from: number; to: number; shift?: string }[],
     );
     const cats = longest.map((slot) => slot.label);
     // Store from/to timestamps per bucket — used by the "Time drilldown"
     // onPointClick handler to narrow the time range on click.
     const catTs = longest.map((slot) => ({ from: (slot as any).from as number, to: (slot as any).to as number }));
+    // Shift name per bucket, straight from the backend's per-slot `shift` tag.
+    // Drives shift-series assignment so each bucket plots under the shift the
+    // backend assigned it to (no client-side time-window re-derivation).
+    const catSh = longest.map((slot) => (slot as any).shift as string | undefined);
     const out = resolved.map((r, i) => ({
       name: r.def.name || `Series ${i + 1}`,
       color: r.def.color,
@@ -529,7 +617,7 @@ export function LineChart({
         valueDecimals: typeof r.def.dataPrecision === 'number' ? r.def.dataPrecision : 2,
       },
     }));
-    return { series: out, categories: cats, catTimestamps: catTs };
+    return { series: out, categories: cats, catTimestamps: catTs, catShifts: catSh };
   }, [activeChart, chartIndex, data]);
 
   // The SDK's `shift` and `comparison` props own rendering in those modes;
@@ -659,6 +747,24 @@ export function LineChart({
           shiftIndex: shIdx,
           shiftColor: shift.color,
           data: s.data.map((v, ci) => {
+            // Prefer the backend's per-bucket shift tag — with multiple shifts
+            // it authoritatively says which shift each bucket belongs to. Match
+            // by shift name (the tag is the shift's name).
+            const tag = catShifts[ci];
+            if (tag !== undefined) {
+              if (tag === shift.name) return v;
+              // Boundary bridge — sub-daily (minute/hourly) ONLY. Here shifts
+              // are contiguous time-of-day blocks, so emitting the value at the
+              // FIRST bucket after this shift's run (the next shift's opening
+              // bucket) makes segments join into ONE continuous line: 00–08,
+              // 08–16, 16–00 share endpoints. At Daily and coarser we DON'T
+              // bridge — each shift stays its own line across days (connected
+              // via connectNulls, see highchartsOptions).
+              if (shiftSubDaily && catShifts[ci - 1] === shift.name) return v;
+              return null;
+            }
+            // Fall back to the time-window check only when the backend didn't
+            // tag the bucket (e.g. an older backend that ignores `shifts`).
             const ts = catTimestamps[ci];
             if (!ts?.from) return null;
             return isSlotInShift(ts.from, shift.startTime, shift.endTime, tz) ? v : null;
@@ -682,7 +788,7 @@ export function LineChart({
       onToggleSource: () => {},
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chartMode, cfgShiftKey, series, catTimestamps, enabledShiftIds, activeChart, timeConfig?.timezone]);
+  }, [chartMode, cfgShiftKey, series, catTimestamps, catShifts, enabledShiftIds, activeChart, timeConfig?.timezone, shiftSubDaily]);
 
   // Plot lines (fixed values only — periodicity-dependent lines need the live
   // periodicity context which the host owns, so they're rendered server-side).
@@ -967,6 +1073,17 @@ export function LineChart({
       zooming: { type: chartDisplay.zoom ? 'x' : (null as any) },
       clip: chartDisplay.clipping,
     };
+    // Shift mode — connectNulls depends on granularity:
+    //  • Sub-daily (minute/hourly): OFF. Each shift carries its own buckets plus
+    //    the next shift's opening bucket (boundary bridge in shiftProp), so the
+    //    shifts join end-to-end into ONE continuous line. connectNulls:true here
+    //    would instead arc a shift ACROSS the other shifts' hours (e.g. Shift 1
+    //    jumping 07:00 → next day 00:00).
+    //  • Daily and coarser: ON. Each shift is one point per day; connecting
+    //    across the other shifts' buckets draws each shift as its own trend line.
+    if (chartMode === 'shift') {
+      opts.plotOptions = { series: { connectNulls: !shiftSubDaily } };
+    }
     // startOnTick/endOnTick ensure Highcharts always pads above and below
     // the data range, preventing a single-tick collapsed axis when all
     // data points share the same value (flat/constant data).
@@ -1059,7 +1176,7 @@ export function LineChart({
       };
     }
     return opts as any;
-  }, [axisColors, miscColors, multiAxis, effectiveSeries, effectiveTooltipOnlyFlags, style?.card?.wrapInCard, style?.card?.backgroundColor, chartDisplay.zoom, chartDisplay.clipping, anomalyOverlay, chartMode, plotLines, plotBands, activeChart]);
+  }, [axisColors, miscColors, multiAxis, effectiveSeries, effectiveTooltipOnlyFlags, style?.card?.wrapInCard, style?.card?.backgroundColor, chartDisplay.zoom, chartDisplay.clipping, anomalyOverlay, chartMode, plotLines, plotBands, activeChart, shiftSubDaily]);
 
   // The data table is portalled into the chart card (sibling of the canvas).
   const [cardEl, setCardEl] = useState<HTMLDivElement | null>(null);
@@ -1099,9 +1216,6 @@ export function LineChart({
   }, [defaultDurationId]);
 
   const [periodicityOpen, setPeriodicityOpen] = useState(false);
-  const [selectedPeriodicity, setSelectedPeriodicity] = useState<string>(
-    () => computeDefaultPeriodicity(timeConfig),
-  );
   // Once the user manually picks a periodicity (dropdown or drilldown) we stop
   // auto-defaulting to the coarsest option so their choice sticks.
   const periodicityTouchedRef = useRef(false);
@@ -1168,7 +1282,7 @@ export function LineChart({
         startTime: String(evStart),
         endTime: String(evEnd),
         periodicity: nextPeriodicity.toLowerCase(),
-        ...(comparisonActiveRef.current ? comparisonWindowPayload(evStart, evEnd) : {}),
+        ...modeEventFields(evStart, evEnd),
       },
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1437,6 +1551,9 @@ export function LineChart({
               // re-rendered yet at this point.
               const vStart = new Date(v.start).getTime();
               const vEnd = new Date(v.end).getTime();
+              // Draft values were just committed by commitToggles() above; the
+              // committed refs haven't re-rendered yet, so read the drafts here.
+              const shiftActive = draftShiftOn && cfgShifts.length > 0;
               const compActive = cfgComparisonMode && draftComparisonOn;
               onEvent({
                 type: 'TIME_CHANGE',
@@ -1444,7 +1561,11 @@ export function LineChart({
                   startTime: String(vStart),
                   endTime: String(vEnd),
                   periodicity: nextPeriodicity.toLowerCase(),
-                  ...(compActive ? comparisonWindowPayload(vStart, vEnd) : {}),
+                  ...(shiftActive
+                    ? shiftEventPayload(cfgShifts, cfgShiftAggregator)
+                    : compActive
+                      ? comparisonWindowPayload(vStart, vEnd)
+                      : {}),
                 },
               });
             }}
@@ -1457,7 +1578,7 @@ export function LineChart({
               setSelectedPreset(v);
             }}
             placeholder="Select date range"
-            showShift={cfgShifts.length > 0 && ['minute', 'hourly'].includes(selectedPeriodicity)}
+            showShift={cfgShifts.length > 0 && ['minute', 'hourly'].includes(selectedPeriodicity.toLowerCase())}
             shiftEnabled={draftShiftOn}
             onShiftToggle={draftActivateShift}
             showComparison={cfgComparisonMode}
@@ -1494,9 +1615,7 @@ export function LineChart({
                               startTime: String(startTime),
                               endTime: String(endTime),
                               periodicity: opt.toLowerCase(),
-                              ...(comparisonActiveRef.current
-                                ? comparisonWindowPayload(startTime, endTime)
-                                : {}),
+                              ...modeEventFields(startTime, endTime),
                             },
                           });
                         }}
