@@ -821,6 +821,25 @@ export function LineChartConfiguration({
   const [timeTabConfig, setTimeTabConfig] = useState<TimeTabUIConfig | undefined>(
     config?.timeTabConfig ?? (config?.timeConfig as TimeTabUIConfig | undefined),
   );
+  // Ref tracks the latest committed timeTabConfig without triggering a re-render.
+  // Used in emit() so other emit calls (e.g. chart changes) don't lose the latest
+  // time config. NOT fed back into TimeTabConfiguration's `value` prop — doing so
+  // would reset the SDK's internal panel state and close the "Add Shift" form mid-edit.
+  const timeTabConfigRef = useRef<TimeTabUIConfig | undefined>(
+    config?.timeTabConfig ?? (config?.timeConfig as TimeTabUIConfig | undefined),
+  );
+  // The SDK's TimeTabConfiguration fires onChange on initial mount (an initialization
+  // callback). If that value differs even slightly from what's in the envelope (e.g.
+  // normalization), the emit would overwrite the widget's runtime time selection with
+  // the configured default — resetting "Previous 3 months" back to "Today". Block all
+  // onChange calls until after the first paint cycle (when the SDK's mount callback
+  // has already fired and been discarded).
+  const timeConfigSettledRef = useRef(false);
+  useEffect(() => {
+    const t = setTimeout(() => { timeConfigSettledRef.current = true; }, 0);
+    return () => clearTimeout(t);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Pending delete (modal) — keyed by section so a single modal can serve all.
   const [pendingDelete, setPendingDelete] = useState<
@@ -849,6 +868,7 @@ export function LineChartConfiguration({
           : !!(tc?.disableTimeSelection || (tc?.futureDaysAllowed && tc.futureDaysAllowed !== ''));
       setAdvanceSettings(shouldAutoOpen);
       setTimeTabConfig(tc);
+      timeTabConfigRef.current = tc;
       setChartEditMode(false);
       setNewChartDraft(false);
     }
@@ -948,6 +968,28 @@ export function LineChartConfiguration({
     return () => obs.disconnect();
   }, [topTab]);
 
+  // The SDK's TimeTabConfiguration adds document.addEventListener('mousedown') that
+  // closes all open panels unless the click target is inside .fds-ttc__panel-modal.
+  // SelectInput portals its dropdown to <body> as a sibling of the modal backdrop —
+  // outside .fds-ttc__panel-modal — so clicking any dropdown option trips the close
+  // handler before the option registers. Fix: intercept on document.body (fires before
+  // document in the bubble chain) and stop propagation when clicking a portaled popover
+  // while a TTC panel is open, so the SDK's document handler never fires.
+  useEffect(() => {
+    function guardTTCPanels(e: MouseEvent) {
+      const target = e.target as Element | null;
+      if (!target) return;
+      if (
+        target.closest('.fds-select-input__popover') &&
+        document.querySelector('.fds-ttc__panel-modal')
+      ) {
+        e.stopPropagation();
+      }
+    }
+    document.body.addEventListener('mousedown', guardTTCPanels);
+    return () => document.body.removeEventListener('mousedown', guardTTCPanels);
+  }, []);
+
   // Derived: GTPChart[] view of local charts — passed to TimeTabConfiguration's
   // `charts` prop (SDK 0.6.5+) so the SDK can render the per-source deviation
   // override section natively when Comparison Mode + Advance Settings are on.
@@ -987,7 +1029,7 @@ export function LineChartConfiguration({
       advanceSettings: overrides?.advanceSettings ?? advanceSettings,
     };
 
-    onChange(buildEnvelope(config, uiConfig, overrides?.timeTabConfig ?? timeTabConfig));
+    onChange(buildEnvelope(config, uiConfig, overrides?.timeTabConfig ?? timeTabConfigRef.current));
   }
 
   // Update one field across the active chart, persisting downstream.
@@ -1391,19 +1433,27 @@ export function LineChartConfiguration({
 
   // ---- Time tab mutator ----------------------------------------------------
   function handleTimeConfigChange(next: TimeTabUIConfig) {
+    // Guard #0: drop the SDK's on-mount initialization callback. The component
+    // fires onChange immediately on mount; if its normalized value differs from
+    // the envelope's default it would emit and reset the widget's runtime time
+    // selection. timeConfigSettledRef turns true after the first paint cycle.
+    if (!timeConfigSettledRef.current) return;
     // The SDK's TimeTabConfiguration fires onChange on mount and whenever the
     // `charts` prop changes (e.g. adding/removing a data source). Guard #1:
     // bail out if the full value is already identical to avoid a no-op emit.
-    if (JSON.stringify(next) === JSON.stringify(timeTabConfig)) return;
+    if (JSON.stringify(next) === JSON.stringify(timeTabConfigRef.current)) return;
     // Guard #2: if the SDK reverted defaultPeriodicity back to a default while
     // the user had already chosen one, keep the user's choice. This prevents
     // adding/removing a data source from silently resetting the periodicity.
     const merged: TimeTabUIConfig =
-      timeTabConfig?.defaultPeriodicity && next.defaultPeriodicity !== timeTabConfig.defaultPeriodicity
-        ? { ...next, defaultPeriodicity: timeTabConfig.defaultPeriodicity }
+      timeTabConfigRef.current?.defaultPeriodicity && next.defaultPeriodicity !== timeTabConfigRef.current.defaultPeriodicity
+        ? { ...next, defaultPeriodicity: timeTabConfigRef.current.defaultPeriodicity }
         : next;
-    if (JSON.stringify(merged) === JSON.stringify(timeTabConfig)) return;
-    setTimeTabConfig(merged);
+    if (JSON.stringify(merged) === JSON.stringify(timeTabConfigRef.current)) return;
+    // Update the ref but NOT the state — feeding the SDK's own output back as
+    // its `value` prop causes the component to reset its internal panel state,
+    // closing the "Add Shift" / "Add Duration" form mid-edit.
+    timeTabConfigRef.current = merged;
     emit({ timeTabConfig: merged });
   }
 
@@ -1622,7 +1672,8 @@ export function LineChartConfiguration({
                   // Empty state should render rows at full opacity with their `+`
                   // visible. Only grey-out when Chart Settings is being edited.
                   const disabled = inEditMode;
-                  const hasItems = hasCounter && count > 0;
+                  // Axis section always has at least the non-deletable Left axis item.
+                  const hasItems = (hasCounter && count > 0) || sectionKey === 'Axis';
                   return (
                     <div
                       key={s}
@@ -1663,6 +1714,31 @@ export function LineChartConfiguration({
                       }}
                     >
                       {/* Body = list of item cards */}
+                      {sectionKey === 'Axis' && (
+                        <p className="lc-config__axis-hint BodyXSmallRegular">
+                          Left axis is used by default. Add a right axis for different values.
+                        </p>
+                      )}
+                      {sectionKey === 'Axis' && (
+                        <div
+                          className="lc-config__default-axis-row"
+                          role="button"
+                          tabIndex={0}
+                          onClick={() => openEditPanel('Axis', '__default_left__')}
+                          onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') openEditPanel('Axis', '__default_left__'); }}
+                        >
+                          <span className="BodySmallMedium lc-config__default-axis-label">
+                            {activeChart?.defaultAxis?.yAxisLabel || 'Left Axis'}
+                          </span>
+                          <span className="lc-config__default-axis-meta BodyXSmallRegular">
+                            {(() => {
+                              const rightSeriesIds = new Set((activeChart?.axes ?? []).flatMap((a) => a.linkedSeriesIds));
+                              const count = (activeChart?.series ?? []).filter((s) => !rightSeriesIds.has(s._id)).length;
+                              return `Left • ${count} Data Source${count !== 1 ? 's' : ''}`;
+                            })()}
+                          </span>
+                        </div>
+                      )}
                       <SectionItemList
                         section={sectionKey}
                         series={series}
@@ -1785,7 +1861,19 @@ export function LineChartConfiguration({
                   onReady={setEditorBinding}
                 />
               )}
-              {addPanel.section === 'Axis' && (
+              {addPanel.section === 'Axis' && addPanel.mode === 'edit' && addPanel.itemId === '__default_left__' ? (
+                <DefaultAxisEditor
+                  initial={activeChart?.defaultAxis ?? {}}
+                  onSubmit={(v) => {
+                    updateActiveChart((c) => ({
+                      ...c,
+                      defaultAxis: { ...c.defaultAxis, ...v },
+                    }));
+                    closeAddPanel();
+                  }}
+                  onReady={(b) => setEditorBinding(b)}
+                />
+              ) : addPanel.section === 'Axis' ? (
                 <AxisEditor
                   key={addPanel.mode === 'edit' ? addPanel.itemId : 'new'}
                   initial={(editingItem as LineChartAxis | null) ?? null}
@@ -1802,13 +1890,14 @@ export function LineChartConfiguration({
                   }}
                   onReady={setEditorBinding}
                 />
-              )}
+              ) : null}
               {addPanel.section === 'Plot Line' && (
                 <PlotLineEditor
                   key={addPanel.mode === 'edit' ? addPanel.itemId : 'new'}
                   initial={(editingItem as LineChartPlotLine | null) ?? null}
                   existingCount={plotLines.length}
                   axes={axes}
+                  defaultAxisLabel={activeChart?.defaultAxis?.yAxisLabel || 'Left'}
                   unsTree={unsTree}
                   isLoadingTree={isLoadingTree}
                   loadWorkspaces={loadWorkspaces}
@@ -1827,6 +1916,7 @@ export function LineChartConfiguration({
                   key={addPanel.mode === 'edit' ? addPanel.itemId : 'new'}
                   initial={(editingItem as LineChartPlotBand | null) ?? null}
                   axes={axes}
+                  defaultAxisLabel={activeChart?.defaultAxis?.yAxisLabel || 'Left'}
                   existingCount={plotBands.length}
                   onSubmit={(b) => {
                     if (addPanel.mode === 'edit') handleUpdatePlotBand(b);
@@ -2115,7 +2205,6 @@ function ChartSettingsBlock({
             necessityIndicator="required"
             onChange={({ value }: { name: string; value: string }) => setDraftTitle(value)}
           />
-          <ChartTypeSelect value={draftChartType} onChange={setDraftChartType} />
           <TextInput
             label="Chart Description"
             labelPosition="top"
@@ -2164,7 +2253,6 @@ function ChartSettingsBlock({
             necessityIndicator="required"
             onChange={({ value }: { name: string; value: string }) => setNewTitle(value)}
           />
-          <ChartTypeSelect value={newChartType} onChange={setNewChartType} />
           <TextInput
             label="Chart Description"
             labelPosition="top"
@@ -2230,9 +2318,6 @@ function ChartSettingsBlock({
             necessityIndicator="required"
             onChange={({ value }: { name: string; value: string }) => setEditTitle(value)}
           />
-          {/* Chart Type is locked while editing an existing chart — only the
-              title/description can change. */}
-          <ChartTypeSelect value={editChartType} onChange={setEditChartType} disabled />
           <TextInput
             label="Chart Description"
             labelPosition="top"
@@ -2391,7 +2476,6 @@ function ChartSettingsDisplayMode({
             required
           />
         )}
-        <ChartTypeSelect value={chartType} onChange={onChangeChartType} />
         <ReadOnlyField
           label="Chart Description"
           value={activeChart?.description ?? ''}
@@ -3331,6 +3415,38 @@ function DataSourceEditor({
 }
 
 // ===========================================================================
+// Editor: Default Left Axis (always present, maps to activeChart.defaultAxis)
+// ===========================================================================
+
+interface DefaultAxisEditorProps {
+  initial: { yAxisLabel?: string };
+  onSubmit: (v: { yAxisLabel: string; yAxisMin: number | null; yAxisMax: number | null }) => void;
+  onReady: (b: EditorBinding) => void;
+}
+
+function DefaultAxisEditor({ initial, onSubmit, onReady }: DefaultAxisEditorProps) {
+  const [label, setLabel] = useState(initial?.yAxisLabel ?? '');
+
+  const submit = useCallback(() => {
+    onSubmit({ yAxisLabel: label.trim(), yAxisMin: null, yAxisMax: null });
+  }, [label, onSubmit]);
+
+  useEditorBinding(true, submit, onReady);
+
+  return (
+    <div className="lc-config__editor">
+      <TextInput
+        label="Y Axis Label"
+        labelPosition="top"
+        placeholder="e.g. Flow Rate"
+        value={label}
+        onChange={({ value }: { name: string; value: string }) => setLabel(value)}
+      />
+    </div>
+  );
+}
+
+// ===========================================================================
 // Editor: Axis
 // ===========================================================================
 
@@ -3468,6 +3584,7 @@ interface PlotLineEditorProps {
   initial: LineChartPlotLine | null;
   existingCount: number;
   axes: LineChartAxis[];
+  defaultAxisLabel?: string;
   unsTree: import('@faclon-labs/design-sdk/UNSPathInput').UNSTree;
   isLoadingTree: boolean;
   loadWorkspaces: () => void;
@@ -3481,6 +3598,7 @@ function PlotLineEditor({
   initial,
   existingCount,
   axes,
+  defaultAxisLabel = 'Left',
   unsTree,
   isLoadingTree,
   loadWorkspaces,
@@ -3576,34 +3694,32 @@ function PlotLineEditor({
         onChange={(hex: string) => setColor(hex)}
       />
 
-      {axes.length > 0 && (
-        <SelectInput
-          label="Axis"
-          placeholder="Select axis"
-          value={axisId ? (axes.find((a) => a._id === axisId)?.name ?? 'Left') : 'Left'}
-          isOpen={axisDropdownOpen}
-          onOpenChange={setAxisDropdownOpen}
-          onClick={() => setAxisDropdownOpen((o) => !o)}
-        >
-          <DropdownMenu>
+      <SelectInput
+        label="Axis"
+        placeholder="Select axis"
+        value={axisId ? (axes.find((a) => a._id === axisId)?.name ?? defaultAxisLabel) : defaultAxisLabel}
+        isOpen={axisDropdownOpen}
+        onOpenChange={setAxisDropdownOpen}
+        onClick={() => setAxisDropdownOpen((o) => !o)}
+      >
+        <DropdownMenu>
+          <ActionListItem
+            title={defaultAxisLabel}
+            selectionType="Single"
+            isSelected={!axisId}
+            onClick={() => { setAxisId(''); setAxisDropdownOpen(false); }}
+          />
+          {axes.map((a) => (
             <ActionListItem
-              title="Left"
+              key={a._id}
+              title={a.name}
               selectionType="Single"
-              isSelected={!axisId}
-              onClick={() => { setAxisId(''); setAxisDropdownOpen(false); }}
+              isSelected={axisId === a._id}
+              onClick={() => { setAxisId(a._id); setAxisDropdownOpen(false); }}
             />
-            {axes.map((a) => (
-              <ActionListItem
-                key={a._id}
-                title={a.name}
-                selectionType="Single"
-                isSelected={axisId === a._id}
-                onClick={() => { setAxisId(a._id); setAxisDropdownOpen(false); }}
-              />
-            ))}
-          </DropdownMenu>
-        </SelectInput>
-      )}
+          ))}
+        </DropdownMenu>
+      </SelectInput>
 
       <div className="lc-config__date-row">
         <TextInput
@@ -3722,6 +3838,7 @@ function PlotLineEditor({
 interface PlotBandEditorProps {
   initial: LineChartPlotBand | null;
   axes: LineChartAxis[];
+  defaultAxisLabel?: string;
   existingCount: number;
   onSubmit: (band: LineChartPlotBand) => void;
   onReady: (b: EditorBinding) => void;
@@ -3730,6 +3847,7 @@ interface PlotBandEditorProps {
 function PlotBandEditor({
   initial,
   axes,
+  defaultAxisLabel = 'Left',
   existingCount,
   onSubmit,
   onReady,
@@ -3758,7 +3876,7 @@ function PlotBandEditor({
     return m;
   }, [axes]);
 
-  const axisLabel = axisId ? axesById.get(axisId)?.name ?? 'Left' : 'Left';
+  const axisLabel = axisId ? axesById.get(axisId)?.name ?? defaultAxisLabel : defaultAxisLabel;
 
   const submit = useCallback(() => {
     if (!isValid) return;
@@ -3800,7 +3918,7 @@ function PlotBandEditor({
       >
         <DropdownMenu>
           <ActionListItem
-            title="Left"
+            title={defaultAxisLabel}
             selectionType="Single"
             isSelected={!axisId}
             onClick={() => {
@@ -4426,7 +4544,7 @@ function AnomalyEditor({
       </SelectInput>
 
       <RadioGroup
-        label="Label"
+        label="Source Type"
         name="anomaly-label-mode"
         size="Medium"
         value={labelMode}
@@ -4467,7 +4585,7 @@ function AnomalyEditor({
 
       {labelMode === 'NewSource' && (
         <UNSPathInput
-          label="Topic"
+          label="UNS Path"
           placeholder="Type / to browse UNS or paste {{topic}} directly"
           value={newSourceTopic}
           tree={unsTree}
@@ -4506,6 +4624,7 @@ const DATA_TABLE_OPERATOR_OPTIONS: DataTableOperator[] = [
   'median',
   'first',
   'last',
+  'std',
 ];
 const DATA_TABLE_OPERATOR_LABELS: Record<DataTableOperator, string> = {
   sum: 'Sum',
@@ -4515,6 +4634,7 @@ const DATA_TABLE_OPERATOR_LABELS: Record<DataTableOperator, string> = {
   median: 'Median',
   first: 'First',
   last: 'Last',
+  std: 'Std Dev',
 };
 
 interface DataTableColumnEditorProps {

@@ -121,6 +121,7 @@ const OPERATOR_LABEL: Record<DataTableOperator, string> = {
   median: 'Median',
   first: 'First',
   last: 'Last',
+  std: 'Std Dev',
 };
 
 function aggregate(values: number[], op: DataTableOperator): number {
@@ -138,6 +139,11 @@ function aggregate(values: number[], op: DataTableOperator): number {
     }
     case 'first': return values[0];
     case 'last': return values[values.length - 1];
+    case 'std': {
+      const mean = sum / values.length;
+      const variance = values.reduce((a, v) => a + (v - mean) ** 2, 0) / values.length;
+      return Math.sqrt(variance);
+    }
     default: return sum / values.length;
   }
 }
@@ -615,7 +621,26 @@ export function LineChart({
       (best, r) => (r.slots.length > best.length ? r.slots : best),
       [] as { label: string; value: number | null; from: number; to: number; shift?: string }[],
     );
-    const cats = longest.map((slot) => slot.label);
+    const cats = longest.map((slot) => {
+      if (slot.label) return slot.label;
+      // Backend returned an empty label — derive one from the slot's start timestamp
+      // so x-axis labels always appear regardless of periodicity.
+      const ms = slot.from;
+      const dur = slot.to - slot.from; // bucket duration in ms
+      const d = new Date(ms);
+      if (dur < 2 * 3600_000) {
+        // Sub-2-hour buckets: show time only (HH:MM)
+        return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      } else if (dur < 32 * 86400_000) {
+        // Daily/hourly buckets: show date + time
+        return d.toLocaleDateString([], { day: '2-digit', month: 'short' });
+      } else if (dur < 366 * 86400_000) {
+        // Monthly buckets
+        return d.toLocaleDateString([], { month: 'short', year: 'numeric' });
+      }
+      // Yearly/quarterly
+      return d.toLocaleDateString([], { year: 'numeric' });
+    });
     // Store from/to timestamps per bucket — used by the "Time drilldown"
     // onPointClick handler to narrow the time range on click.
     const catTs = longest.map((slot) => ({ from: (slot as any).from as number, to: (slot as any).to as number }));
@@ -975,7 +1000,16 @@ export function LineChart({
         ? { plotBands: leftPlotBands.map((b) => ({ from: b.from, to: b.to, color: b.color, ...(b.label ? { label: { text: b.label } } : {}) })) }
         : {}),
     };
-    const rightYAxes = rightAxes.map((a) => ({ title: { text: a.name || 'Axis' }, opposite: true }));
+    const rightYAxes = rightAxes.map((a) => {
+      const rpl = plotLines.filter((p) => (p as any)._axisId === a._id);
+      const rpb = plotBands.filter((b) => b._axisId === a._id);
+      return {
+        title: { text: a.name || 'Axis' },
+        opposite: true,
+        ...(rpl.length ? { plotLines: rpl.map((p) => ({ value: p.value, color: p.color, width: p.width ?? 2, dashStyle: p.dashStyle ?? 'Dash', zIndex: 5, ...(p.label ? { label: { text: p.label, align: 'right', style: { color: p.color } } } : {}) })) } : {}),
+        ...(rpb.length ? { plotBands: rpb.map((b) => ({ from: b.from, to: b.to, color: b.color, ...(b.label ? { label: { text: b.label } } : {}) })) } : {}),
+      };
+    });
     return { yAxis: [leftAxis, ...rightYAxes], seriesAxis };
   }, [activeChart, plotLines, plotBands, leftAxisTitle]);
 
@@ -1076,7 +1110,12 @@ export function LineChart({
     const titleEllipsis = { textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
     const xAxis: any = {};
     xAxis.title = { style: { ...titleEllipsis, ...(axisColors.xTitle ? { color: axisColors.xTitle } : {}) } };
-    if (axisColors.xLabel) xAxis.labels = { style: { color: axisColors.xLabel } };
+    // Always show labels; rotate when dense so they never overlap and hide.
+    xAxis.labels = {
+      enabled: true,
+      autoRotation: [-45],
+      ...(axisColors.xLabel ? { style: { color: axisColors.xLabel } } : {}),
+    };
     if (axisColors.xLine) xAxis.lineColor = axisColors.xLine;
     if (miscColors.grid) xAxis.gridLineColor = miscColors.grid;
     // Anomaly vertical markers — only in normal mode (shift/comparison series
@@ -1134,6 +1173,23 @@ export function LineChart({
       const yMax = activeChart?.defaultAxis?.yAxisMax;
       if (yMin !== null && yMin !== undefined) yAxis.min = yMin;
       if (yMax !== null && yMax !== undefined) yAxis.max = yMax;
+      // Declare plot lines/bands directly in the Highcharts options so they
+      // survive every chart.update() call. The imperative addPlotLine approach
+      // was clearing these on every highchartsOptions change (anomaly overlay,
+      // periodicity, data arrival) because the imperative effect deps didn't
+      // cover all the triggers that cause chart.update() to rebuild yAxis.
+      if (plotLines.length) {
+        yAxis.plotLines = plotLines.map((p: any) => ({
+          value: p.value, color: p.color, width: p.width ?? 2, dashStyle: p.dashStyle ?? 'Dash', zIndex: 5,
+          ...(p.label ? { label: { text: p.label, align: 'right', style: { color: p.color } } } : {}),
+        }));
+      }
+      if (plotBands.length) {
+        yAxis.plotBands = plotBands.map((b: any) => ({
+          from: b.from, to: b.to, color: b.color,
+          ...(b.label ? { label: { text: b.label } } : {}),
+        }));
+      }
       opts.yAxis = yAxis;
     }
     // "Add Source as Tooltip": no visible line / marker / data label and no
@@ -1357,12 +1413,9 @@ export function LineChart({
   }, [periodicityOptions, selectedPeriodicity]);
 
   // Highcharts instance handle for the export menu and fullscreen toggle.
-  // chartInitKey increments each time onChartReady fires so the plotLine effect
-  // re-runs against the freshly created chart instance.
   const chartInstanceRef = useRef<
     { reflow: () => void; fdsToggleFullscreen?: () => void } | null
   >(null);
-  const [chartInitKey, setChartInitKey] = useState(0);
 
   // Root element ref for the ResizeObserver — triggers chart.reflow() when the
   // dashboard resizes or repositions this widget so Highcharts recalculates
@@ -1390,58 +1443,6 @@ export function LineChart({
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  // Apply plotLines/plotBands imperatively via the Highcharts axis API.
-  // Re-runs on periodicity change and data arrival (categories.length) because
-  // Highcharts rebuilds axis objects during chart.update(), which clears any
-  // previously imperative-added lines/bands. The RAF call re-applies after the
-  // update settles.
-  useEffect(() => {
-    const chart = chartInstanceRef.current as any;
-    if (!chart) return;
-
-    // Build axisId → Highcharts yAxis index map for plot-line axis routing.
-    // Left axis (default) is always index 0; each right axis follows in order.
-    const rightAxesList = (activeChart?.axes ?? []).filter((a) => a.position === 'Right');
-    const axisIdToHcIdx = new Map<string, number>([['', 0]]);
-    rightAxesList.forEach((a, i) => axisIdToHcIdx.set(a._id, i + 1));
-
-    // Same for plot bands — LineChartPlotBand already has axisId.
-    const bandAxisIds = (activeChart?.plotBands ?? []).map((b) => b.axisId ?? '');
-
-    const applyPlotLines = () => {
-      const hcAxes: any[] = chart.yAxis ?? [];
-      hcAxes.forEach((ax: any, axIdx: number) => {
-        for (let i = 0; i < 50; i++) {
-          ax.removePlotLine?.(`__lc_pl_${axIdx}_${i}`);
-          ax.removePlotBand?.(`__lc_pb_${axIdx}_${i}`);
-        }
-        plotLines.forEach((p, i) => {
-          const targetIdx = axisIdToHcIdx.get((p as any)._axisId ?? '') ?? 0;
-          if (targetIdx !== axIdx) return;
-          ax.addPlotLine({
-            id: `__lc_pl_${axIdx}_${i}`,
-            value: p.value,
-            color: p.color,
-            width: p.width ?? 2,
-            dashStyle: p.dashStyle ?? 'Dash',
-            zIndex: 5,
-            ...(p.label ? { label: { text: p.label, align: 'right', style: { color: p.color } } } : {}),
-          });
-        });
-        plotBands.forEach((b, i) => {
-          const targetIdx = axisIdToHcIdx.get(bandAxisIds[i] ?? '') ?? 0;
-          if (targetIdx !== axIdx) return;
-          ax.addPlotBand({ id: `__lc_pb_${axIdx}_${i}`, from: b.from, to: b.to, color: b.color, ...(b.label ? { label: { text: b.label } } : {}) });
-        });
-      });
-    };
-
-    applyPlotLines();
-    const raf = requestAnimationFrame(applyPlotLines);
-    return () => cancelAnimationFrame(raf);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [plotLines, plotBands, chartInitKey, selectedPeriodicity, categories.length]);
 
   // Date presets surfaced in the DatePicker's preset rail. Derived from the
   // host-passed allDurations so what's offered here matches what was
@@ -1505,6 +1506,7 @@ export function LineChart({
   // Lens also sets `globalTimepickerId` at runtime when a GTP is connected
   // (it may not preserve `pickerType` across updates), so we check both.
   const hideDatePicker =
+    !hasAnySeries ||
     timeConfig?.pickerType === 'fixed' ||
     timeConfig?.pickerType === 'global' ||
     timeConfig?.type === 'global' ||
@@ -1773,7 +1775,6 @@ export function LineChart({
           }}
           onChartReady={(inst: { reflow: () => void; fdsToggleFullscreen?: () => void }) => {
             chartInstanceRef.current = inst;
-            setChartInitKey((k) => k + 1);
             // Reflow on the next animation frame so Highcharts measures the
             // container AFTER the DOM settles. Without this, key-driven
             // remounts during config editing can initialize at a stale size.

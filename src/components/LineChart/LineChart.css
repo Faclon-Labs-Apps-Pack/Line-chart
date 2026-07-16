@@ -164,16 +164,17 @@
   height: fit-content;
 }
 
-/* When the data table is shown, enforce a 70(chart)/30(table) height split so
-   the table never squeezes the chart area. The data table is portalled as a
-   direct sibling of .fds-chart__canvas inside .fds-chart. */
+/* When the data table is shown: chart canvas takes all remaining height,
+   table stays at its natural content height with a scrollable cap so it
+   never squeezes the chart area regardless of widget height. */
 .lcw--with-table .fds-chart > .fds-chart__canvas {
-  flex: 7 7 0 !important;
+  flex: 1 1 0 !important;
   min-height: 0;
 }
 .lcw--with-table .fds-chart > .lcw__data-table {
-  flex: 3 3 0 !important;
+  flex: 0 0 auto !important;
   height: auto;
+  max-height: 30%;
   min-height: 0;
   overflow-y: auto;
 }

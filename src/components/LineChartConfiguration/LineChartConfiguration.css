@@ -151,6 +151,33 @@
   gap: var(--spacing-04, 12px);
 }
 
+/* Non-deletable default Left axis row — always visible in the Axis accordion */
+.lc-config__default-axis-row {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--spacing-01);
+  padding: var(--spacing-03) var(--spacing-04);
+  background: var(--background-surface-subtle);
+  border: var(--fds-border-subtle);
+  border-radius: var(--global-border-radius-medium);
+  cursor: pointer;
+}
+.lc-config__default-axis-row:hover {
+  background: var(--background-surface-moderate);
+}
+.lc-config__default-axis-label {
+  color: var(--text-default-primary);
+}
+.lc-config__default-axis-meta {
+  color: var(--text-gray-tertiary);
+}
+.lc-config__axis-hint {
+  color: var(--text-gray-tertiary);
+  padding: var(--spacing-02) var(--spacing-04) var(--spacing-03);
+  margin: 0;
+}
+
 /* SelectInput, ColorInput, UNSPathInput portal their popovers to <body> —
    they are root-level siblings of .fds-modal__backdrop so they win via the
    10001 rule below. The DropdownMenu used inline (inside the modal DOM) still
@@ -213,7 +240,16 @@
    side modal does. The base `.fds-modal__backdrop` rule above already lifts
    the backdrop to viewport-fixed + max z-index, so the popup floats over any
    host canvas widget. */
+/* Disable pointer events on the TTC backdrop so portaled SelectInput/ColorInput
+   dropdown menus (which are body-level siblings, outside the modal DOM) don't
+   land on the backdrop and trigger the SDK's outside-click close handler. The
+   form still closes via its own Cancel / X buttons. */
+.fds-ttc__panel-modal.fds-modal__backdrop {
+  pointer-events: none !important;
+}
+/* Re-enable pointer events on the modal content itself. */
 .fds-ttc__panel-modal .fds-modal--positioned {
+  pointer-events: auto;
   left: calc(var(--lc-config-right-edge, 320px) + 20px) !important;
 }
 

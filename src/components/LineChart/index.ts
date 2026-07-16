@@ -12,8 +12,8 @@ function mount(containerId: string, props: any) {
   container.setAttribute('data-zone-ignore', '');
 
   if (roots.has(containerId)) {
-    roots.get(containerId)!.unmount();
-    roots.delete(containerId);
+    roots.get(containerId)!.render(React.createElement(LineChart, props));
+    return;
   }
 
   const root = createRoot(container);

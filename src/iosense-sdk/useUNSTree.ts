@@ -156,7 +156,7 @@ export function useUNSTree(authentication?: string): UseUNSTreeResult {
     if (!authentication) {
       console.warn(
         '[UNS] loadWorkspaces skipped — no auth token. ' +
-          'Authenticate first via the SSO URL: http://localhost:3000/?token=<SSO_TOKEN>',
+          'Authenticate first: visit http://localhost:3005/?token=<YOUR_JWT> (get JWT from IOsense Network tab)',
       );
       return;
     }

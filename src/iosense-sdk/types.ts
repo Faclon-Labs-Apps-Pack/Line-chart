@@ -328,7 +328,7 @@ export interface LineChartStyling {
 }
 
 export type DataTableSourceMode = 'Existing' | 'AddNew';
-export type DataTableOperator = 'sum' | 'avg' | 'min' | 'max' | 'median' | 'first' | 'last';
+export type DataTableOperator = 'sum' | 'avg' | 'min' | 'max' | 'median' | 'first' | 'last' | 'std';
 
 export interface DataTableColumn {
   _id: string;
