@@ -1,7 +1,7 @@
 import { createRoot, Root } from 'react-dom/client';
 import React from 'react';
 import { LineChartConfiguration } from './LineChartConfiguration';
-import '@faclon-labs/design-sdk/styles.css';
+import '@faclon-labs/design-sdk/base.css';
 
 const roots = new Map<string, Root>();
 

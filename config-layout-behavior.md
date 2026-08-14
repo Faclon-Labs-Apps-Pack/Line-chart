@@ -3,7 +3,8 @@
 This file is the **complete, self-contained recipe** for replicating the IOsense
 configurator look-and-feel in ANY widget. The widget's *content* (fields, sections,
 domain model) will differ — the *shell, layout, spacing, modals, buttons, contracts,
-and null-handling* below must be reproduced exactly.
+Time-tab (shifts/comparison) wiring, and null-handling* below must be reproduced
+exactly.
 
 **How to use:** paste this file into the new widget's context and say
 "build the configurator for <Widget> following ConfigLayout.md". Replace every
@@ -682,7 +683,308 @@ or any missing nested key. Techniques (all mandatory):
 
 ---
 
-## 12. Behavioral rules checklist (DO / DON'T)
+## 12. Time tab — shifts, comparison mode & deviation (SDK delegation + host contract)
+
+Applies to every widget whose envelope carries time config. This is the
+**producing** side — how the configurator lets the user set up shifts,
+comparison mode, and deviation patterns. The **consuming** side (how the
+widget requests shift/comparison data via TIME_CHANGE and renders it) lives in
+`widget-layout-behavior.md` §§4, 6, 8–10. Reference implementation:
+`src/components/LineChartConfiguration/LineChartConfiguration.tsx`.
+
+### 12.1 Ownership: the SDK owns ALL shift/comparison UI
+
+The Time tab is ONE component — the SDK's `TimeTabConfiguration`
+(`@faclon-labs/design-sdk`). It natively renders:
+
+- picker type (Local / Fixed / link to Global Timepicker),
+- duration presets ("Add Duration" panel) + default duration + default periodicity,
+- **Shifts** — the "Add Shift" panel (name, color, start/end time) and the
+  **Shift Aggregator** select,
+- **Comparison Mode** switch + **deviation-pattern** cards (`fds-ttc__deviation`),
+- per-source deviation overrides (the Time tab's own "Advance Settings",
+  rendered only when a `charts` prop is supplied — §12.2).
+
+DON'T rebuild or duplicate any of this UI. (An earlier LineChart iteration
+injected its own deviation-indicator + advance-settings portals; both were
+removed once the SDK rendered the deviation cards natively. A vestigial
+`uiConfig.deviationIndicator` field remains in LineChart that the widget never
+reads — do not replicate it in new widgets.) The configurator's job is exactly
+four things:
+
+1. mount the component, gated + wired (§12.2),
+2. persist BOTH config shapes on every emit (§12.3),
+3. transform SDK output → host shape via `toHostTimeConfig` (§12.4) — this is
+   the step that actually delivers shifts/comparison to the host and widget,
+4. guard its `onChange` (§12.5) and patch its DOM quirks (§12.6).
+
+### 12.2 Mounting & gating
+
+```tsx
+{activeTab === 'time' && (
+  activeChart && activeChart.series.length > 0 ? (
+    <div className="{p}-config__time-tab" ref={timeTabRef}>
+      <TimeTabConfiguration
+        value={timeTabConfig}                 // re-hydration only — NEVER echoed from onChange (§12.5)
+        onChange={handleTimeConfigChange}
+        globalTimepickers={globalTimepickers} // pass-through of the host prop (§0)
+        charts={gtpCharts}
+      />
+      <PerSourceChartDropdownPortal scope={timeTabRef} charts={gtpCharts} />  {/* §12.6 #5 */}
+    </div>
+  ) : (
+    <div className="{p}-config__time-tab-empty">
+      <span>Add a data source in the <strong>Data</strong> tab first.</span>
+    </div>
+  )
+)}
+```
+
+- **Gate on data**: no series → hint text, not the component (time config is
+  meaningless with nothing to query).
+- **`charts` prop** (SDK 0.6.5+) is a `GTPChart[]` view of the local entities.
+  Without it the per-source deviation override section never renders:
+
+  ```tsx
+  const gtpCharts = useMemo<GTPChart[]>(
+    () =>
+      charts.map((c) => ({
+        id: c._id,
+        name: c.title,
+        sources: c.series.map((s) => ({ id: s._id, name: s.name })),
+      })),
+    [charts],
+  );
+  ```
+
+  The `id`s here MUST be the real entity/series `_id`s — the SDK writes
+  per-source overrides keyed `` `${chartId}:${seriesId}` `` and the widget
+  looks them up with the same key (widget-layout-behavior.md §10).
+
+```css
+.{p}-config__time-tab { padding: 0; overflow-y: auto; }
+.{p}-config__time-tab-empty {
+  display: flex; align-items: center; justify-content: center;
+  padding: var(--spacing-08, 32px) var(--spacing-06, 20px);
+  text-align: center;
+  color: var(--content-tertiary, #6B7280);
+  font-size: var(--font-size-02, 14px);
+}
+```
+
+### 12.3 Dual persistence — the envelope carries BOTH shapes
+
+| Envelope key | Shape | Consumer |
+|---|---|---|
+| `timeTabConfig` | raw SDK `TimeTabUIConfig` | the configurator itself — re-hydrates `TimeTabConfiguration` exactly as the user left it |
+| `timeConfig` | `HostTimeConfig` = `toHostTimeConfig(tc)` | Lens query-engine + the widget's `timeConfig` prop |
+
+In `buildEnvelope`:
+
+```tsx
+const tc: TimeTabUIConfig =
+  timeTabConfig ??                                // override from the current emit
+  existing?.timeTabConfig ??                      // previous save
+  (existing?.timeConfig as TimeTabUIConfig) ??    // legacy envelope (pre-split, old shape)
+  FALLBACK_TIME_CONFIG;                           // user never opened the Time tab
+…
+timeConfig: toHostTimeConfig(tc),
+timeTabConfig: tc,
+```
+
+Rules:
+
+- `FALLBACK_TIME_CONFIG` must ship the **full built-in preset roster** (today /
+  yesterday / last24h / last7d / last30d / current_week / previous_week /
+  current_month / previous_month — each with its `periodicities` list). The
+  host derives the window by looking up `defaultDurationId` in `allDurations`;
+  an id missing from the list means the host can't compute time → 422. Copy
+  the roster from `LineChartConfiguration.tsx` (`FALLBACK_TIME_CONFIG`).
+- The `[config?._id]` re-init effect (§0 rule 2) resets BOTH the
+  `timeTabConfig` state and `timeTabConfigRef` from
+  `config.timeTabConfig ?? (config.timeConfig as TimeTabUIConfig)`.
+- Persisting `timeConfig: <raw SDK value>` does NOT work — the host needs
+  `type`, `pickerType`, `startTime: null`, `endTime: null`, etc. (§12.4).
+
+### 12.4 `toHostTimeConfig` — where shifts/comparison actually reach the host
+
+The SDK stores shift/comparison settings in DIFFERENT sub-objects depending on
+picker type: under `t.fixed.…` in fixed mode, under `t.global.…` in GTP mode,
+and at the top level in local mode. The transform must select per-pickerType
+or the configured shifts/comparison **silently vanish** for that mode. Copy
+verbatim:
+
+```tsx
+function toHostTimeConfig(t: TimeTabUIConfig): HostTimeConfig {
+  const pickerType = (t.linkTimeWith ?? t.timeType ?? 'local') as 'local' | 'fixed' | 'global';
+  const fd = t.fixed?.duration;
+  const fixedDuration =
+    pickerType === 'fixed' && fd
+      ? {
+          id: 'fixed' as const,
+          label: fd.name || 'Fixed',
+          navigation: fd.navigation,
+          x: Number(fd.x) || 0,
+          xPeriod: fd.xPeriod,
+          xEvent: fd.xEvent,
+          y: Number(fd.y) || 0,
+          yPeriod: fd.yPeriod,
+          yEvent: fd.yEvent,
+        }
+      : undefined;
+  const cycleTime = pickerType === 'fixed' ? t.fixed?.cycleTime ?? null : t.cycleTime ?? null;
+  return {
+    timezone: t.timezone,
+    type: pickerType === 'global' ? 'local' : pickerType,
+    pickerType,
+    // Preserve the GTP id so the widget detects GTP mode even when Lens pushes
+    // a runtime timeConfig update that drops pickerType (widget spec §8).
+    ...(pickerType === 'global' && (t.global as any)?.id
+      ? { globalTimepickerId: (t.global as any).id }
+      : {}),
+    cycleTime,
+    startTime: null,          // the HOST resolves the actual window at query time
+    endTime: null,
+    fixedDuration,
+    defaultDurationId: t.defaultDurationId,
+    allDurations: t.allDurations ?? [],
+    defaultPeriodicity:
+      pickerType === 'fixed' && fd?.periodicity ? fd.periodicity.toLowerCase() : t.defaultPeriodicity,
+    shifts:
+      pickerType === 'fixed' ? (t.fixed?.shifts ?? t.shifts ?? []) :
+      pickerType === 'global' ? ((t.global as any)?.shifts ?? t.shifts ?? []) :
+      (t.shifts ?? []),
+    shiftAggregator:
+      pickerType === 'fixed' ? ((t.fixed as any)?.shiftAggregator ?? (t as any).shiftAggregator) :
+      pickerType === 'global' ? ((t.global as any)?.shiftAggregator ?? (t as any).shiftAggregator) :
+      (t as any).shiftAggregator,
+    comparisonMode:
+      pickerType === 'fixed' ? t.fixed?.comparisonMode :
+      pickerType === 'global' ? t.global?.comparisonMode :
+      t.comparisonMode,
+    deviationPattern:
+      pickerType === 'fixed' ? t.fixed?.deviationPattern :
+      pickerType === 'global' ? t.global?.deviationPattern :
+      t.deviationPattern,
+    sourceDeviationOverrides:
+      pickerType === 'fixed' ? t.fixed?.sourceDeviationOverrides :
+      pickerType === 'global' ? t.global?.sourceDeviationOverrides :
+      t.sourceDeviationOverrides,
+  };
+}
+```
+
+The five mode-scoped fields and what the widget does with each:
+
+| HostTimeConfig field | Set by (SDK Time tab) | Consumed by (widget spec §) |
+|---|---|---|
+| `shifts` | "Add Shift" panel (name, color, start/end) | Shift toggle + TIME_CHANGE `shifts` + shift-series rendering (§9) |
+| `shiftAggregator` | Shift Aggregator select (Sum/Average/…) | mapped to backend vocab (`average → mean`) on TIME_CHANGE (§6) |
+| `comparisonMode` | Comparison Mode switch | OFFERS the Compare toggle; off force-clears it (§10) |
+| `deviationPattern` | deviation-pattern cards | global deviation coloring convention (§10) |
+| `sourceDeviationOverrides` | per-source Advance Settings | per-source override, key `` `${chartId}:${seriesId}` `` (§10) |
+
+### 12.5 onChange guards (copy verbatim)
+
+The SDK fires `onChange` on mount AND whenever its `charts` prop changes —
+both must be filtered or the configurator stomps the widget's runtime state:
+
+```tsx
+// Ref tracks the latest committed value; NOT fed back into `value` (see below).
+const timeTabConfigRef = useRef<TimeTabUIConfig | undefined>(initialTc);
+// The SDK fires onChange immediately on mount (initialization callback). If its
+// normalized value differs from the envelope's, emitting it would reset the
+// widget's runtime time selection (e.g. "Previous 3 months" → back to default).
+const timeConfigSettledRef = useRef(false);
+useEffect(() => {
+  const t = setTimeout(() => { timeConfigSettledRef.current = true; }, 0);
+  return () => clearTimeout(t);
+}, []);
+
+function handleTimeConfigChange(next: TimeTabUIConfig) {
+  if (!timeConfigSettledRef.current) return;                                       // guard 0: mount echo
+  if (JSON.stringify(next) === JSON.stringify(timeTabConfigRef.current)) return;   // guard 1: no-op
+  // guard 2: adding/removing a data source makes the SDK revert defaultPeriodicity
+  // to its default — keep the user's explicit choice.
+  const merged: TimeTabUIConfig =
+    timeTabConfigRef.current?.defaultPeriodicity &&
+    next.defaultPeriodicity !== timeTabConfigRef.current.defaultPeriodicity
+      ? { ...next, defaultPeriodicity: timeTabConfigRef.current.defaultPeriodicity }
+      : next;
+  if (JSON.stringify(merged) === JSON.stringify(timeTabConfigRef.current)) return;
+  timeTabConfigRef.current = merged;    // ref, NOT state — see rule below
+  emit({ timeTabConfig: merged });
+}
+```
+
+Rules:
+
+- **Ref, not state.** Feeding the SDK's own `onChange` output back into its
+  `value` prop resets its internal panel state — closing the "Add Shift" /
+  "Add Duration" form mid-edit. `value` only changes on entity re-init (§12.3).
+- **Every emit carries time config.** The single `emit()` funnel (§0 rule 1)
+  passes `overrides?.timeTabConfig ?? timeTabConfigRef.current` into
+  `buildEnvelope`, so chart/style edits never drop the latest Time tab state.
+
+### 12.6 Required DOM patches around the SDK Time tab
+
+The SDK component has runtime quirks that MUST be patched or shifts/comparison
+cannot be configured from a narrow host column. All patches are
+MutationObserver-based (the SDK re-renders internally); copy each from
+`LineChartConfiguration.tsx`.
+
+1. **Float the Add Shift / Add Duration panel.** The SDK renders these panels
+   as an SDK Modal (backdrop class `.fds-ttc__panel-modal`) whose inline
+   `left` anchors INSIDE the narrow configurator column, so it overflows into
+   the canvas under other widgets. Publish the panel's real right edge as a
+   CSS variable (`--{p}-config-right-edge`, kept fresh via ResizeObserver +
+   window resize listener) and dock the modal beside the column:
+
+   ```css
+   /* Backdrop pointer-events OFF: SelectInput/ColorInput portal their menus to
+      <body> (outside the modal DOM); clicks on them must not hit the backdrop
+      and fire the SDK's outside-click close. Form still closes via Cancel/X. */
+   .fds-ttc__panel-modal.fds-modal__backdrop { pointer-events: none !important; }
+   .fds-ttc__panel-modal .fds-modal--positioned {
+     pointer-events: auto;
+     left: calc(var(--{p}-config-right-edge, 320px) + 20px) !important;
+   }
+   ```
+
+2. **Dropdown-inside-panel guard.** The SDK adds a `document` mousedown
+   listener that closes every open panel unless the click lands inside
+   `.fds-ttc__panel-modal` — but SelectInput portals its dropdown to `<body>`,
+   so picking a Shift Aggregator option would close the form. Intercept
+   `mousedown` on `document.body` (fires before `document` in the bubble
+   chain) and `stopPropagation()` when the target is inside
+   `.fds-select-input__popover` while a `.fds-ttc__panel-modal` exists.
+
+3. **Single-open accordions.** The SDK's Time-tab accordions are uncontrolled
+   with no single-open prop. Observe class changes; when an item gains
+   `fds-pa-item--expanded`, click closed every OTHER expanded item's header
+   (skipping ancestors of the opened item).
+
+4. **Realtime entities: hide periodicity.** No SDK prop hides periodicity
+   (`disablePeriodicities` is a runtime no-op). When the active entity is
+   realtime-type, DOM-hide the periodicity selects (inputs named
+   `periodicity` / `fixed-duration-periodicity` → hide their closest
+   `.fds-ttc__required-select`) and the duration cards' "Periodicity: …"
+   subtitles. Leave shifts intact.
+
+5. **Per-source chart switcher → dropdown.** The SDK renders the per-source
+   deviation section's chart switcher as a Tabs strip that doesn't fit 280px.
+   Hide it and inject a single-select "Chart" `SelectInput` that drives the
+   hidden tabs by programmatic click on `.fds-tab-item[data-value="<id>"]`
+   (copy `PerSourceChartDropdownPortal` + `PerSourceChartSelect`):
+
+   ```css
+   .fds-ttc__per-source > .fds-tabs { display: none !important; }
+   .{p}-config__per-source-chart-field { margin-bottom: var(--spacing-04, 12px); }
+   ```
+
+---
+
+## 13. Behavioral rules checklist (DO / DON'T)
 
 DO:
 - `e.stopPropagation()` in EVERY click handler living inside an accordion header,
@@ -697,6 +999,17 @@ DO:
 - Call `buildDynamicBindingPathList(uiConfig)` in `buildEnvelope` on every emit.
 - Follow the UNS injection pattern from CLAUDE.md (all-or-none injected trio, hook
   always called unconditionally).
+- Persist BOTH `timeConfig` (host shape via `toHostTimeConfig`) and `timeTabConfig`
+  (raw SDK shape) on EVERY emit — reading the latest from `timeTabConfigRef` so
+  chart/style edits never drop the Time tab state (§12.3, §12.5).
+- Read `shifts` / `shiftAggregator` / `comparisonMode` / `deviationPattern` /
+  `sourceDeviationOverrides` per-pickerType in `toHostTimeConfig` (fixed →
+  `t.fixed.…`, global → `t.global.…`, local → top level) (§12.4).
+- Pass a `GTPChart[]` view of the local entities (real `_id`s) as
+  `TimeTabConfiguration`'s `charts` prop, or per-source deviation overrides never
+  render (§12.2).
+- Guard `TimeTabConfiguration.onChange` with all three guards (mount echo,
+  deep-equal no-op, defaultPeriodicity revert) (§12.5).
 
 DON'T:
 - Don't fetch data in the configurator or the widget (mini-engine owns data).
@@ -709,3 +1022,11 @@ DON'T:
   is zeroed on purpose).
 - Don't persist UI-only state (active tab, open sections, open modals) to the envelope
   — except `activeEntityId`, which IS persisted.
+- Don't rebuild or duplicate shift / comparison / deviation UI — the SDK's
+  `TimeTabConfiguration` owns all of it (§12.1).
+- Don't feed `TimeTabConfiguration`'s own `onChange` output back into its `value`
+  prop — it resets the SDK's internal panel state and closes the "Add Shift" /
+  "Add Duration" form mid-edit. Ref only; `value` changes on entity re-init (§12.5).
+- Don't persist the raw SDK Time tab value as `timeConfig` — the host needs the
+  `HostTimeConfig` shape (`type`, `pickerType`, `startTime: null`, …) or it can't
+  compute the query window (§12.3).

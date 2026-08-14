@@ -23,6 +23,44 @@
   padding: var(--spacing-08, 32px);
 }
 
+/* No-data empty state rendered INSIDE the chart canvas area (header + table
+   stay visible). Fills the (filling) canvas and CENTERS a compact empty-state
+   block. The canvas keeps its normal fill behaviour so the table pins to the
+   bottom (no awkward gap); the EmptyState itself is ~250px tall, well under the
+   304px ceiling, so the "no taller than 304" requirement holds via the inner
+   block's natural size. */
+.lcw__empty-canvas,
+.lcw__loading-canvas {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--spacing-06, 24px);
+}
+
+/* Width-constrained, centered empty-state block. Width is set inline from
+   computeNoDataWidth(canvasWidth); height capped at 304px per spec. */
+.lcw__empty-inner {
+  max-width: 100%;
+  max-height: 304px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* The SDK Table sets `scrollbar-gutter: stable` on its scroll surface, which
+   always reserves a scrollbar-width gap on the right — visible as empty space
+   even when the table has only a couple of rows and doesn't scroll. Scope it
+   back to `auto` for the widget's preview table so the gutter appears ONLY when
+   a scrollbar is actually needed. */
+.lcw__data-table .fds-table-surface__scroll {
+  scrollbar-gutter: auto;
+}
+
 /* SDK Chart card fills .lcw — each layer must be a flex column so the
    Highcharts renderTo div tracks the widget height and reflow() returns the
    correct pixel size. SDK default is shrink-to-content; we override here. */
@@ -178,6 +216,7 @@
   min-height: 0;
   overflow-y: auto;
 }
+
 
 /* Data table rows are display-only (no row-level action) — suppress the
    SDK's default hover highlight so they don't look interactive. */

@@ -1,0 +1,642 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://iosense.faclon.com/schemas/line-chart-widget.json",
+  "title": "LineChartWidget Envelope",
+  "description": "Configuration envelope for the IOsense LineChart widget. Emitted by the configurator via onChange() (through buildEnvelope) and consumed by the mini-engine + widget renderer. Supports multiple charts, per-chart series/axes/plot-lines/plot-bands/SPC/anomalies/data-table, full styling, and a time configuration (host + SDK shapes).",
+  "type": "object",
+  "required": ["_id", "type", "general", "uiConfig", "dynamicBindingPathList"],
+  "additionalProperties": false,
+  "properties": {
+    "_id": {
+      "type": "string",
+      "description": "Unique widget instance id (e.g. \"linechart_1720000000000\")."
+    },
+    "type": {
+      "const": "LineChart",
+      "description": "Widget type discriminator."
+    },
+    "general": {
+      "type": "object",
+      "required": ["title"],
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "Human-readable widget title."
+        }
+      }
+    },
+    "timeConfig": {
+      "$ref": "#/$defs/HostTimeConfig",
+      "description": "Host (Lens) time configuration. The configurator always persists this in HostTimeConfig shape (produced by toHostTimeConfig). Lens reads it to derive startTime/endTime/timezone/shifts for resolveAndCompute. Optional — absent until the Time tab has been touched (then FALLBACK_TIME_CONFIG is applied)."
+    },
+    "timeTabConfig": {
+      "$ref": "#/$defs/TimeTabUIConfig",
+      "description": "Raw design-sdk TimeTabConfiguration UI state. Used only to re-hydrate the SDK TimeTabConfiguration component when the configurator is re-opened. Opaque SDK-owned shape — forward-compatible (additional properties allowed)."
+    },
+    "uiConfig": {
+      "$ref": "#/$defs/LineChartUIConfig"
+    },
+    "dynamicBindingPathList": {
+      "type": "array",
+      "description": "Bindings extracted from bindable uiConfig fields containing {{topic}}. Built by buildDynamicBindingPathList(uiConfig) before every onChange(). LineChart emits ONLY series bindings (type:'series') from series[].unsPath, axes[].unsPath, plotLines[].value, anomalies[].newSourceTopic, and AddNew dataTable columns[].topic.",
+      "items": { "$ref": "#/$defs/BindingEntry" }
+    }
+  },
+  "$defs": {
+    "LineChartUIConfig": {
+      "type": "object",
+      "description": "Render configuration consumed by the widget renderer.",
+      "required": ["charts", "activeChartId", "dataTable", "style"],
+      "additionalProperties": false,
+      "properties": {
+        "charts": {
+          "type": "array",
+          "description": "One or more chart instances. Empty when no chart has been created yet.",
+          "items": { "$ref": "#/$defs/ChartInstance" }
+        },
+        "activeChartId": {
+          "type": ["string", "null"],
+          "description": "_id of the chart currently selected in the configurator (default preview chart). Null when there are no charts."
+        },
+        "dataTable": {
+          "$ref": "#/$defs/DataTableConfig",
+          "description": "Legacy widget-level data table. Retained as a fallback for charts that don't yet carry their own per-chart dataTable."
+        },
+        "style": { "$ref": "#/$defs/LineChartStyling" },
+        "deviationIndicator": {
+          "$ref": "#/$defs/DeviationIndicatorMode",
+          "default": "standard",
+          "description": "Tooltip deviation indicator behavior — only meaningful when timeConfig.comparisonMode is true. 'standard': green up = positive. 'inverse': red up = positive (for lower-is-better metrics)."
+        },
+        "advanceSettings": {
+          "type": "boolean",
+          "default": false,
+          "description": "UI disclosure state for advanced time fields (Disable Time Selection, Future Days Allowed). Auto-resolves to true on load if any advanced field already has a non-default value."
+        }
+      }
+    },
+    "ChartInstance": {
+      "type": "object",
+      "required": ["_id", "title", "series", "defaultAxis", "axes", "plotLines", "plotBands", "spcs", "anomalies", "dataTable"],
+      "additionalProperties": false,
+      "properties": {
+        "_id": { "type": "string", "description": "Unique chart id (e.g. \"chart_1720000000000\")." },
+        "title": { "type": "string", "description": "Chart title." },
+        "description": { "type": "string", "description": "Optional chart description." },
+        "chartType": {
+          "type": "string",
+          "enum": ["Aggregated", "Realtime"],
+          "default": "Aggregated",
+          "description": "'Aggregated' uses periodicity-based bucketing. 'Realtime' removes all periodicity controls."
+        },
+        "series": { "type": "array", "items": { "$ref": "#/$defs/LineChartSeries" } },
+        "defaultAxis": { "$ref": "#/$defs/LineChartDefaultAxis" },
+        "axes": { "type": "array", "items": { "$ref": "#/$defs/LineChartAxis" } },
+        "plotLines": { "type": "array", "items": { "$ref": "#/$defs/LineChartPlotLine" } },
+        "plotBands": { "type": "array", "items": { "$ref": "#/$defs/LineChartPlotBand" } },
+        "spcs": { "type": "array", "items": { "$ref": "#/$defs/LineChartSPC" } },
+        "anomalies": { "type": "array", "items": { "$ref": "#/$defs/LineChartAnomaly" } },
+        "dataTable": {
+          "$ref": "#/$defs/DataTableConfig",
+          "description": "Per-chart data table config. Each chart owns its own; the widget shows a table only for the chart that configured one."
+        },
+        "breakSeriesTimeout": {
+          "type": "number",
+          "description": "Break-series timeout (BT) in SECONDS. When set, a gap between consecutive buckets larger than this severs the line (device-inactive break), matching v1's breakSeriesTimeout. When unset, the widget falls back to an adaptive median-gap heuristic."
+        }
+      }
+    },
+    "LineChartSeries": {
+      "type": "object",
+      "required": ["_id", "name", "color", "unsPath"],
+      "additionalProperties": false,
+      "properties": {
+        "_id": { "type": "string" },
+        "name": { "type": "string", "description": "Series display name (used as the legend label)." },
+        "color": { "type": "string", "description": "Series line color (hex)." },
+        "unsPath": {
+          "type": "string",
+          "description": "Bindable data source. Stores a {{uns:wsId://path}} binding template. Field name MUST be `unsPath` — the host engine treats binding keys ending in `.unsPath` as series sources."
+        },
+        "dataSource": {
+          "type": "string",
+          "deprecated": true,
+          "description": "@deprecated legacy field kept only for envelope migration. Stripped from every emitted envelope."
+        },
+        "downsampling": { "type": "string" },
+        "downsamplingUnit": { "type": "string" },
+        "dataPrecision": { "type": "number", "description": "Decimal places for tooltip values (default 2)." },
+        "limit": { "type": "string" },
+        "advanceParameters": { "type": "boolean" },
+        "m": { "type": "string" },
+        "s": { "type": "string" },
+        "addAsTooltip": {
+          "type": "boolean",
+          "description": "When true the series stays in the dataset for shared-tooltip readout but renders no line and no legend chip."
+        },
+        "deviationIndicator": {
+          "$ref": "#/$defs/DeviationIndicatorMode",
+          "description": "Per-series deviation indicator override. Undefined = inherit uiConfig.deviationIndicator."
+        }
+      }
+    },
+    "LineChartDefaultAxis": {
+      "type": "object",
+      "required": ["yAxisLabel"],
+      "additionalProperties": false,
+      "properties": {
+        "yAxisLabel": { "type": "string" },
+        "yAxisMin": { "type": ["number", "null"] },
+        "yAxisMax": { "type": ["number", "null"] },
+        "xAxisLabel": { "type": "string" }
+      }
+    },
+    "LineChartAxis": {
+      "type": "object",
+      "required": ["_id", "name", "position", "unsPath", "linkedSeriesIds"],
+      "additionalProperties": false,
+      "properties": {
+        "_id": { "type": "string" },
+        "name": { "type": "string", "description": "Axis title." },
+        "position": { "type": "string", "enum": ["Left", "Right"] },
+        "unsPath": {
+          "type": "string",
+          "description": "Bindable data source ({{uns:...}}). Same rename rationale as LineChartSeries.unsPath."
+        },
+        "dataSource": {
+          "type": "string",
+          "deprecated": true,
+          "description": "@deprecated legacy field for envelope migration only."
+        },
+        "linkedSeriesIds": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Series (_id) routed to this axis. Right-position axes become secondary Y-axes."
+        }
+      }
+    },
+    "LineChartPlotLine": {
+      "type": "object",
+      "required": ["_id", "name", "color", "value", "lineWidth", "lineStyle"],
+      "additionalProperties": false,
+      "properties": {
+        "_id": { "type": "string" },
+        "name": { "type": "string" },
+        "color": { "type": "string" },
+        "value": {
+          "type": "string",
+          "description": "Numeric string (\"1.5\") OR a {{uns:...}} binding template (bindable — emits a series binding when a topic)."
+        },
+        "lineWidth": { "type": "number" },
+        "lineStyle": { "type": "string", "enum": ["Solid", "Dashed"] },
+        "axisId": { "type": "string", "description": "Y-axis to draw on. Empty/undefined = default left axis; else matches a LineChartAxis._id (Right axis)." },
+        "periodicityType": { "type": "string", "enum": ["independent", "dependent"] },
+        "periodicities": { "type": "array", "items": { "type": "string" }, "description": "Active periodicities when periodicityType is 'dependent'." },
+        "fixedValue": { "type": "string", "deprecated": true, "description": "@deprecated use `value`." },
+        "dynamicTopic": { "type": "string", "deprecated": true, "description": "@deprecated use `value`." },
+        "type": { "type": "string", "deprecated": true, "description": "@deprecated use `periodicityType`." },
+        "valueType": { "type": "string", "deprecated": true },
+        "dataPrecision": { "type": "number", "deprecated": true },
+        "unit": { "type": "string", "deprecated": true }
+      }
+    },
+    "LineChartPlotBand": {
+      "type": "object",
+      "required": ["_id", "name", "color", "startValue", "endValue"],
+      "additionalProperties": false,
+      "properties": {
+        "_id": { "type": "string" },
+        "name": { "type": "string" },
+        "color": { "type": "string" },
+        "startValue": { "type": "number" },
+        "endValue": { "type": "number" },
+        "axisId": { "type": "string", "description": "Y-axis to draw on. Empty/undefined = default left axis." }
+      }
+    },
+    "LineChartSPC": {
+      "type": "object",
+      "description": "Statistical Process Control overlay. (Section currently hidden in the configurator but the shape is preserved.)",
+      "required": ["_id", "dataSourceIds", "processTypes"],
+      "additionalProperties": false,
+      "properties": {
+        "_id": { "type": "string" },
+        "dataSourceIds": { "type": "array", "items": { "type": "string" }, "description": "Series (_id) the SPC lines are computed over." },
+        "startDate": { "type": "string" },
+        "endDate": { "type": "string" },
+        "processTypes": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["Average", "Median", "StandardDeviation"] }
+        },
+        "average": { "$ref": "#/$defs/SPCLine" },
+        "median": { "$ref": "#/$defs/SPCLine" },
+        "standardDeviation": {
+          "allOf": [
+            { "$ref": "#/$defs/SPCLine" },
+            {
+              "type": "object",
+              "properties": {
+                "sigmaLevels": {
+                  "type": "array",
+                  "items": { "type": "string", "enum": ["1Sigma", "2Sigma", "3Sigma", "4Sigma", "5Sigma", "6Sigma"] }
+                }
+              },
+              "required": ["sigmaLevels"]
+            }
+          ]
+        }
+      }
+    },
+    "SPCLine": {
+      "type": "object",
+      "required": ["enabled", "plotName", "lineWidth", "lineColor"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "plotName": { "type": "string" },
+        "lineWidth": { "type": "number" },
+        "lineColor": { "type": "string" }
+      }
+    },
+    "LineChartAnomaly": {
+      "type": "object",
+      "required": ["_id", "name", "color", "applyToSeriesId", "operator", "labelMode"],
+      "additionalProperties": false,
+      "properties": {
+        "_id": { "type": "string" },
+        "name": { "type": "string" },
+        "color": { "type": "string" },
+        "applyToSeriesId": { "type": "string", "description": "Series (_id) the condition is evaluated against." },
+        "operator": { "type": "string", "enum": [">", "<", ">=", "<=", "==", "!="] },
+        "labelMode": {
+          "type": "string",
+          "enum": ["Value", "Existing", "NewSource"],
+          "description": "Threshold source: fixed 'Value', an 'Existing' series, or a 'NewSource' UNS topic."
+        },
+        "thresholdValue": { "type": "number", "description": "Required when labelMode is 'Value'." },
+        "existingSeriesId": { "type": "string", "description": "Threshold series (_id) when labelMode is 'Existing'." },
+        "newSourceTopic": {
+          "type": "string",
+          "description": "Bindable {{uns:...}} topic when labelMode is 'NewSource' (emits a series binding)."
+        },
+        "advanceEnabled": { "type": "boolean" },
+        "advanceM": { "type": "number" },
+        "advanceC": { "type": "number" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "labelMode": { "const": "Value" } }, "required": ["labelMode"] },
+          "then": { "required": ["thresholdValue"] }
+        },
+        {
+          "if": { "properties": { "labelMode": { "const": "Existing" } }, "required": ["labelMode"] },
+          "then": { "required": ["existingSeriesId"] }
+        },
+        {
+          "if": { "properties": { "labelMode": { "const": "NewSource" } }, "required": ["labelMode"] },
+          "then": { "required": ["newSourceTopic"] }
+        }
+      ]
+    },
+    "DataTableConfig": {
+      "type": "object",
+      "required": ["enabled", "columns", "transposeTable", "operators", "showUnit"],
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "columns": { "type": "array", "items": { "$ref": "#/$defs/DataTableColumn" } },
+        "transposeTable": { "type": "boolean" },
+        "operators": {
+          "type": "array",
+          "description": "Aggregation operators — one aggregated row/column is shown per operator.",
+          "items": { "$ref": "#/$defs/DataTableOperator" }
+        },
+        "operator": { "$ref": "#/$defs/DataTableOperator", "deprecated": true, "description": "@deprecated legacy single-operator field; read via `operators`." },
+        "showUnit": { "type": "boolean" }
+      }
+    },
+    "DataTableColumn": {
+      "type": "object",
+      "required": ["_id", "sourceMode", "dataPrecision"],
+      "additionalProperties": false,
+      "properties": {
+        "_id": { "type": "string" },
+        "sourceMode": { "type": "string", "enum": ["Existing", "AddNew"] },
+        "seriesId": { "type": "string", "description": "Existing-mode: the source series (_id)." },
+        "name": { "type": "string", "description": "AddNew-mode: user-defined column name (required in AddNew mode)." },
+        "topic": { "type": "string", "description": "AddNew-mode: bindable {{uns:...}} source (emits a series binding)." },
+        "downsampling": { "type": "string" },
+        "downsamplingUnit": { "type": "string" },
+        "dataPrecision": { "type": "number" },
+        "unit": { "type": "string" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "sourceMode": { "const": "Existing" } }, "required": ["sourceMode"] },
+          "then": { "required": ["seriesId"] }
+        },
+        {
+          "if": { "properties": { "sourceMode": { "const": "AddNew" } }, "required": ["sourceMode"] },
+          "then": { "required": ["name", "topic"] }
+        }
+      ]
+    },
+    "DataTableOperator": {
+      "type": "string",
+      "enum": ["sum", "avg", "min", "max", "median", "first", "last"]
+    },
+    "DeviationIndicatorMode": {
+      "type": "string",
+      "enum": ["standard", "inverse"]
+    },
+    "LineChartStyling": {
+      "type": "object",
+      "required": ["size", "card", "hideElements", "advancedEnabled", "chartTitle", "xAxisLabel", "yAxisLabel", "dataTable", "misc"],
+      "additionalProperties": false,
+      "properties": {
+        "size": {
+          "type": "object",
+          "required": ["preset"],
+          "additionalProperties": false,
+          "properties": {
+            "preset": { "type": "string", "enum": ["Small", "Medium", "Large", "Custom"] },
+            "customWidth": { "type": "number" },
+            "customHeight": { "type": "number" },
+            "lockAspectRatio": { "type": "boolean" }
+          }
+        },
+        "card": {
+          "type": "object",
+          "required": ["wrapInCard", "backgroundColor", "borderColor", "borderWidth", "borderRadius"],
+          "additionalProperties": false,
+          "properties": {
+            "wrapInCard": { "type": "boolean", "description": "When on (default), background + border + padding are applied; off drops them so the chart sits transparently." },
+            "backgroundColor": { "type": "string" },
+            "borderColor": { "type": "string" },
+            "borderWidth": { "type": "number" },
+            "borderRadius": { "type": "number" }
+          }
+        },
+        "hideElements": {
+          "type": "object",
+          "required": ["settingsIcon", "exportIcon", "chartTitle"],
+          "additionalProperties": false,
+          "properties": {
+            "settingsIcon": { "type": "boolean" },
+            "exportIcon": { "type": "boolean" },
+            "chartTitle": { "type": "boolean" }
+          }
+        },
+        "advancedEnabled": {
+          "type": "boolean",
+          "description": "Master switch for the advanced styling fields below (chartTitle/xAxisLabel/yAxisLabel/dataTable/misc). When false the widget uses built-in defaults."
+        },
+        "chartTitle": {
+          "type": "object",
+          "required": ["fontSize", "fontColor", "fontWeight"],
+          "additionalProperties": false,
+          "properties": {
+            "fontSize": { "type": "number" },
+            "fontColor": { "type": "string" },
+            "fontWeight": { "$ref": "#/$defs/StylingFontWeight" }
+          }
+        },
+        "xAxisLabel": {
+          "type": "object",
+          "required": ["textColor", "lineColor", "dataPointColor"],
+          "additionalProperties": false,
+          "properties": {
+            "textColor": { "type": "string" },
+            "lineColor": { "type": "string" },
+            "dataPointColor": { "type": "string" }
+          }
+        },
+        "yAxisLabel": {
+          "type": "object",
+          "required": ["textColor", "lineColor", "dataPointColor"],
+          "additionalProperties": false,
+          "properties": {
+            "textColor": { "type": "string" },
+            "lineColor": { "type": "string" },
+            "dataPointColor": { "type": "string" }
+          }
+        },
+        "dataTable": {
+          "type": "object",
+          "required": ["headerBackgroundColor", "headerTextColor", "headerTextSize", "headerTextWeight", "dataPointTextSize", "dataPointTextWeight", "dataPointTextColor"],
+          "additionalProperties": false,
+          "properties": {
+            "headerBackgroundColor": { "type": "string" },
+            "headerTextColor": { "type": "string" },
+            "headerTextSize": { "type": "number" },
+            "headerTextWeight": { "$ref": "#/$defs/StylingFontWeight" },
+            "dataPointTextSize": { "type": "number" },
+            "dataPointTextWeight": { "$ref": "#/$defs/StylingFontWeight" },
+            "dataPointTextColor": { "type": "string" }
+          }
+        },
+        "misc": {
+          "type": "object",
+          "required": ["gridLineColor", "legendTextColor"],
+          "additionalProperties": false,
+          "properties": {
+            "gridLineColor": { "type": "string" },
+            "legendTextColor": { "type": "string" }
+          }
+        }
+      }
+    },
+    "StylingFontWeight": {
+      "type": "string",
+      "enum": ["Regular", "Medium", "Semi-Bold", "Bold"]
+    },
+    "BindingEntry": {
+      "oneOf": [
+        {
+          "type": "object",
+          "description": "Scalar binding.",
+          "required": ["key", "topic"],
+          "additionalProperties": false,
+          "properties": {
+            "key": { "type": "string", "description": "Dot/bracket-path to the bound uiConfig field." },
+            "topic": { "type": "string", "description": "UNS topic extracted from {{topic}} (e.g. \"uns:wsId://path\")." }
+          }
+        },
+        {
+          "type": "object",
+          "description": "Series binding — the only kind LineChart emits.",
+          "required": ["key", "topic", "type"],
+          "additionalProperties": false,
+          "properties": {
+            "key": {
+              "type": "string",
+              "description": "Bracket-path to the bound field, e.g. \"charts[0].series[1].unsPath\", \"charts[0].axes[0].unsPath\", \"charts[0].plotLines[0].value\", \"charts[0].anomalies[0].newSourceTopic\", or \"charts[0].dataTable.columns[0].topic\"."
+            },
+            "topic": { "type": "string", "description": "UNS topic extracted from {{topic}} — expected to start with \"uns:\"." },
+            "type": { "const": "series" },
+            "aggregation": {
+              "type": "object",
+              "description": "Optional per-binding aggregation override.",
+              "properties": {
+                "operator": { "type": "string" },
+                "downscale": { "type": "number" },
+                "resolution": { "type": "string" }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "HostTimeConfig": {
+      "type": "object",
+      "description": "Host (Lens) time config shape produced by toHostTimeConfig(). Extra properties are permitted for forward-compatibility with Lens runtime pushes.",
+      "additionalProperties": true,
+      "properties": {
+        "timezone": { "type": "string" },
+        "type": { "type": "string", "enum": ["local", "fixed", "global"] },
+        "pickerType": { "type": "string", "enum": ["local", "fixed", "global"] },
+        "globalTimepickerId": { "type": "string", "description": "Set by Lens when a Global Timepicker widget drives this widget's time." },
+        "cycleTime": { "type": ["object", "null"] },
+        "startTime": { "type": ["number", "null"] },
+        "endTime": { "type": ["number", "null"] },
+        "fixedDuration": {
+          "type": "object",
+          "properties": {
+            "id": { "const": "fixed" },
+            "label": { "type": "string" },
+            "navigation": { "type": "string" },
+            "x": { "type": "number" },
+            "xPeriod": { "type": "string" },
+            "xEvent": { "type": "string" },
+            "y": { "type": "number" },
+            "yPeriod": { "type": "string" },
+            "yEvent": { "type": "string" }
+          }
+        },
+        "defaultDurationId": { "type": "string" },
+        "allDurations": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Duration" }
+        },
+        "defaultPeriodicity": { "type": "string" },
+        "shifts": { "type": "array", "items": { "$ref": "#/$defs/ShiftWindow" } },
+        "shiftAggregator": { "type": "string", "description": "Aggregation operator applied within each shift window." },
+        "comparisonMode": { "type": "boolean" },
+        "deviationPattern": { "type": "string" },
+        "sourceDeviationOverrides": {
+          "type": "object",
+          "description": "Map of \"<chartId>:<seriesId>\" → deviation pattern.",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "Duration": {
+      "type": "object",
+      "required": ["id"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string" },
+        "label": { "type": "string" },
+        "navigation": { "type": "string" },
+        "x": { "type": "number" },
+        "xPeriod": { "type": "string" },
+        "xEvent": { "type": "string" },
+        "y": { "type": "number" },
+        "yPeriod": { "type": "string" },
+        "yEvent": { "type": "string" },
+        "calendarType": { "type": "string" },
+        "periodicities": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "ShiftWindow": {
+      "type": "object",
+      "required": ["id", "name", "color", "startTime", "endTime"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "color": { "type": "string" },
+        "startTime": { "type": "string", "description": "\"HH:mm\"." },
+        "endTime": { "type": "string", "description": "\"HH:mm\"." }
+      }
+    },
+    "TimeTabUIConfig": {
+      "type": "object",
+      "description": "Opaque design-sdk TimeTabConfiguration UI state, persisted verbatim for re-hydration. Not validated field-by-field here.",
+      "additionalProperties": true
+    }
+  },
+  "examples": [
+    {
+      "_id": "linechart_1720000000000",
+      "type": "LineChart",
+      "general": { "title": "Line 1 Throughput" },
+      "timeConfig": {
+        "timezone": "Asia/Kolkata",
+        "type": "local",
+        "pickerType": "local",
+        "cycleTime": null,
+        "startTime": null,
+        "endTime": null,
+        "defaultDurationId": "last24h",
+        "allDurations": [
+          { "id": "last24h", "label": "Last 24 Hours", "x": 24, "xPeriod": "hour", "periodicities": ["minute", "hourly"] }
+        ],
+        "defaultPeriodicity": "hourly",
+        "shifts": []
+      },
+      "uiConfig": {
+        "charts": [
+          {
+            "_id": "chart_1720000000001",
+            "title": "Throughput",
+            "chartType": "Aggregated",
+            "series": [
+              {
+                "_id": "s1",
+                "name": "Output",
+                "color": "#3b82f6",
+                "unsPath": "{{uns:ws1://plantA/line1/output}}",
+                "dataPrecision": 2
+              }
+            ],
+            "defaultAxis": { "yAxisLabel": "Units", "yAxisMin": null, "yAxisMax": null, "xAxisLabel": "" },
+            "axes": [],
+            "plotLines": [
+              { "_id": "pl1", "name": "Target", "color": "#10b981", "value": "100", "lineWidth": 1, "lineStyle": "Dashed" }
+            ],
+            "plotBands": [],
+            "spcs": [],
+            "anomalies": [],
+            "dataTable": { "enabled": false, "columns": [], "transposeTable": false, "operators": ["avg"], "showUnit": true }
+          }
+        ],
+        "activeChartId": "chart_1720000000001",
+        "dataTable": { "enabled": false, "columns": [], "transposeTable": false, "operators": ["avg"], "showUnit": true },
+        "style": {
+          "size": { "preset": "Medium", "customWidth": 880, "customHeight": 400, "lockAspectRatio": false },
+          "card": { "wrapInCard": true, "backgroundColor": "#FFFFFF", "borderColor": "#EEEEEE", "borderWidth": 1, "borderRadius": 8 },
+          "hideElements": { "settingsIcon": false, "exportIcon": false, "chartTitle": false },
+          "advancedEnabled": false,
+          "chartTitle": { "fontSize": 18, "fontColor": "#050505", "fontWeight": "Semi-Bold" },
+          "xAxisLabel": { "textColor": "#050505", "lineColor": "#DEE1E3", "dataPointColor": "#050505" },
+          "yAxisLabel": { "textColor": "#050505", "lineColor": "#333333", "dataPointColor": "#050505" },
+          "dataTable": {
+            "headerBackgroundColor": "#EEF0F1",
+            "headerTextColor": "#616D75",
+            "headerTextSize": 14,
+            "headerTextWeight": "Semi-Bold",
+            "dataPointTextSize": 14,
+            "dataPointTextWeight": "Regular",
+            "dataPointTextColor": "#292F32"
+          },
+          "misc": { "gridLineColor": "#DEE1E3", "legendTextColor": "#292F2E" }
+        },
+        "deviationIndicator": "standard",
+        "advanceSettings": false
+      },
+      "dynamicBindingPathList": [
+        { "key": "charts[0].series[0].unsPath", "topic": "uns:ws1://plantA/line1/output", "type": "series" }
+      ]
+    }
+  ]
+}

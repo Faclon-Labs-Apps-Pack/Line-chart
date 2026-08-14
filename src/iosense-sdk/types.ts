@@ -293,9 +293,6 @@ export interface ChartInstance {
   _id: string;
   title: string;
   description?: string;
-  // 'Aggregated' (default) uses periodicity-based bucketing; 'Realtime' removes
-  // all periodicity controls (preview picker, Time tab, periodicity plotlines).
-  chartType?: 'Aggregated' | 'Realtime';
   series: LineChartSeries[];
   defaultAxis: LineChartDefaultAxis;
   axes: LineChartAxis[];
@@ -306,6 +303,12 @@ export interface ChartInstance {
   // Per-chart data table config (each chart has its own; the preview/widget show
   // a data table only for the chart that configured one).
   dataTable: DataTableConfig;
+  // Break-series timeout (BT) in SECONDS. When set, a gap between consecutive
+  // buckets larger than this severs the line (device-inactive break), matching
+  // v1's `breakSeriesTimeout`. When unset, the widget falls back to an adaptive
+  // median-gap heuristic. (Later: fall back to the source device's admin BT once
+  // the backend exposes it in the resolveAndCompute meta.)
+  breakSeriesTimeout?: number;
 }
 
 export type StylingFontWeight = 'Regular' | 'Medium' | 'Semi-Bold' | 'Bold';
@@ -325,6 +328,14 @@ export interface LineChartStyling {
     dataPointTextWeight: StylingFontWeight; dataPointTextColor: string;
   };
   misc: { gridLineColor: string; legendTextColor: string };
+  enableAreaFill?: boolean;
+  showDataPoints?: boolean;
+  defaultChartDisplay?: {
+    legends?: boolean;
+    dataLabel?: boolean;
+    clipping?: boolean;
+    zoom?: boolean;
+  };
 }
 
 export type DataTableSourceMode = 'Existing' | 'AddNew';
@@ -360,6 +371,9 @@ export type DeviationIndicatorMode = 'standard' | 'inverse';
 export interface LineChartUIConfig {
   charts: ChartInstance[];
   activeChartId: string | null;
+  // When true: live streaming mode — no periodicity controls, shift coloring
+  // uses time-window grouping with null-gap insertion for data breaks.
+  realtimeMode?: boolean;
   dataTable: DataTableConfig;
   style: LineChartStyling;
   // Tooltip deviation indicator behavior — only used when timeConfig.comparisonMode is true.
@@ -386,6 +400,10 @@ export type {
   GTPShift,
   GTPCycleTimeConfig,
 };
+
+// Mirrors TimeTabUIConfig.defaultDisplayMode — defined locally because the
+// SDK's TimeTabConfiguration subpath does not re-export it.
+export type TimeTabDefaultDisplayMode = 'normal' | 'shift' | 'comparison';
 
 // GTPCycleTimeType drives the first dropdown in the Cycle Time accordion.
 // The SDK defines it internally but does not re-export it from the
@@ -449,6 +467,10 @@ export interface HostTimeConfig {
   defaultDurationId: string;
   allDurations: TimeTabUIConfig['allDurations'];
   defaultPeriodicity: string;
+  /** When true, periodicity selection is disabled in the Time tab. The widget
+   *  reads this to hide the periodicity dropdown in its header. Mirrored here so
+   *  it survives Lens save/restore even when timeTabConfig is stripped. */
+  disablePeriodicities?: boolean;
   shifts?: TimeTabUIConfig['shifts'];
   /** Aggregation operator applied within each shift window (Sum/Average/Min/
    *  Max/First/Last as configured in the Time tab's Shift Aggregator dropdown).
@@ -457,6 +479,13 @@ export interface HostTimeConfig {
   comparisonMode?: boolean;
   deviationPattern?: string;
   sourceDeviationOverrides?: Record<string, string>;
+  /** Preserved from timeTabConfig so it survives Lens save/restore (Lens reads
+   *  timeConfig but may not preserve timeTabConfig across sessions). The widget
+   *  falls back to this field when timeTabConfig is unavailable. */
+  defaultDisplayMode?: TimeTabDefaultDisplayMode;
+  /** When true, the LineChart is in realtime (live-streaming) mode. Embedded
+   *  here so query-engine.ts can set timeFrame='realtime' without reading uiConfig. */
+  realtimeMode?: boolean;
 }
 
 export interface LineChartEnvelope {

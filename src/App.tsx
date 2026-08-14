@@ -26,9 +26,6 @@ import './App.css';
 const TOKEN_STORAGE_KEY = 'iosense_bearer_token';
 const ENVELOPE_STORAGE_KEY = 'iosense_lc_envelope';
 
-// Read the Bearer token directly — no SSO validation step. A ?token= param is
-// treated as a raw Bearer JWT (persisted + stripped from the URL); otherwise we
-// fall back to whatever was stored previously.
 function readInitialToken(): string {
   try {
     const url = new URL(window.location.href);
@@ -188,6 +185,7 @@ export default function App() {
               config={envelope?.uiConfig}
               data={resolvedData}
               timeConfig={envelope?.timeConfig as HostTimeConfig | undefined}
+              timeTabConfig={envelope?.timeTabConfig}
               onEvent={handleWidgetEvent}
               authentication={token}
             />

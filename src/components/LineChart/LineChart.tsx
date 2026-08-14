@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 
 import Highcharts from 'highcharts';
@@ -11,6 +11,7 @@ import { IconButton } from '@faclon-labs/design-sdk/IconButton';
 import type { ChartPlotLine, ChartPlotBand, ChartExportFormat } from '@faclon-labs/design-sdk/Chart';
 import type { ChartComparisonConfig, ComparisonSeriesInput, DeviationPattern, ChartShiftConfig, ShiftSeriesInput } from '@faclon-labs/design-sdk';
 import { EmptyState, NoDataOneIllustration } from '@faclon-labs/design-sdk/EmptyState';
+import { Spinner } from '@faclon-labs/design-sdk/Spinner';
 import { DatePicker } from '@faclon-labs/design-sdk/DatePicker';
 import type { DateRange, DatePresetOption } from '@faclon-labs/design-sdk/DatePicker';
 import { DropdownMenu } from '@faclon-labs/design-sdk/DropdownMenu';
@@ -40,7 +41,7 @@ import type {
   SeriesPayload,
   WidgetEvent,
 } from '../../iosense-sdk/types';
-import '@faclon-labs/design-sdk/styles.css';
+import '@faclon-labs/design-sdk/base.css';
 import './LineChart.css';
 
 // Register the Highcharts modules the SDK chart's actions slot will call
@@ -89,6 +90,9 @@ interface LineChartWidgetProps {
     defaultDurationId?: string;
     allDurations?: import('../../iosense-sdk/types').Duration[];
     defaultPeriodicity?: string;
+    /** When true, periodicity selection was disabled in the Time tab — the
+     *  widget hides its periodicity dropdown. */
+    disablePeriodicities?: boolean;
     startTime?: number | null;
     endTime?: number | null;
     fixedDuration?: import('../../iosense-sdk/types').Duration | null;
@@ -100,6 +104,9 @@ interface LineChartWidgetProps {
     sourceDeviationOverrides?: Record<string, string>;
   };
   onEvent?: (event: WidgetEvent) => void;
+  // Full TimeTabConfiguration UI state — Lens passes this as a separate
+  // envelope-level prop so the widget can read defaultDisplayMode on mount.
+  timeTabConfig?: import('../../iosense-sdk/types').TimeTabUIConfig;
   // Bearer token for comparison data fetch. Lens injects this for widgets that
   // declare it; dev harness passes it from auth state. Falls back to
   // localStorage when not provided (covers both dev and production Lens).
@@ -123,6 +130,15 @@ const OPERATOR_LABEL: Record<DataTableOperator, string> = {
   last: 'Last',
   std: 'Std Dev',
 };
+
+function hexToRgba(hex: string, alpha: number): string {
+  const h = hex.replace('#', '');
+  const full = h.length === 3 ? h.split('').map((c) => c + c).join('') : h;
+  const r = parseInt(full.slice(0, 2), 16);
+  const g = parseInt(full.slice(2, 4), 16);
+  const b = parseInt(full.slice(4, 6), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
 
 function aggregate(values: number[], op: DataTableOperator): number {
   if (!values.length) return 0;
@@ -157,7 +173,7 @@ const PERIODICITY_MS: Record<string, number> = {
   Quarterly: 90 * 86_400_000,
   Yearly: 365 * 86_400_000,
 };
-const PERIODICITY_ORDER = ['Minute', 'Hourly', 'Daily', 'Weekly', 'Monthly', 'Quarterly', 'Yearly'];
+const PERIODICITY_ORDER = ['Hourly', 'Daily', 'Weekly', 'Monthly', 'Quarterly', 'Yearly'];
 
 // Rank from finest (0) to coarsest. Used to present periodicity options in
 // decremental order (Yearly → Minute) so the dropdown always reads high-to-low
@@ -192,7 +208,7 @@ function getValidPeriodicities(range: DateRange | null): string[] {
     const ms = PERIODICITY_MS[p];
     return span >= ms && span / ms <= MAX_BUCKETS;
   });
-  return orderDescending(valid.length ? valid : ['Minute']);
+  return orderDescending(valid.length ? valid : ['Hourly']);
 }
 
 // Derive valid periodicities from a preset's definition — not from range span.
@@ -228,14 +244,16 @@ function getPresetPeriodicities(
     }
   } else if (typeof preset.x === 'number' && preset.xPeriod) {
     const mins = preset.x * (PRESET_MINS[preset.xPeriod] ?? 1440);
-    if (mins <= 60)          raw = ['Minute', 'Hourly'];
-    else if (mins <= 1440)   raw = ['Minute', 'Hourly'];
+    if (mins <= 60)          raw = ['Hourly'];
+    else if (mins <= 1440)   raw = ['Hourly'];
     else if (mins <= 10080)  raw = ['Hourly', 'Daily'];
     else if (mins <= 43200)  raw = ['Hourly', 'Daily', 'Weekly'];
     else if (mins <= 129600) raw = ['Daily', 'Weekly', 'Monthly'];
     else                     raw = ['Daily', 'Weekly', 'Monthly', 'Quarterly'];
   }
-  return raw ? orderDescending(raw) : null;
+  // Minute is not a selectable periodicity — drop it if a preset lists it.
+  const filtered = raw?.filter((p) => p !== 'Minute') ?? null;
+  return filtered && filtered.length ? orderDescending(filtered) : null;
 }
 
 
@@ -248,7 +266,6 @@ function finerPeriodicity(p?: string): string | null {
     case 'monthly':   return 'Daily';
     case 'weekly':    return 'Daily';
     case 'daily':     return 'Hourly';
-    case 'hourly':    return 'Minute';
     default: return null;
   }
 }
@@ -288,6 +305,73 @@ function isSlotInShift(
   const e = eh * 60 + em;
   return s < e ? slotMin >= s && slotMin < e : slotMin >= s || slotMin < e;
 }
+
+// Width of the "no data" empty-state block, derived from the chart canvas width.
+// Scales with the container (~70%) but clamped so it neither stretches edge-to-
+// edge on a wide widget nor gets cramped on a narrow one. Never wider than the
+// container itself.
+// Max time to show the loading spinner before assuming the fetch resolved with
+// no data (falls back to the empty state). Generous, to tolerate a slow backend
+// (e.g. Redis warm-up) — a genuine late arrival still renders the chart.
+const LOADING_TIMEOUT_MS = 15000;
+
+// A series is "bound" when its binding value is wrapped in `{{ }}` — i.e. it
+// expects data from the engine. Used to tell a true loading state (bound series,
+// data not arrived yet) apart from an unconfigured/empty one. Mirrors ColumnChart.
+function isBound(binding?: string): boolean {
+  return !!binding && /^\{\{.+\}\}$/.test(binding.trim());
+}
+
+const NO_DATA_MIN_WIDTH = 160;
+const NO_DATA_MAX_WIDTH = 360;
+function computeNoDataWidth(containerWidth: number): number {
+  if (!containerWidth || containerWidth <= 0) return NO_DATA_MAX_WIDTH;
+  const target = containerWidth * 0.7;
+  return Math.round(
+    Math.max(NO_DATA_MIN_WIDTH, Math.min(target, NO_DATA_MAX_WIDTH, containerWidth)),
+  );
+}
+
+// Break a timestamp into timezone-aware calendar parts used by the realtime
+// x-axis tick logic (day/hour bucketing + label formatting).
+function tzParts(ms: number, tz?: string): {
+  dayKey: string; hour: number; dateLabel: string; hourLabel: string;
+} {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: tz,
+    year: 'numeric', month: 'short', day: '2-digit', hour: '2-digit', hour12: false,
+  }).formatToParts(new Date(ms));
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? '';
+  const hour = parseInt(get('hour'), 10) || 0;
+  return {
+    dayKey: `${get('year')}-${get('month')}-${get('day')}`,
+    hour,
+    dateLabel: `${get('day')} ${get('month')}`,          // "27 Jul"
+    hourLabel: `${String(hour).padStart(2, '0')}:00`,     // "12:00"
+  };
+}
+
+// Adaptive "nice" hour steps for the realtime axis — mirrors how a Highcharts
+// datetime axis picks readable intervals so the label count stays ~TARGET
+// regardless of how many days the live window spans.
+// Nice hour-steps spanning intraday → multi-month so a long realtime window
+// (e.g. 12 months) still thins to ~REALTIME_TARGET_TICKS labels instead of one
+// per day/week (which overlap into an unreadable smear). Values:
+// 1h…12h (intraday) · 24h/48h/72h (days) · 168h(1wk)/336h(2wk) · 720h(30d)
+// /1440h(60d)/2160h(90d)/4320h(180d)/8760h(1yr).
+const NICE_HOUR_STEPS = [1, 2, 3, 6, 12, 24, 48, 72, 168, 336, 720, 1440, 2160, 4320, 8760];
+const REALTIME_TARGET_TICKS = 8;
+
+// Breakdown break-detection: the backend returns only buckets that have data,
+// so an inactive device surfaces as a large time gap between two consecutive
+// buckets. When a gap exceeds the normal cadence (median inter-bucket gap) by
+// this factor, the dead period is filled with null buckets at the normal cadence
+// so the line BREAKS there AND the empty span is width-proportional to how long
+// the device was inactive (matches v1's datetime-axis look).
+const BREAK_GAP_FACTOR = 2.5;
+// Cap on synthetic filler buckets per gap so an extreme gap/cadence ratio can't
+// explode the category count (keeps Highcharts responsive).
+const MAX_BREAK_FILLERS = 2000;
 
 type ChartDisplay = {
   legends: boolean;
@@ -400,41 +484,27 @@ export function LineChart({
   config: rawConfig,
   data = [],
   timeConfig,
+  timeTabConfig,
   onEvent,
 }: LineChartWidgetProps) {
-  // Emit TIME_CHANGE once on mount so the host's data layer registers this
-  // widget for query dispatch. Refs hold the latest values so the mount-only
-  // effect can read them without listing them as deps — if we re-emitted on
-  // every host-pushed timeConfig change, changing one widget's DatePicker would
-  // propagate its time range to every other widget on the dashboard (the host
-  // broadcasts the updated timeConfig to all widgets after any TIME_CHANGE).
   const onEventRef = useRef(onEvent);
   onEventRef.current = onEvent;
   const timeConfigRef = useRef(timeConfig);
   timeConfigRef.current = timeConfig;
-  useEffect(() => {
-    const ev = onEventRef.current;
-    if (!ev) return;
-    const tc = timeConfigRef.current;
-    if (!tc?.defaultDurationId && !tc?.fixedDuration) return;
-    const { startTime, endTime } = computeRange(tc);
-    const periodicity = computeDefaultPeriodicity(tc).toLowerCase();
-    // Shift auto-defaults on when the widget loads with shifts configured
-    // (non-GTP), so include the shift fields in the first request.
-    const shifts = tc?.shifts ?? [];
-    const shiftOn = shifts.length > 0 && !isGTPModeRef.current;
-    ev({
-      type: 'TIME_CHANGE',
-      payload: {
-        startTime: String(startTime),
-        endTime: String(endTime),
-        periodicity,
-        ...(shiftOn ? shiftEventPayload(shifts, tc?.shiftAggregator) : {}),
-        ...controlFlags(),
-      },
-    });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // Run once on mount — do NOT add timeConfig/onEvent as deps
+  // undefined = not configured yet (legacy: auto-enable shifts if present).
+  // 'normal' | 'shift' | 'comparison' = explicit dashboard-builder choice.
+  // Fall back to timeConfig.defaultDisplayMode: Lens preserves timeConfig across
+  // save/restore but may strip timeTabConfig (a non-standard field). Both are
+  // written by the configurator so either path gives the user's intent.
+  const defaultDisplayMode =
+    timeTabConfig?.defaultDisplayMode ??
+    (timeConfig as { defaultDisplayMode?: import('../../iosense-sdk/types').TimeTabDefaultDisplayMode } | undefined)?.defaultDisplayMode;
+  const defaultDisplayModeRef = useRef(defaultDisplayMode);
+  defaultDisplayModeRef.current = defaultDisplayMode;
+  // Mount TIME_CHANGE removed: the host (Lens canvas) now reads defaultDisplayMode
+  // from the saved datasource body and fires the first resolveAndCompute query
+  // with the correct shifts / comparison window before the widget mounts.
+  // Emitting here was causing a redundant second query with identical params.
 
   // Lens may pass the full envelope as `config` instead of just uiConfig.
   // Detect by presence of `uiConfig` field on the input and unwrap.
@@ -484,10 +554,25 @@ export function LineChart({
   // listing isGTPMode as a dep (which would re-run and stomp manual toggles).
   const isGTPModeRef = useRef(isGTPMode);
   isGTPModeRef.current = isGTPMode;
-  const [shiftToggleOn, setShiftToggleOn] = useState(() => cfgShifts.length > 0 && !isGTPMode);
-  const [draftShiftOn, setDraftShiftOn] = useState(() => cfgShifts.length > 0 && !isGTPMode);
+  const [shiftToggleOn, setShiftToggleOn] = useState(() => {
+    const legacyAutoOn = cfgShifts.length > 0 && !isGTPMode;
+    return defaultDisplayMode === 'shift' ? legacyAutoOn
+      : defaultDisplayMode === 'normal' || defaultDisplayMode === 'comparison' ? false
+      : legacyAutoOn; // undefined = legacy
+  });
+  const [draftShiftOn, setDraftShiftOn] = useState(() => {
+    const legacyAutoOn = cfgShifts.length > 0 && !isGTPMode;
+    return defaultDisplayMode === 'shift' ? legacyAutoOn
+      : defaultDisplayMode === 'normal' || defaultDisplayMode === 'comparison' ? false
+      : legacyAutoOn;
+  });
   useEffect(() => {
-    const autoOn = cfgShifts.length > 0 && !isGTPModeRef.current;
+    const mode = defaultDisplayModeRef.current;
+    const legacyAutoOn = cfgShifts.length > 0 && !isGTPModeRef.current;
+    const autoOn =
+      mode === 'shift' ? legacyAutoOn
+      : mode === 'normal' || mode === 'comparison' ? false
+      : legacyAutoOn;
     setShiftToggleOn(autoOn);
     setDraftShiftOn(autoOn);
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -500,16 +585,66 @@ export function LineChart({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cfgShiftKey]);
 
+  // Periodicity dropdown visibility. Hidden when the Time tab disabled
+  // periodicity selection. Prefer the host-mirrored flag on timeConfig (survives
+  // Lens save/restore); fall back to the raw timeTabConfig (Local top-level or
+  // Fixed-scoped) when the host shape isn't populated.
+  const cfgDisablePeriodicities =
+    !!(timeConfig as { disablePeriodicities?: boolean } | undefined)?.disablePeriodicities ||
+    !!timeTabConfig?.disablePeriodicities ||
+    !!timeTabConfig?.fixed?.disablePeriodicities;
+
   // Comparison state — mirrors shift state: draft in-picker, committed on Apply.
   const cfgComparisonMode = !!timeConfig?.comparisonMode;
-  const [comparisonToggleOn, setComparisonToggleOn] = useState(false);
-  const [draftComparisonOn, setDraftComparisonOn] = useState(false);
+  const [comparisonToggleOn, setComparisonToggleOn] = useState(
+    () => defaultDisplayMode === 'comparison' && cfgComparisonMode,
+  );
+  const [draftComparisonOn, setDraftComparisonOn] = useState(
+    () => defaultDisplayMode === 'comparison' && cfgComparisonMode,
+  );
   useEffect(() => {
     if (!cfgComparisonMode) {
       setComparisonToggleOn(false);
       setDraftComparisonOn(false);
     }
   }, [cfgComparisonMode]);
+
+  // Live-update: when the configurator changes defaultDisplayMode, immediately
+  // flip the toggles and re-emit TIME_CHANGE so the chart and data both update
+  // without requiring a save + refresh cycle.
+  const defaultDisplayModeInitRef = useRef(false);
+  useEffect(() => {
+    if (!defaultDisplayModeInitRef.current) {
+      defaultDisplayModeInitRef.current = true;
+      return; // skip on first run — host handles the initial query
+    }
+    const mode = defaultDisplayMode;
+    const legacyAutoOn = cfgShifts.length > 0 && !isGTPModeRef.current;
+    const shiftOn = mode === 'shift' ? legacyAutoOn
+      : (mode === 'normal' || mode === 'comparison') ? false
+      : legacyAutoOn;
+    const compOn = mode === 'comparison' && cfgComparisonMode;
+    setShiftToggleOn(shiftOn);
+    setDraftShiftOn(shiftOn);
+    setComparisonToggleOn(compOn);
+    setDraftComparisonOn(compOn);
+    // Re-emit TIME_CHANGE with the new mode params so the host re-fetches data.
+    if (!rangeValue) return;
+    const startMs = new Date(rangeValue.start).getTime();
+    const endMs = new Date(rangeValue.end).getTime();
+    onEventRef.current?.({
+      type: 'TIME_CHANGE',
+      payload: {
+        startTime: String(startMs),
+        endTime: String(endMs),
+        periodicity: selectedPeriodicity.toLowerCase(),
+        ...(shiftOn ? shiftEventPayload(cfgShifts, cfgShiftAggregator) : {}),
+        ...(compOn ? comparisonWindowPayload(startMs, endMs) : {}),
+        ...controlFlags(),
+      },
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [defaultDisplayMode]);
 
   // Shift and comparison are mutually exclusive — activating one deactivates the other.
   const draftActivateShift = (on: boolean) => {
@@ -529,45 +664,19 @@ export function LineChart({
     setDraftComparisonOn(comparisonToggleOn);
   };
 
-  // Comparison is driven by DATA, not the toggle: whenever the resolved series
-  // carry comparisonSlots values, render the comparison chart. The config flag +
-  // Compare toggle only govern whether the widget REQUESTS the previous period
-  // (see comparisonActiveRef / the TIME_CHANGE emitters) — once that data
-  // arrives, the comparison view shows regardless of the current toggle state.
-  const hasComparisonData = useMemo(() => {
-    const configured = activeChart?.series ?? [];
-    return configured.some((_, i) => {
-      const payload =
-        getSeriesData(`charts[${chartIndex}].series[${i}].unsPath`, data) ??
-        getSeriesData(`charts[${chartIndex}].series[${i}].dataSource`, data);
-      const cs = payload?.comparisonSlots;
-      return Array.isArray(cs) && cs.some((slot) => typeof slot?.value === 'number');
-    });
-  }, [activeChart, chartIndex, data]);
-
-  // Shift is driven by DATA, not the toggle — same contract as comparison above:
-  // whenever the resolved series carry backend-tagged shift slots (slot.shift),
-  // render the shift chart. The Shift toggle + config shifts only govern whether
-  // the widget REQUESTS shift bucketing (see shiftActiveRef / the TIME_CHANGE
-  // emitters); once shift-tagged data arrives, the shift view shows regardless
-  // of the current toggle state.
-  const hasShiftData = useMemo(() => {
-    const configured = activeChart?.series ?? [];
-    return configured.some((_, i) => {
-      const payload =
-        getSeriesData(`charts[${chartIndex}].series[${i}].unsPath`, data) ??
-        getSeriesData(`charts[${chartIndex}].series[${i}].dataSource`, data);
-      const slots = payload?.slots;
-      return Array.isArray(slots) &&
-        slots.some((slot) => typeof slot?.shift === 'string' && slot.shift.length > 0);
-    });
-  }, [activeChart, chartIndex, data]);
-
   const chartMode = useMemo<'normal' | 'comparison' | 'shift'>(() => {
-    if (hasComparisonData) return 'comparison';
-    if (hasShiftData) return 'shift';
+    // Purely toggle-driven — toggle state is initialized from defaultDisplayMode
+    // on mount and updated via the user's Apply action in the DatePicker.
+    // No data-driven fallback: that would make stale shift/comparison data from
+    // the previous mode bleed into the new mode while fresh data is loading, and
+    // it caused shift view to show after refresh even when defaultDisplayMode='normal'.
+    // Shift is supported in realtime too (v1 parity) — the host must send the
+    // shifts with timeFrame:'realtime' so the backend returns shift-tagged
+    // realtime data; the shiftSubDaily branch below then bridges the segments.
+    if (shiftToggleOn && cfgShifts.length > 0) return 'shift';
+    if (comparisonToggleOn && cfgComparisonMode) return 'comparison';
     return 'normal';
-  }, [hasComparisonData, hasShiftData]);
+  }, [shiftToggleOn, comparisonToggleOn, cfgShifts.length, cfgComparisonMode]);
 
   // Latest committed comparison flag for TIME_CHANGE emitters that fire from
   // effects/callbacks whose dependency lists don't track it.
@@ -602,12 +711,13 @@ export function LineChart({
   // blocks that should join into ONE continuous line (boundary bridging +
   // connectNulls off). At Daily and coarser each shift is its own trend line
   // across days, connected across gaps (connectNulls on, no bridging).
-  const shiftSubDaily = ['minute', 'hourly'].includes(selectedPeriodicity.toLowerCase());
+  // Realtime is always sub-daily (live readings, never coarse buckets).
+  const shiftSubDaily = config?.realtimeMode || ['minute', 'hourly'].includes(selectedPeriodicity.toLowerCase());
 
   // Resolve each configured series from `data` (series binding key matches the
   // configurator's: charts[ci].series[si].dataSource). Categories are the slot
   // labels of the longest series (backend returns aligned, pre-bucketed slots).
-  const { series, categories, catTimestamps, catShifts } = useMemo(() => {
+  const { series, categories, catTimestamps, catShifts, hasBreakdownGaps } = useMemo(() => {
     const configured = activeChart?.series ?? [];
     const resolved = configured.map((s, si) => {
       const payload =
@@ -615,52 +725,167 @@ export function LineChart({
         // Legacy key from envelopes saved before the dataSource → unsPath rename.
         getSeriesData(`charts[${chartIndex}].series[${si}].dataSource`, data);
       const slots = payload?.slots ?? [];
-      return { def: s, slots };
+      // Measurement unit from the resolved payload meta — appended to the value
+      // in the tooltip (v1 parity). "." is the backend's "no unit" sentinel.
+      const rawUnit = (payload as any)?.meta?.unit;
+      const unit = typeof rawUnit === 'string' && rawUnit !== '.' ? rawUnit : '';
+      return { def: s, slots, unit };
     });
     const longest = resolved.reduce(
       (best, r) => (r.slots.length > best.length ? r.slots : best),
       [] as { label: string; value: number | null; from: number; to: number; shift?: string }[],
     );
-    const cats = longest.map((slot) => {
+    // Label for a bucket — the backend label, else derived from its start.
+    const labelFor = (slot: { label?: string; from: number; to: number }): string => {
       if (slot.label) return slot.label;
-      // Backend returned an empty label — derive one from the slot's start timestamp
-      // so x-axis labels always appear regardless of periodicity.
       const ms = slot.from;
       const dur = slot.to - slot.from; // bucket duration in ms
       const d = new Date(ms);
-      if (dur < 2 * 3600_000) {
-        // Sub-2-hour buckets: show time only (HH:MM)
-        return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      } else if (dur < 32 * 86400_000) {
-        // Daily/hourly buckets: show date + time
-        return d.toLocaleDateString([], { day: '2-digit', month: 'short' });
-      } else if (dur < 366 * 86400_000) {
-        // Monthly buckets
-        return d.toLocaleDateString([], { month: 'short', year: 'numeric' });
-      }
-      // Yearly/quarterly
+      if (dur < 2 * 3600_000) return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      if (dur < 32 * 86400_000) return d.toLocaleDateString([], { day: '2-digit', month: 'short' });
+      if (dur < 366 * 86400_000) return d.toLocaleDateString([], { month: 'short', year: 'numeric' });
       return d.toLocaleDateString([], { year: 'numeric' });
+    };
+
+    // Derive the "normal" cadence from the median gap between consecutive bucket
+    // starts. `interval` is the filler spacing; `breakThreshold` is the gap size
+    // beyond which the line is severed (device-inactive break).
+    //
+    // Threshold source, in priority order:
+    //   1. Configured Break-Series Timeout (BT) — activeChart.breakSeriesTimeout,
+    //      in SECONDS (v1 parity). When set, a gap > BT*1000 breaks the line,
+    //      regardless of the data's own cadence.
+    //   2. Adaptive fallback — median gap × BREAK_GAP_FACTOR — used when no BT is
+    //      configured, so coarse historical views still break only on genuinely
+    //      large gaps (not every bucket).
+    // NOTE: BT is a raw duration; on a coarse (e.g. daily) view a BT smaller than
+    // the bucket size would break every bucket. Leave BT blank for those and let
+    // the adaptive fallback handle it.
+    const fromGaps: number[] = [];
+    for (let i = 1; i < longest.length; i++) {
+      const g = (longest[i] as any).from - (longest[i - 1] as any).from;
+      if (g > 0) fromGaps.push(g);
+    }
+    let interval = 0; // normal cadence — filler spacing (needs ≥1 gap)
+    if (fromGaps.length > 0) {
+      const sorted = [...fromGaps].sort((a, b) => a - b);
+      // Median once we have a stable sample (≥3 gaps); else the smallest gap so
+      // fillers still have a sane spacing when there are only a couple of points.
+      interval = fromGaps.length >= 3 ? sorted[Math.floor(sorted.length / 2)] : sorted[0];
+    }
+    const btSeconds = activeChart?.breakSeriesTimeout;
+    let breakThreshold = Infinity;
+    if (typeof btSeconds === 'number' && btSeconds > 0) {
+      breakThreshold = btSeconds * 1000; // configured BT (seconds → ms)
+    } else if (interval > 0 && fromGaps.length >= 3) {
+      breakThreshold = interval * BREAK_GAP_FACTOR; // adaptive fallback
+    }
+
+    // Build categories / timestamps / shift-tags / per-series data together so
+    // NULL filler buckets can be inserted across any breakdown gap. Fillers are
+    // spaced at the normal cadence (`interval`) with real interpolated timestamps
+    // + derived labels, so the empty span is WIDTH-proportional to the elapsed
+    // dead time and the x-axis still shows dates inside it (v1 look). Fillers
+    // carry a null value → the line breaks; `undefined` shift → null across every
+    // shift series; they're not hoverable/clickable (null points).
+    const cats: string[] = [];
+    const catTs: { from: number; to: number }[] = [];
+    const catSh: (string | undefined)[] = [];
+    const seriesData: (number | null)[][] = resolved.map(() => []);
+    // Breakdown breaks are a NORMAL-view feature only. In shift mode the shifts
+    // must join end-to-end into one continuous colored line (v1 parity) — the
+    // null fillers would chop that line into disconnected strips — so skip them.
+    const allowBreaks = chartMode !== 'shift';
+    let hasBreakdownGaps = false;
+    longest.forEach((slot: any, idx: number) => {
+      if (idx > 0 && interval > 0 && allowBreaks) {
+        const prevFrom = (longest[idx - 1] as any).from as number;
+        const gap = slot.from - prevFrom;
+        if (gap > breakThreshold) {
+          hasBreakdownGaps = true;
+          const count = Math.min(MAX_BREAK_FILLERS, Math.max(1, Math.round(gap / interval) - 1));
+          for (let k = 1; k <= count; k++) {
+            const t = prevFrom + interval * k;
+            cats.push(labelFor({ from: t, to: t + interval }));
+            catTs.push({ from: t, to: t + interval });
+            catSh.push(undefined);
+            resolved.forEach((_, si) => seriesData[si].push(null));
+          }
+        }
+      }
+      cats.push(labelFor(slot));
+      catTs.push({ from: slot.from, to: slot.to });
+      catSh.push(slot.shift);
+      resolved.forEach((r, si) => {
+        const v = r.slots[idx]?.value;
+        seriesData[si].push(typeof v === 'number' ? v : null);
+      });
     });
-    // Store from/to timestamps per bucket — used by the "Time drilldown"
-    // onPointClick handler to narrow the time range on click.
-    const catTs = longest.map((slot) => ({ from: (slot as any).from as number, to: (slot as any).to as number }));
-    // Shift name per bucket, straight from the backend's per-slot `shift` tag.
-    // Drives shift-series assignment so each bucket plots under the shift the
-    // backend assigned it to (no client-side time-window re-derivation).
-    const catSh = longest.map((slot) => (slot as any).shift as string | undefined);
+
     const out = resolved.map((r, i) => ({
       name: r.def.name || `Series ${i + 1}`,
       color: r.def.color,
-      data: cats.map((_, idx) => {
-        const v = r.slots[idx]?.value;
-        return typeof v === 'number' ? v : null;
-      }),
+      data: seriesData[i],
       tooltip: {
         valueDecimals: typeof r.def.dataPrecision === 'number' ? r.def.dataPrecision : 2,
+        // Custom field carried through to the tooltip formatter (Highcharts
+        // preserves unknown keys on series.options.tooltip).
+        unit: r.unit,
       },
     }));
-    return { series: out, categories: cats, catTimestamps: catTs, catShifts: catSh };
-  }, [activeChart, chartIndex, data]);
+    return { series: out, categories: cats, catTimestamps: catTs, catShifts: catSh, hasBreakdownGaps };
+  }, [activeChart, chartIndex, data, chartMode]);
+
+  // Realtime x-axis thinning. Live data is minute-level, so a category axis
+  // labels every single slot and packs the axis solid (dense, unreadable). v1's
+  // datetime axis instead shows a HANDFUL of labels at a "nice" interval that
+  // scales with the window (hourly for a day, 12-hourly for a few days, etc.).
+  // We reproduce that on the category axis: pick a nice hour-step from the total
+  // span so ~REALTIME_TARGET_TICKS labels remain, then place a tick at the first
+  // bucket of each clock hour that is a multiple of that step (in the widget's
+  // timezone). Midnight ticks render the date; others render HH:00. Undefined
+  // when not in realtime so normal category behaviour is untouched.
+  const realtimeTicks = useMemo<{ positions: number[]; daily: boolean } | undefined>(() => {
+    if (!config?.realtimeMode || catTimestamps.length === 0) return undefined;
+    const tz = timeConfig?.timezone || undefined;
+    const withTs = catTimestamps.filter((t) => t?.from != null && !Number.isNaN(t.from));
+    if (withTs.length === 0) return undefined;
+    const rangeHours = Math.max(1, (withTs[withTs.length - 1].from - withTs[0].from) / 3_600_000);
+    const step =
+      NICE_HOUR_STEPS.find((s) => rangeHours / s <= REALTIME_TARGET_TICKS) ??
+      NICE_HOUR_STEPS[NICE_HOUR_STEPS.length - 1];
+    const daily = step >= 24;
+
+    if (daily) {
+      // Day-or-larger ranges: one candidate tick per calendar DAY (first bucket of
+      // that day, at ANY hour — realtime buckets are rarely at midnight), then keep
+      // every (step/24)-th day so the label count stays ~target. Labelled as dates.
+      const dayFirsts: number[] = [];
+      let lastDay = '';
+      catTimestamps.forEach((t, i) => {
+        if (t?.from == null || Number.isNaN(t.from)) return; // skip synthetic break buckets
+        const p = tzParts(t.from, tz);
+        if (p.dayKey === lastDay) return;
+        lastDay = p.dayKey;
+        dayFirsts.push(i);
+      });
+      const everyNDays = Math.max(1, Math.round(step / 24));
+      return { positions: dayFirsts.filter((_, i) => i % everyNDays === 0), daily };
+    }
+
+    // Intraday: first bucket of each clock hour that is a multiple of `step`.
+    const positions: number[] = [];
+    let lastKey = '';
+    catTimestamps.forEach((t, i) => {
+      if (t?.from == null || Number.isNaN(t.from)) return;
+      const p = tzParts(t.from, tz);
+      const key = `${p.dayKey} ${p.hour}`;
+      if (key === lastKey) return;
+      lastKey = key;
+      if (p.hour % step === 0) positions.push(i);
+    });
+    return { positions, daily };
+  }, [config?.realtimeMode, catTimestamps, timeConfig?.timezone]);
 
   // The SDK's `shift` and `comparison` props own rendering in those modes;
   // `series` is passed through but ignored by the chart when either prop is set.
@@ -673,6 +898,41 @@ export function LineChart({
   // the range / confirm the source is wired. The empty state is only for
   // when ZERO slots came back.
   const hasSlots = effectiveSeries.some((s) => s.data.length > 0);
+
+  // True when at least one series has a numeric point to plot. When false the
+  // canvas would otherwise show Highcharts' bare "No data to display" text — we
+  // render the branded EmptyState instead (v1 parity). Covers three data-related
+  // cases uniformly: zero slots came back, every value is null (compute "N/A"
+  // sentinels), and backend errors (e.g. Redis loading) that yield no slots.
+  const hasPlottableData = effectiveSeries.some((s) =>
+    s.data.some((v: any) => typeof v === 'number' && !Number.isNaN(v)),
+  );
+
+  // Loading state: no data has arrived yet AND the chart has bound series that
+  // expect data. Distinguishes "still fetching" (show a spinner) from "no data
+  // found" (show the empty state) on first load. Mirrors ColumnChart.
+  //
+  // Safeguard: `data.length === 0` alone can't tell "fetch in progress" from
+  // "fetch resolved empty" (both are []). If the response for this chart is
+  // empty, or the resolved data never reaches this widget (binding/routing
+  // issue), the spinner would otherwise show forever. So we cap the spinner: if
+  // data still hasn't arrived after LOADING_TIMEOUT_MS, fall back to the empty
+  // state. When data does arrive later, the chart renders regardless.
+  const dataEmpty = data.length === 0;
+  const hasBoundSeries = (activeChart?.series ?? []).some(
+    (s) => isBound(s.unsPath || s.dataSource),
+  );
+  const [loadingExpired, setLoadingExpired] = useState(false);
+  useEffect(() => {
+    if (!dataEmpty || !hasBoundSeries) {
+      setLoadingExpired(false);
+      return;
+    }
+    setLoadingExpired(false); // fresh fetch (data reference changed) → restart
+    const t = setTimeout(() => setLoadingExpired(true), LOADING_TIMEOUT_MS);
+    return () => clearTimeout(t);
+  }, [data, dataEmpty, hasBoundSeries]);
+  const isLoadingData = dataEmpty && hasBoundSeries && !loadingExpired;
 
   // "Add Source as Tooltip" — these series stay in the dataset (shared tooltip)
   // but render no line and no legend chip. Index-aligned with `series`.
@@ -1088,12 +1348,13 @@ export function LineChart({
   }, [style?.dataTable]);
 
   // Per-chart in-widget UI overrides: NOT written back to the envelope (these
+  const dcd = config?.style?.defaultChartDisplay;
   const [chartDisplay, setChartDisplay] = useState<ChartDisplay>({
-    legends: true,
-    dataLabel: false,
-    clipping: false,
+    legends: dcd?.legends ?? true,
+    dataLabel: dcd?.dataLabel ?? false,
+    clipping: dcd?.clipping ?? false,
     inexactMultiple: false,
-    zoom: true,
+    zoom: dcd?.zoom ?? true,
   });
   // Latest control flags for the scattered TIME_CHANGE emit sites (mount,
   // preset, periodicity, drilldown) whose closures read via a ref.
@@ -1118,6 +1379,24 @@ export function LineChart({
     };
     if (axisColors.xLine) xAxis.lineColor = axisColors.xLine;
     if (miscColors.grid) xAxis.gridLineColor = miscColors.grid;
+    // Realtime: thin the dense minute-level category axis down to a handful of
+    // adaptive ticks (like v1's datetime axis). tickPositions are the category
+    // indices chosen by realtimeTicks. Day-or-larger ranges label every tick as a
+    // date; intraday ranges show the date at a midnight tick and HH:00 otherwise.
+    if (config?.realtimeMode && realtimeTicks && realtimeTicks.positions.length > 0) {
+      const tz = timeConfig?.timezone || undefined;
+      const daily = realtimeTicks.daily;
+      xAxis.tickPositions = realtimeTicks.positions;
+      xAxis.labels = {
+        ...xAxis.labels,
+        formatter: function (this: any) {
+          const t = catTimestamps[this.pos];
+          if (!t?.from) return this.value;
+          const p = tzParts(t.from, tz);
+          return daily || p.hour === 0 ? p.dateLabel : p.hourLabel;
+        },
+      };
+    }
     // Anomaly vertical markers — only in normal mode (shift/comparison series
     // indices don't align with the anomaly-evaluated series indices).
     xAxis.plotLines = chartMode === 'normal' ? (anomalyOverlay?.xPlotLines ?? []) : [];
@@ -1149,6 +1428,29 @@ export function LineChart({
     //    across the other shifts' buckets draws each shift as its own trend line.
     if (chartMode === 'shift') {
       opts.plotOptions = { series: { connectNulls: !shiftSubDaily } };
+      if (style?.enableAreaFill) {
+        // SDK shift series have no per-series type — they inherit chart.type.
+        // smooth=false → chart.type:'line'. Override via highchartsOptions so
+        // the SDK-generated shift series render as areaspline (curved + fill).
+        // highchartsOptions is deep-merged last and wins over the SDK's own type.
+        opts.chart = { ...opts.chart, type: 'areaspline' };
+      }
+    } else if (config?.realtimeMode && !hasBreakdownGaps) {
+      // Realtime is a live, continuous stream — bridge missing/irregular samples
+      // so it draws one smooth line (v1 parity) instead of breaking into
+      // disconnected segments (which, with area fill, look like vertical bars).
+      // BUT only when there are NO breakdown gaps: a genuine device-inactive
+      // span (major gap → null fillers) must still sever the line even in
+      // realtime, otherwise connectNulls:true would draw straight across the
+      // dead period and hide it.
+      opts.plotOptions = { series: { connectNulls: true } };
+    } else {
+      // Normal mode, OR realtime WITH breakdown gaps: explicitly DON'T bridge
+      // nulls, so both the breakdown-gap fillers AND any null-valued buckets the
+      // backend returns for a device-inactive span sever the line. Kept explicit
+      // (not a reliance on the Highcharts default) so a future SDK/default change
+      // can't silently connect across dead periods.
+      opts.plotOptions = { series: { connectNulls: false } };
     }
     // startOnTick/endOnTick ensure Highcharts always pads above and below
     // the data range, preventing a single-tick collapsed axis when all
@@ -1214,8 +1516,51 @@ export function LineChart({
       // it in each Highcharts series option. The SDK ignores unknown fields on the
       // `series` prop; highchartsOptions.series is the correct path.
       if (s.tooltip) so.tooltip = s.tooltip;
+      if (!effectiveTooltipOnlyFlags[i]) {
+        if (style?.enableAreaFill) {
+          so.type = 'areaspline';
+          // Fill down to the axis MINIMUM, not the default threshold of 0.
+          // Without this, an area series pins the y-axis to include 0, so a
+          // series around ~115 renders a huge 0–125 axis with the data squashed
+          // into a thin band (and, when the line breaks, tall bars from 0).
+          so.threshold = null;
+          const color = s.color || '#7cb5ec';
+          so.fillColor = {
+            linearGradient: { x1: 0, y1: 0, x2: 0, y2: 1 },
+            stops: [
+              [0, hexToRgba(color, 0.5)],
+              [1, hexToRgba(color, 0)],
+            ],
+          };
+        }
+        if (style?.showDataPoints) {
+          so.marker = { ...(so.marker ?? {}), enabled: true, symbol: 'square', radius: 4 };
+        }
+      }
       return so;
     });
+    // In shift mode the SDK generates its own Highcharts series internally from
+    // the `shift` prop. highchartsOptions.series[i] IS deep-merged onto those
+    // generated series, so we can inject per-shift fillColor gradients here.
+    // We override opts.series entirely for shift+areaFill because effectiveSeries
+    // (source-indexed, length = #sources) doesn't align with the SDK's expanded
+    // series (length = #sources × #shifts). Shift tooltip/legend are SDK-owned
+    // in this mode so the effectiveSeries-based per-series opts aren't needed.
+    if (chartMode === 'shift' && style?.enableAreaFill && shiftProp) {
+      opts.series = (shiftProp.series as any[]).map((ss: any) => ({
+        // Fill down to the axis MINIMUM, not the default threshold of 0 — else
+        // each shift area fills from 0 up to its value, rendering as tall solid
+        // bars from the axis bottom instead of a gradient under the line.
+        threshold: null,
+        fillColor: {
+          linearGradient: { x1: 0, y1: 0, x2: 0, y2: 1 },
+          stops: [
+            [0, hexToRgba(ss.shiftColor || '#7cb5ec', 0.5)],
+            [1, hexToRgba(ss.shiftColor || '#7cb5ec', 0)],
+          ],
+        },
+      }));
+    }
     // Override the SDK's defaultTooltip so per-series dataPrecision (valueDecimals)
     // is actually applied. The SDK renders c.y as a raw number via a custom HTML
     // formatter that ignores Highcharts' valueDecimals. We replicate its exact
@@ -1245,24 +1590,75 @@ export function LineChart({
             const name: string = c.series?.name ?? '';
             const precision = Math.max(0, Math.min(20, c.series?.options?.tooltip?.valueDecimals ?? 2));
             const yVal = typeof c.y === 'number' ? c.y.toFixed(precision) : '—';
+            // Unit appended after the value (v1 parity). Only when we have a real
+            // value and a meaningful unit.
+            const unit: string = c.series?.options?.tooltip?.unit ?? '';
+            const valueWithUnit = typeof c.y === 'number' && unit ? `${yVal} ${unit}` : yVal;
             const dashStyle: string = c.series?.options?.dashStyle ?? 'Solid';
             let lineRect = `<rect x="0" y="5" width="16" height="2" rx="1" fill="${color}"/>`;
             if (dashStyle !== 'Solid') {
               lineRect = [0, 7, 13].map((x) => `<rect x="${x}" y="5" width="4" height="2" fill="${color}"/>`).join('');
             }
             const svg = `<svg width="16" height="12" viewBox="0 0 16 12" style="flex:0 0 auto;vertical-align:-2px">${lineRect}<circle cx="8" cy="6" r="3" fill="${color}"/></svg>`;
-            return `<div style="display:flex;align-items:center;gap:6px;padding:1px 0;white-space:nowrap;font-family:${TOOLTIP_FONT}"><span style="display:inline-flex">${svg}</span><span style="font:400 13px/1.2 ${TOOLTIP_FONT};color:${primary}">${name} : </span><span style="font:700 13px/1.2 ${TOOLTIP_FONT};color:${primary}">${yVal}</span></div>`;
+            // Row typography mirrors v1: name in regular weight, value+unit bold, 14px.
+            return `<div style="display:flex;align-items:center;gap:6px;padding:1px 0;white-space:nowrap;font-family:${TOOLTIP_FONT}"><span style="display:inline-flex">${svg}</span><span style="font:400 14px/1.3 ${TOOLTIP_FONT};color:${primary}">${name} : </span><span style="font:600 14px/1.3 ${TOOLTIP_FONT};color:${primary}">${valueWithUnit}</span></div>`;
           });
-          const cat = (points[0] as any)?.point?.category ?? (this as any).x ?? '';
-          return rows.join('') + `<div style="margin-top:4px;font:400 12px/1.2 ${TOOLTIP_FONT};color:${secondary};white-space:nowrap">${cat}</div>`;
+          // Footer shows the hovered bucket's START – END range (v1 parity),
+          // read from catTimestamps by the point's category index. The interval
+          // END is the NEXT bucket's start (v1 uses current→next), which is what
+          // gives a real span even for zero-duration realtime points where
+          // from === to; falls back to this bucket's own `to`, then to a single
+          // stamp / the category label. Format: "DD MMM YYYY HH:mm" (no comma).
+          const idx = (points[0] as any)?.point?.index;
+          const bucket = typeof idx === 'number' ? catTimestamps[idx] : undefined;
+          const tzFooter = timeConfig?.timezone || undefined;
+          const fmtTs = (ms: number) => {
+            const parts = new Intl.DateTimeFormat('en-GB', {
+              timeZone: tzFooter,
+              day: '2-digit', month: 'short', year: 'numeric',
+              hour: '2-digit', minute: '2-digit', hour12: false,
+            }).formatToParts(new Date(ms));
+            const g = (t: string) => parts.find((p) => p.type === t)?.value ?? '';
+            return `${g('day')} ${g('month')} ${g('year')} ${g('hour')}:${g('minute')}`;
+          };
+          const start = bucket?.from;
+          const rawNext = typeof idx === 'number' ? catTimestamps[idx + 1]?.from : undefined;
+          const nextFrom =
+            typeof rawNext === 'number' && !Number.isNaN(rawNext) ? rawNext : undefined;
+          const end =
+            nextFrom ?? (bucket?.to && bucket.to !== bucket.from ? bucket.to : undefined);
+          const footer = start
+            ? end && end !== start
+              ? `${fmtTs(start)} - ${fmtTs(end)}`
+              : fmtTs(start)
+            : ((points[0] as any)?.point?.category ?? (this as any).x ?? '');
+          return rows.join('') + `<div style="margin-top:4px;font:400 12px/1.2 ${TOOLTIP_FONT};color:${secondary};white-space:nowrap">${footer}</div>`;
         },
       };
     }
     return opts as any;
-  }, [axisColors, miscColors, multiAxis, effectiveSeries, effectiveTooltipOnlyFlags, style?.card?.wrapInCard, style?.card?.backgroundColor, chartDisplay.zoom, anomalyOverlay, chartMode, plotLines, plotBands, activeChart, shiftSubDaily]);
+  }, [axisColors, miscColors, multiAxis, effectiveSeries, effectiveTooltipOnlyFlags, style?.card?.wrapInCard, style?.card?.backgroundColor, style?.enableAreaFill, style?.showDataPoints, chartDisplay.zoom, anomalyOverlay, chartMode, plotLines, plotBands, activeChart, shiftSubDaily, shiftProp, config?.realtimeMode, hasBreakdownGaps, realtimeTicks, catTimestamps, timeConfig?.timezone]);
 
   // The data table is portalled into the chart card (sibling of the canvas).
   const [cardEl, setCardEl] = useState<HTMLDivElement | null>(null);
+
+  // No-data empty state: measure the canvas width and constrain the empty-state
+  // block to computeNoDataWidth(width), kept vertically centered. Callback ref +
+  // ResizeObserver so it tracks widget resizes and mounts/unmounts cleanly.
+  const [noDataWidth, setNoDataWidth] = useState<number>();
+  const noDataRoRef = useRef<ResizeObserver | null>(null);
+  const emptyCanvasRefCb = useCallback((node: HTMLDivElement | null) => {
+    noDataRoRef.current?.disconnect();
+    if (!node) {
+      noDataRoRef.current = null;
+      return;
+    }
+    const measure = () => setNoDataWidth(computeNoDataWidth(node.clientWidth));
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(node);
+    noDataRoRef.current = ro;
+  }, []);
 
   // Local DatePicker state — initialized from the host-passed timeConfig.
   // On user pick, we emit TIME_CHANGE through onEvent so the host's data
@@ -1396,6 +1792,39 @@ export function LineChart({
     ev({ type: 'TIME_CHANGE', payload });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chartDisplay.clipping, chartDisplay.inexactMultiple]);
+
+  // Realtime mount emit (parity with ColumnChart's picker, which emits a
+  // TIME_CHANGE with a concrete window on mount).
+  //
+  // The mount TIME_CHANGE was removed for the normal path because the host fires
+  // the first resolveAndCompute itself by resolving the envelope's duration. In
+  // REALTIME that host-side resolution throws ("Cannot read properties of
+  // undefined (reading 'hour')") and retries in a loop until the user manually
+  // picks a duration (which emits a TIME_CHANGE with explicit start/end). We
+  // reproduce that fix automatically: on mount, if realtime is on, emit a
+  // TIME_CHANGE carrying the concrete window so the host uses explicit times and
+  // never runs the failing duration resolution. Gated to realtime so the normal
+  // path keeps its single host-driven query (no redundant duplicate).
+  const realtimeMountEmitRef = useRef(false);
+  useEffect(() => {
+    if (realtimeMountEmitRef.current) return;
+    if (!config?.realtimeMode) return;
+    const ev = onEventRef.current;
+    if (!ev || !initialRange) return;
+    realtimeMountEmitRef.current = true;
+    const startMs = new Date(initialRange.start).getTime();
+    const endMs = new Date(initialRange.end).getTime();
+    const payload = {
+      startTime: String(startMs),
+      endTime: String(endMs),
+      periodicity: selectedPeriodicity.toLowerCase(),
+      ...modeEventFields(startMs, endMs),
+      ...controlFlags(),
+    };
+    console.log('[LineChart] emitting TIME_CHANGE (realtime mount)', payload);
+    ev({ type: 'TIME_CHANGE', payload });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [config?.realtimeMode, initialRange]);
 
   const periodicityOptions = useMemo(() => {
     return getPresetPeriodicities(activePreset) ?? getValidPeriodicities(rangeValue);
@@ -1645,15 +2074,15 @@ export function LineChart({
               setSelectedPreset(v);
             }}
             placeholder="Select date range"
-            showShift={cfgShifts.length > 0 && ['minute', 'hourly'].includes(selectedPeriodicity.toLowerCase())}
+            showShift={cfgShifts.length > 0}
             shiftEnabled={draftShiftOn}
             onShiftToggle={draftActivateShift}
-            showComparison={cfgComparisonMode}
+            showComparison={cfgComparisonMode && !config?.realtimeMode}
             comparisonEnabled={draftComparisonOn}
             onComparisonToggle={draftActivateComparison}
-            showPeriodicity={activeChart?.chartType !== 'Realtime'}
+            showPeriodicity={!config?.realtimeMode && !cfgDisablePeriodicities}
             periodicitySlot={
-              activeChart?.chartType !== 'Realtime' ? (
+              !config?.realtimeMode && !cfgDisablePeriodicities ? (
                 <SelectInput
                   label=""
                   value={selectedPeriodicity}
@@ -1717,6 +2146,29 @@ export function LineChart({
           )
         }
       >
+        {isLoadingData ? (
+          // Still fetching (bound series, no data yet) — show a spinner, NOT the
+          // "no data" state which is only for a resolved-but-empty response.
+          <div className="lcw__loading-canvas">
+            <Spinner size="Medium" label="Loading data" labelPosition="Bottom" />
+          </div>
+        ) : hasAnySeries && !hasPlottableData ? (
+          // No plottable data (zero slots / all-null / backend error) — show the
+          // branded empty state in the canvas area, keeping the header + table.
+          // Matches v1's "Data not available" state.
+          <div className="lcw__empty-canvas" ref={emptyCanvasRefCb}>
+            <div
+              className="lcw__empty-inner"
+              style={noDataWidth ? { width: `${noDataWidth}px` } : undefined}
+            >
+              <EmptyState
+                illustration={<NoDataOneIllustration />}
+                title="Data not available"
+                description="We couldn't find any data matching your request"
+              />
+            </div>
+          </div>
+        ) : (
         <DSLineChart
           // Highcharts updates options in-place via React props for most
           // fields, but doesn't reliably pick up changes to deep style
@@ -1734,6 +2186,22 @@ export function LineChart({
             // Force remount when anomaly rules are added/removed so Highcharts
             // clears stale per-point marker objects from the old config.
             anomalyCount: activeChart.anomalies?.length ?? 0,
+            // Area fill and data points change the Highcharts series type/marker
+            // at options-build time; force a fresh instance so the SDK doesn't
+            // apply its own type/marker settings after our overrides.
+            areaFill: style?.enableAreaFill,
+            dataPoints: style?.showDataPoints,
+            // Data SHAPE signature — category count + total null-gap count.
+            // Highcharts updates category-axis series in place via chart.update()
+            // and does NOT reliably reopen a gap when breakdown null-fillers are
+            // added/removed on a re-fetch (e.g. duration change). Keying on the
+            // shape forces a fresh instance whenever the gap structure changes so
+            // the breakdown breaks always render. Value-only changes (same shape)
+            // still update in place — no needless remounts.
+            shape: `${categories.length}:${effectiveSeries.reduce(
+              (n, s) => n + (s.data?.reduce((m: number, v: any) => m + (v == null ? 1 : 0), 0) ?? 0),
+              0,
+            )}`,
           })}
           bare
           // null entries are valid Highcharts gaps; the SDK's LineSeries types
@@ -1746,8 +2214,8 @@ export function LineChart({
           // suppress the scrollable series legend so it doesn't show alongside.
           showLegend={shiftProp ? false : chartDisplay.legends}
           showDataLabels={chartDisplay.dataLabel}
-          showMarkers={false}
-          smooth
+          showMarkers={style?.showDataPoints ? true : false}
+          smooth={!style?.enableAreaFill}
           plotLines={[]}
           plotBands={[]}
           xAxisTitle={activeChart?.defaultAxis?.xAxisLabel || undefined}
@@ -1783,6 +2251,7 @@ export function LineChart({
             });
           }}
         />
+        )}
       </Chart>
       {cardEl &&
         showDataTable &&
@@ -2106,7 +2575,7 @@ function DataTablePreview({
   );
 
   const cellText = (values: number[], op: DataTableOperator, prec: number) =>
-    values.length ? aggregate(values, op).toFixed(prec) : '—';
+    values.length ? aggregate(values, op).toFixed(prec) : 'N/A';
 
   if (dataTable.transposeTable) {
     // Rows = data sources; one value column per operator.

@@ -26,12 +26,6 @@
   min-height: 100%;
 }
 
-/* Strip the SDK accordion body-inner wrapper's built-in padding across the
-   entire configurator — we own spacing via our own section classes. */
-.lc-config .fds-pa-item__body-inner {
-  padding: 0 !important;
-}
-
 /* fds-checkbox renders as inline-flex (shrinks to content width). Force full
    width so standalone checkboxes in accordion bodies and editor panels stay
    left-aligned instead of floating to the center of their flex container. */
@@ -114,7 +108,6 @@
 .lc-config__accordion .fds-pa-item__body-inner {
   display: flex;
   flex-direction: column;
-  gap: var(--spacing-02, 4px);
 }
 
 .lc-config__empty {
@@ -217,11 +210,14 @@
   inset: 0 !important;
   z-index: 10000 !important;
 }
-/* SelectInput, ColorInput, and UNSPathInput portal their popover to <body>.
-   At root level they must beat the modal backdrop (10000). */
+/* SelectInput, ColorInput, and UNSTreePicker portal their popover to <body>.
+   At root level they must beat the modal backdrop (10000). The picker's popover
+   class is `.fds-uns-tree-picker__popover` (was `.fds-uns-path-input__popover`
+   pre-migration) — this single selector is what makes the workspace list show
+   above the Data-tab side modal instead of behind it. */
 .fds-select-input__popover,
 .fds-color-input__popover,
-.fds-uns-path-input__popover {
+.fds-uns-tree-picker__popover {
   z-index: 10001 !important;
 }
 
@@ -658,10 +654,12 @@
   justify-content: space-between;
   gap: var(--spacing-03);
   padding: var(--spacing-02) 0;
+  width: 100%;
 }
 
 .lc-config__style-tab__switch-label {
   color: var(--text-default-primary);
+  flex: 1;
 }
 
 .lc-config__style-tab__block {
@@ -671,6 +669,10 @@
   gap: var(--spacing-03);
   padding-top: var(--spacing-02);
   text-align: left;
+}
+
+.lc-config__style-tab__block--full {
+  align-self: stretch;
 }
 
 .lc-config__style-tab__block-title {
