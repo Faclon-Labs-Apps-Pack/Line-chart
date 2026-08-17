@@ -922,17 +922,56 @@ export function LineChart({
   const hasBoundSeries = (activeChart?.series ?? []).some(
     (s) => isBound(s.unsPath || s.dataSource),
   );
+
+  // Has the host ever answered for this widget? Separates the FIRST-load spinner
+  // (nothing fetched yet) from a REFETCH spinner (data already on screen, a new
+  // query in flight). Set once real data lands, or once a pending refetch
+  // resolves (even to empty/error) — after that, an empty response means the
+  // dedicated "no data" screen, not another 15 s spinner.
+  const [everResolved, setEverResolved] = useState(false);
+
+  // Refetch-in-flight bridge. When the user changes the selected time window or
+  // periodicity, the widget emits TIME_CHANGE and the host re-queries — but the
+  // OLD `data` stays mounted until the response lands, so `dataEmpty` alone can't
+  // surface a loader on a refetch. `awaitingData` fills that gap: set the moment
+  // the user changes time/periodicity (via beginPendingFetch), cleared the moment
+  // a NEW `data` reference arrives (success OR empty/error) so the dedicated
+  // screen — chart, empty state — takes over.
+  const [awaitingData, setAwaitingData] = useState(false);
+  const awaitingDataRef = useRef(false);
+  const beginPendingFetch = () => {
+    awaitingDataRef.current = true;
+    setAwaitingData(true);
+  };
+  // A fresh `data` reference means the host responded. Drop the pending flag and
+  // mark the widget resolved so the appropriate resolved screen renders.
+  useEffect(() => {
+    if (awaitingDataRef.current) {
+      awaitingDataRef.current = false;
+      setAwaitingData(false);
+      setEverResolved(true);
+    } else if (data.length > 0) {
+      setEverResolved(true);
+    }
+  }, [data]);
+
+  // First-load spinner: bound series, no data yet, host hasn't answered. Refetch
+  // spinner: a user time/periodicity change is in flight. Either way, cap the
+  // spinner at LOADING_TIMEOUT_MS so a response that never reaches this widget
+  // (binding/routing issue, or an in-place data mutation) falls back gracefully.
+  const firstLoadPending = !everResolved && dataEmpty && hasBoundSeries;
+  const loaderActive = firstLoadPending || awaitingData;
   const [loadingExpired, setLoadingExpired] = useState(false);
   useEffect(() => {
-    if (!dataEmpty || !hasBoundSeries) {
+    if (!loaderActive) {
       setLoadingExpired(false);
       return;
     }
-    setLoadingExpired(false); // fresh fetch (data reference changed) → restart
+    setLoadingExpired(false); // fresh fetch (data ref changed / new request) → restart
     const t = setTimeout(() => setLoadingExpired(true), LOADING_TIMEOUT_MS);
     return () => clearTimeout(t);
-  }, [data, dataEmpty, hasBoundSeries]);
-  const isLoadingData = dataEmpty && hasBoundSeries && !loadingExpired;
+  }, [data, awaitingData, loaderActive]);
+  const isLoadingData = loaderActive && !loadingExpired;
 
   // "Add Source as Tooltip" — these series stay in the dataset (shared tooltip)
   // but render no line and no legend chip. Index-aligned with `series`.
@@ -1766,6 +1805,7 @@ export function LineChart({
       selectedPreset,
       payload: presetPayload,
     });
+    beginPendingFetch(); // show the loader until the host answers the new window
     onEventRef.current?.({ type: 'TIME_CHANGE', payload: presetPayload });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedPreset, allDurations, JSON.stringify(timeConfig?.cycleTime ?? null)]);
@@ -2063,6 +2103,7 @@ export function LineChart({
                 ...controlFlags(),
               };
               console.log('[LineChart] emitting TIME_CHANGE (manual range pick)', manualPayload);
+              beginPendingFetch(); // show the loader until the host answers the new window
               onEvent({ type: 'TIME_CHANGE', payload: manualPayload });
             }}
             showPresets={datePresets.length > 0}
@@ -2105,6 +2146,7 @@ export function LineChart({
                           if (!onEvent || !rangeValue) return;
                           const startTime = new Date(rangeValue.start).getTime();
                           const endTime = new Date(rangeValue.end).getTime();
+                          beginPendingFetch(); // loader until the host returns the new periodicity
                           onEvent({
                             type: 'TIME_CHANGE',
                             payload: {
@@ -2231,6 +2273,7 @@ export function LineChart({
             setSelectedPreset('');
             periodicityTouchedRef.current = true;
             setSelectedPeriodicity(finer);
+            beginPendingFetch(); // loader until the host returns the drill-down window
             onEvent({
               type: 'TIME_CHANGE',
               payload: {
