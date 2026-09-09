@@ -307,6 +307,7 @@ function normalizeStyling(raw: unknown): LineChartStyling {
           dataLabel: dcd?.dataLabel ?? false,
           clipping: dcd?.clipping ?? false,
           zoom: dcd?.zoom ?? true,
+          scroll: dcd?.scroll ?? false,
         },
       };
     }
@@ -334,11 +335,29 @@ function normalizeStyling(raw: unknown): LineChartStyling {
 // `startTime`/`endTime`/`timezone`/`shifts` in the resolveAndCompute call).
 // Setting `timeConfig: rawTimeTabConfig` does NOT work — the host needs
 // `type`, `pickerType`, `startTime: null`, `endTime: null`, etc.
-function toHostTimeConfig(t: TimeTabUIConfig): HostTimeConfig {
+function toHostTimeConfig(
+  t: TimeTabUIConfig,
+  globalTimepickers?: GTPGlobalTimepicker[],
+): HostTimeConfig {
   const pickerType = (t.linkTimeWith ?? t.timeType ?? 'local') as
     | 'local'
     | 'fixed'
     | 'global';
+  // Under a GTP, shifts/aggregator are INHERITED from the linked Global Time
+  // Picker (the SDK only persists the GTP id under `global.globalTimepickerId`;
+  // the shifts themselves live in the injected `globalTimepickers` prop, NOT in
+  // the config). Look them up from there — exactly like Column / Combined
+  // Bar-Line. The old code fell back to `t.shifts`, i.e. the LOCAL picker's
+  // shifts, so a GTP-linked chart emitted the user's local shifts (and, once
+  // the panel re-seeded, leaked them back into Local) — the reported bug.
+  const globalId =
+    (t.global as { globalTimepickerId?: string; id?: string } | undefined)?.globalTimepickerId ??
+    (t.global as { id?: string } | undefined)?.id ??
+    t.globalTimepickerId;
+  const linkedGtp =
+    pickerType === 'global'
+      ? (globalTimepickers ?? []).find((g) => g.id === globalId)
+      : undefined;
   const fd = t.fixed?.duration;
   const fixedDuration =
     pickerType === 'fixed' && fd
@@ -356,13 +375,21 @@ function toHostTimeConfig(t: TimeTabUIConfig): HostTimeConfig {
       : undefined;
   const cycleTime = pickerType === 'fixed' ? t.fixed?.cycleTime ?? null : t.cycleTime ?? null;
   return {
-    timezone: t.timezone,
+    // Timezone is stored PER-MODE by the SDK (Local → top-level `timezone`,
+    // Fixed → `fixed.timezone`, Global → the inherited `global.timezone`).
+    // Read it the same per-mode way every other setting below is read —
+    // otherwise a Fixed/Global timezone change is dropped and the stale
+    // top-level default (Asia/Kolkata) is sent in the payload.
+    timezone:
+      pickerType === 'fixed' ? (t.fixed?.timezone ?? t.timezone) :
+      pickerType === 'global' ? ((t.global as { timezone?: string } | undefined)?.timezone ?? t.timezone) :
+      t.timezone,
     type: pickerType === 'global' ? 'local' : pickerType,
     pickerType,
     // Preserve the GTP id so the widget can detect GTP mode even when Lens
     // pushes a runtime timeConfig update that doesn't include pickerType.
-    ...(pickerType === 'global' && (t.global as any)?.id
-      ? { globalTimepickerId: (t.global as any).id }
+    ...(pickerType === 'global' && globalId
+      ? { globalTimepickerId: globalId }
       : {}),
     cycleTime,
     startTime: null,
@@ -377,13 +404,17 @@ function toHostTimeConfig(t: TimeTabUIConfig): HostTimeConfig {
     // fall back to the Fixed scope. Mirror into HostTimeConfig so the widget can
     // hide its periodicity dropdown even when timeTabConfig is unavailable.
     disablePeriodicities: !!(t.disablePeriodicities ?? t.fixed?.disablePeriodicities),
+    // GTP: read the linked GTP's own shifts (never fall back to `t.shifts` =
+    // Local's). When the GTP isn't resolvable yet, emit none — the renderer
+    // derives shift identities from the resolved data's shift tags, same as the
+    // peer widgets. Fixed → fixed scope; Local → top level.
     shifts:
-      pickerType === 'fixed' ? (t.fixed?.shifts ?? t.shifts ?? []) :
-      pickerType === 'global' ? ((t.global as any)?.shifts ?? t.shifts ?? []) :
+      pickerType === 'fixed' ? (t.fixed?.shifts ?? []) :
+      pickerType === 'global' ? (linkedGtp?.shifts ?? []) :
       (t.shifts ?? []),
     shiftAggregator:
       pickerType === 'fixed' ? ((t.fixed as any)?.shiftAggregator ?? (t as any).shiftAggregator) :
-      pickerType === 'global' ? ((t.global as any)?.shiftAggregator ?? (t as any).shiftAggregator) :
+      pickerType === 'global' ? (linkedGtp?.shiftAggregator ?? (t as any).shiftAggregator) :
       (t as any).shiftAggregator,
     comparisonMode:
       pickerType === 'fixed' ? t.fixed?.comparisonMode :
@@ -408,6 +439,7 @@ function buildEnvelope(
   existing: LineChartEnvelope | undefined,
   uiConfig: LineChartUIConfig,
   timeTabConfig?: TimeTabUIConfig,
+  globalTimepickers?: GTPGlobalTimepicker[],
 ): LineChartEnvelope {
   // tc is the raw SDK TimeTabUIConfig used to rebuild both the host-shape
   // `timeConfig` (via toHostTimeConfig) and the re-hydration `timeTabConfig`.
@@ -485,32 +517,13 @@ function buildEnvelope(
     // re-opens the configurator.
     // Embed realtimeMode into both shapes so save.strategy.ts finds it in
     // whichever field it reads first — no dependency on widget.instance.config.uiConfig.
-    timeConfig: { ...toHostTimeConfig(tc), ...(cleanedUiConfig.realtimeMode ? { realtimeMode: true as const } : {}) },
+    timeConfig: { ...toHostTimeConfig(tc, globalTimepickers), ...(cleanedUiConfig.realtimeMode ? { realtimeMode: true as const } : {}) },
     timeTabConfig: cleanedUiConfig.realtimeMode ? ({ ...tc, realtimeMode: true } as typeof tc) : tc,
     // Persist the legacy-field-stripped uiConfig — never re-introduce
     // `series[].dataSource` into the saved envelope.
     uiConfig: cleanedUiConfig,
     dynamicBindingPathList,
   };
-  // Diagnostic: confirm the envelope we hand to iosense includes the
-  // host-shaped timeConfig (with `type`, `pickerType`, `defaultDurationId`,
-  // `allDurations`). If `timeConfig.type` is undefined on the next save, the
-  // host engine can't compute startTime/endTime → 422.
-  console.log('[Configurator] emit envelope →', {
-    _id: env._id,
-    timeConfigShape: env.timeConfig
-      ? {
-          type: (env.timeConfig as { type?: string }).type,
-          pickerType: (env.timeConfig as { pickerType?: string }).pickerType,
-          defaultDurationId: env.timeConfig.defaultDurationId,
-          allDurationsCount: env.timeConfig.allDurations?.length ?? 0,
-          defaultPeriodicity: env.timeConfig.defaultPeriodicity,
-          timezone: env.timeConfig.timezone,
-        }
-      : null,
-    bindingCount: env.dynamicBindingPathList.length,
-    bindingKeys: env.dynamicBindingPathList.map((b) => b.key),
-  });
   return env;
 }
 
@@ -830,6 +843,12 @@ export function LineChartConfiguration({
 
   // Full styling config (widget-level).
   const [styling, setStyling] = useState<LineChartStyling>(initialUiConfig.style);
+  // Mirror the latest committed styling in a ref so handleStylingChange can
+  // compute the next value synchronously (React does NOT guarantee the
+  // setStyling updater runs before the following emit — relying on that left a
+  // stale value in the emitted envelope, so the preview lagged one toggle).
+  const stylingRef = useRef<LineChartStyling>(initialUiConfig.style);
+  stylingRef.current = styling;
 
 
   // Deviation indicator preference — only meaningful when comparison mode is on.
@@ -1017,13 +1036,22 @@ export function LineChartConfiguration({
     if (topTab !== 'Time') return;
     const patch = () => {
       const shouldHide = activeChartIsRealtime;
-      const setVis = (el: HTMLElement | null) => {
-        if (el) el.style.display = shouldHide ? 'none' : '';
+      // `forceShow` FORCE-shows (not just clears inline) so this config's
+      // periodicity survives a leftover hide from a previously-open config — e.g.
+      // a Pie chart (no periodicity concept) that hid the periodicity field and
+      // didn't clean it up on unmount. An inline `!important` beats any leftover
+      // stylesheet rule, so a normal (non-realtime) Line/other chart always shows
+      // its periodicity again. Non-force elements just clear their inline display.
+      const setVis = (el: HTMLElement | null, forceShow = false) => {
+        if (!el) return;
+        if (shouldHide) el.style.setProperty('display', 'none', 'important');
+        else if (forceShow) el.style.setProperty('display', 'block', 'important');
+        else el.style.removeProperty('display');
       };
       // Periodicity SelectInputs (Add/Edit Duration modal + fixed-time config).
       document
         .querySelectorAll('input[name="periodicity"], input[name="fixed-duration-periodicity"]')
-        .forEach((inp) => setVis(inp.closest<HTMLElement>('.fds-ttc__required-select')));
+        .forEach((inp) => setVis(inp.closest<HTMLElement>('.fds-ttc__required-select'), true));
       // Duration-card "Periodicity: …" subtitles in the Time tab list.
       const root = timeTabRef.current;
       if (root) {
@@ -1040,7 +1068,18 @@ export function LineChartConfiguration({
     patch();
     const mo = new MutationObserver(patch);
     mo.observe(document.body, { childList: true, subtree: true });
-    return () => mo.disconnect();
+    return () => {
+      mo.disconnect();
+      // CRITICAL: the patch sets inline `display` (an `!important` force-show or
+      // a realtime hide) via a GLOBAL query, and inline styles PERSIST on the
+      // DOM node after this config unmounts. Without clearing them, a force-shown
+      // periodicity field would stay force-shown for the NEXT widget's config —
+      // e.g. showing periodicity in a Pie chart that has none. Clear every inline
+      // display this config may have set so the force-show never outlives it.
+      document
+        .querySelectorAll('input[name="periodicity"], input[name="fixed-duration-periodicity"]')
+        .forEach((inp) => inp.closest<HTMLElement>('.fds-ttc__required-select')?.style.removeProperty('display'));
+    };
   }, [topTab, activeChartIsRealtime]);
 
   // Single-open accordion behaviour for the Time tab (mirrors the Data tab).
@@ -1082,26 +1121,61 @@ export function LineChartConfiguration({
     return () => obs.disconnect();
   }, [topTab]);
 
-  // The SDK's TimeTabConfiguration adds document.addEventListener('mousedown') that
-  // closes all open panels unless the click target is inside .fds-ttc__panel-modal.
-  // SelectInput portals its dropdown to <body> as a sibling of the modal backdrop —
-  // outside .fds-ttc__panel-modal — so clicking any dropdown option trips the close
-  // handler before the option registers. Fix: intercept on document.body (fires before
-  // document in the bubble chain) and stop propagation when clicking a portaled popover
-  // while a TTC panel is open, so the SDK's document handler never fires.
+  // Keep the TimeTabConfiguration / configurator side modals (Add/Edit Duration,
+  // Add Shift, Add Data Source, …) open when interacting with a pop-out surface
+  // inside them. The Start/End Hour+Minute selects (a portaled `DropdownMenu`,
+  // `.fds-dropdown-menu`), the Periodicity / generic `SelectInput` dropdowns
+  // (`.fds-select-input__popover`), the shift-colour `ColorInput`
+  // (`.fds-color-input__popover`) and the UNS pickers
+  // (`.fds-uns-tree-picker__popover`) all render their popover through a portal
+  // OUTSIDE the modal's DOM. Clicking an option/hour/swatch therefore reads as
+  // "outside the modal" and dismisses it.
+  //
+  // Fix (ported verbatim from the working ColumnChart / Combined widget): ONE
+  // bubble-phase (NOT capture) `document` listener that inspects
+  // `composedPath()` — the event's real ancestor chain, accurate regardless of
+  // portals — and, when any ancestor matches a popover selector, calls BOTH
+  // `stopPropagation()` AND `preventDefault()`:
+  //   • `stopPropagation()` pre-empts the SDK's own outside-click check (also a
+  //     bubble-phase `document` mousedown listener) — same-node same-phase
+  //     listeners fire in REGISTRATION ORDER, and this effect mounts with the
+  //     whole configurator, before any modal can open, so it always wins.
+  //   • `preventDefault()` is the KEY the previous stopPropagation-only guard
+  //     missed. The Add-Shift hour/minute dropdown does NOT dismiss via a
+  //     mousedown outside-click listener — it dismisses via a FOCUS TRAP
+  //     (blur/focusout). A mousedown's native default action moves
+  //     `document.activeElement` to the clicked option (in a portal outside the
+  //     panel), so focus "escapes" the panel and the trap closes it before
+  //     `click` (the selection) even fires. Stopping propagation can't stop a
+  //     native focus shift; `preventDefault()` on mousedown suppresses it so the
+  //     field stays focused. `click` still fires afterward, so selection works.
+  // Bubble phase is deliberate: the event has already reached its real target
+  // (the option / swatch) before it bubbles to `document`, so nothing in the
+  // popover loses its own interaction. Remove once the SDK ships a fix.
   useEffect(() => {
-    function guardTTCPanels(e: MouseEvent) {
-      const target = e.target as Element | null;
-      if (!target) return;
-      if (
-        target.closest('.fds-select-input__popover, .fds-uns-tree-picker__popover') &&
-        document.querySelector('.fds-ttc__panel-modal')
-      ) {
-        e.stopPropagation();
+    const SELECTORS = ['.fds-select-input__popover', '.fds-color-input__popover', '.fds-uns-tree-picker__popover', '.fds-dropdown-menu'];
+    const EVENTS: Array<keyof DocumentEventMap> = ['pointerdown', 'mousedown'];
+    const guard = (e: Event) => {
+      const path = (e as { composedPath?: () => EventTarget[] }).composedPath?.() ?? [];
+      const matched = path.find(
+        (n): n is Element => n instanceof Element && SELECTORS.some((sel) => n.matches(sel)),
+      );
+      if (matched) {
+        // MUST be stopImmediatePropagation, not stopPropagation. The SDK's
+        // TimeTabConfiguration closes the Add/Edit Duration panel from its OWN
+        // `document` mousedown listener (keeps open only if the click is inside
+        // `.fds-ttc__panel-modal`/`.fds-list-card`; its dropdowns portal OUTSIDE
+        // the panel, so an option click reads as "outside"). Both listeners are
+        // on `document` — stopPropagation does NOT stop a same-node listener, so
+        // the panel still closed. stopImmediatePropagation stops later same-node
+        // listeners; ours registers on config mount (before the panel opens), so
+        // it wins and the panel stays open through the selection.
+        e.stopImmediatePropagation();
+        if (e.cancelable) e.preventDefault();
       }
-    }
-    document.body.addEventListener('mousedown', guardTTCPanels);
-    return () => document.body.removeEventListener('mousedown', guardTTCPanels);
+    };
+    EVENTS.forEach((ev) => document.addEventListener(ev, guard));
+    return () => EVENTS.forEach((ev) => document.removeEventListener(ev, guard));
   }, []);
 
   // Derived: GTPChart[] view of local charts — passed to TimeTabConfiguration's
@@ -1145,7 +1219,7 @@ export function LineChartConfiguration({
       advanceSettings: overrides?.advanceSettings ?? advanceSettings,
     };
 
-    onChange(buildEnvelope(config, uiConfig, overrides?.timeTabConfig ?? timeTabConfigRef.current));
+    onChange(buildEnvelope(config, uiConfig, overrides?.timeTabConfig ?? timeTabConfigRef.current, globalTimepickers));
   }
 
   // Update one field across the active chart, persisting downstream.
@@ -1166,7 +1240,13 @@ export function LineChartConfiguration({
             deviationIndicator,
             advanceSettings,
           },
-          timeTabConfig,
+          // Use the REF, not the `timeTabConfig` state — the state is
+          // intentionally NOT updated on every Time-tab change (that would reset
+          // the SDK panel), so it lags. Emitting with the stale state drops the
+          // latest time settings (e.g. comparisonMode), which flips the renderer
+          // back to normal the moment a plot line / axis / source is edited.
+          timeTabConfigRef.current,
+          globalTimepickers,
         ),
       );
       return next;
@@ -1601,7 +1681,9 @@ export function LineChartConfiguration({
             deviationIndicator,
             advanceSettings,
           },
-          timeTabConfig,
+          // REF, not the lagging `timeTabConfig` state (see updateActiveChart).
+          timeTabConfigRef.current,
+          globalTimepickers,
         ),
       );
       return next;
@@ -1613,11 +1695,12 @@ export function LineChartConfiguration({
   // never a stale closure. setStyling(fn) runs fn synchronously, letting us
   // capture `next` for the emit before React schedules the re-render.
   function handleStylingChange(updater: StylingUpdater) {
-    let next!: LineChartStyling;
-    setStyling(prev => {
-      next = updater(prev);
-      return next;
-    });
+    // Compute from the ref (always the latest committed value, even across
+    // several updates in one tick) so `next` is reliable — not dependent on
+    // React running the setStyling updater synchronously.
+    const next = updater(stylingRef.current);
+    stylingRef.current = next;
+    setStyling(next);
     emit({ styling: next });
   }
 
@@ -1635,7 +1718,9 @@ export function LineChartConfiguration({
       'Data Source': series.length,
       'Statistical Process Control': spcs.length,
       'Anomaly Highlighting': anomalies.length,
-      Axis: axes.length,
+      // +1 for the always-present, non-deletable default Left axis (rendered
+      // above the custom axes list); `axes` holds only the custom (right) axes.
+      Axis: axes.length + 1,
       'Plot Line': plotLines.length,
       'Plot Band': plotBands.length,
       'Data Table': dataTable.columns.length,
@@ -1714,12 +1799,14 @@ export function LineChartConfiguration({
           {/* Sticky header */}
           <div className="lc-config__col1-header">
             <div className="lc-config__col1-header-title">
-              <IconButton
-                icon={<ArrowLeft size={16} />}
-                size="Small"
-                accessibilityLabel="Back"
-                onClick={onBack}
-              />
+              <Tooltip bodyText="Close" placement="Bottom">
+                <IconButton
+                  icon={<ArrowLeft size={16} />}
+                  size="Small"
+                  accessibilityLabel="Back"
+                  onClick={onBack}
+                />
+              </Tooltip>
               <span className="lc-config__title BodyMediumSemibold">Line Chart</span>
             </div>
           </div>
@@ -1889,9 +1976,23 @@ export function LineChartConfiguration({
               </div>
             )}
 
-            {topTab === 'Time' && (
-              activeChart && activeChart.series.length > 0 ? (
-                <div className="lc-config__time-tab" ref={timeTabRef}>
+            {topTab === 'Time' && (() => {
+              // Show the time form ALWAYS. Until a data source exists the form is
+              // rendered but DISABLED (dimmed + pointer-events off via the
+              // `--disabled` modifier), so the user sees what's coming instead of
+              // a bare "add a data source first" message.
+              const hasDataSource = !!(activeChart && activeChart.series.length > 0);
+              return (
+                <div
+                  className={`lc-config__time-tab${hasDataSource ? '' : ' lc-config__time-tab--disabled'}`}
+                  ref={timeTabRef}
+                  aria-disabled={!hasDataSource}
+                >
+                  {/* {!hasDataSource && (
+                    <p className="lc-config__time-tab-hint">
+                      Add a data source in the <strong>Data</strong> tab to configure time.
+                    </p>
+                  )} */}
                   <TimeTabConfiguration
                     value={timeTabConfig}
                     onChange={handleTimeConfigChange}
@@ -1905,18 +2006,17 @@ export function LineChartConfiguration({
                       `lc-config__deviation-indicator` and "Advance Settings"
                       portals are removed. */}
                   {/* Replace the per-source chart Tabs with a single-select
-                      "Chart" dropdown (the SDK exposes no prop for this). */}
-                  <PerSourceChartDropdownPortal scope={timeTabRef} charts={gtpCharts} />
+                      "Chart" dropdown (the SDK exposes no prop for this). Only
+                      meaningful once sources exist. */}
+                  {hasDataSource && (
+                    <PerSourceChartDropdownPortal scope={timeTabRef} charts={gtpCharts} />
+                  )}
                 </div>
-              ) : (
-                <div className="lc-config__time-tab-empty">
-                  <span>Add a data source in the <strong>Data</strong> tab first.</span>
-                </div>
-              )
-            )}
+              );
+            })()}
 
             {topTab === 'Style' && (
-              <StylingSection value={styling} onChange={handleStylingChange} />
+              <StylingSection value={styling} onChange={handleStylingChange} isMultiChart={charts.length > 1} />
             )}
           </div>
         </div>
@@ -1968,6 +2068,9 @@ export function LineChartConfiguration({
                   key={addPanel.mode === 'edit' ? addPanel.itemId : 'new'}
                   initial={(editingItem as LineChartSeries | null) ?? null}
                   existingCount={series.length}
+                  existingNames={series
+                    .filter((s) => !(addPanel.mode === 'edit' && s._id === addPanel.itemId))
+                    .map((s) => s.name)}
                   unsWorkspaces={unsWorkspaces}
                   isLoadingWorkspaces={isLoadingWorkspaces}
                   loadUnsChildren={loadUnsChildren}
@@ -2357,13 +2460,15 @@ function ChartSettingsBlock({
           <span className="BodySmallSemibold">Chart Settings</span>
           <div className="lc-config__chart-settings-header-actions">
             <span className="lc-config__chart-settings-trash">
-              <IconButton
-                icon={<Trash2 size={16} />}
-                size="Medium"
-                emphasis="Intense"
-                accessibilityLabel="Delete chart"
-                onClick={onRequestDelete}
-              />
+              <Tooltip bodyText="Delete Chart" placement="Top">
+                <IconButton
+                  icon={<Trash2 size={16} />}
+                  size="Medium"
+                  emphasis="Intense"
+                  accessibilityLabel="Delete chart"
+                  onClick={onRequestDelete}
+                />
+              </Tooltip>
             </span>
           </div>
         </div>
@@ -2515,9 +2620,8 @@ function ChartSettingsDisplayMode({
             value={activeChart?.title ?? ''}
             isOpen={chartDropdownOpen}
             onOpenChange={setChartDropdownOpen}
-            onClick={() => setChartDropdownOpen((o) => !o)}
           >
-            <DropdownMenu>
+            <DropdownMenu className="lc-config__chart-list-menu">
               {charts.map((c) => (
                 <ActionListItem
                   key={c._id}
@@ -2557,6 +2661,7 @@ function ChartSettingsDisplayMode({
           label="Break Series Timeout"
           labelPosition="top"
           type="number"
+          min={0}
           suffix="sec"
           placeholder="Leave blank for auto"
           helpText="Gap larger than this breaks the line. Blank = adaptive."
@@ -3092,10 +3197,10 @@ function PerSourceChartSelect({
     <div className="lc-config__per-source-chart-field">
       <SelectInput
         label="Chart"
+        placeholder="Select chart"
         value={charts.find((c) => c.id === selected)?.name ?? ''}
         isOpen={open}
         onOpenChange={setOpen}
-        onClick={() => setOpen((o) => !o)}
       >
         <DropdownMenu>
           {charts.map((c) => (
@@ -3349,16 +3454,18 @@ function ItemCard({
         <ListCardTrailingItem
           trailing="Icon"
           icon={
-            <IconButton
-              icon={<Trash2 size={14} />}
-              size="Medium"
-              emphasis="Subtle"
-              accessibilityLabel={`Remove ${title}`}
-              onClick={(e) => {
-                e.stopPropagation();
-                onRemove();
-              }}
-            />
+            <Tooltip bodyText="Remove" placement="Top">
+              <IconButton
+                icon={<Trash2 size={14} />}
+                size="Medium"
+                emphasis="Subtle"
+                accessibilityLabel={`Remove ${title}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onRemove();
+                }}
+              />
+            </Tooltip>
           }
         />
       }
@@ -3389,6 +3496,9 @@ function useEditorBinding(
 interface DataSourceEditorProps {
   initial: LineChartSeries | null;
   existingCount: number;
+  // Names already taken by OTHER series on this chart (the one being edited is
+  // excluded) — used to block adding two data sources with the same name.
+  existingNames: string[];
   unsWorkspaces: UNSWorkspace[];
   isLoadingWorkspaces: boolean;
   loadUnsChildren: (wsId: string, parentId?: string) => Promise<UNSNode[]>;
@@ -3400,6 +3510,7 @@ interface DataSourceEditorProps {
 function DataSourceEditor({
   initial,
   existingCount,
+  existingNames,
   unsWorkspaces,
   isLoadingWorkspaces,
   loadUnsChildren,
@@ -3418,9 +3529,16 @@ function DataSourceEditor({
   const [limit, setLimit] = useState(initial?.limit ?? '');
   const [addAsTooltip, setAddAsTooltip] = useState(initial?.addAsTooltip ?? false);
 
-  // Name, Color and UNS Path are mandatory.
+  // A data source name must be unique within the chart (case-insensitive) —
+  // two series with the same name are indistinguishable in the legend/table.
+  const nameTaken =
+    name.trim().length > 0 &&
+    existingNames.some((n) => n.trim().toLowerCase() === name.trim().toLowerCase());
+
+  // Name, Color and UNS Path are mandatory; the name must also be unique.
   const isValid =
     name.trim().length > 0 &&
+    !nameTaken &&
     color.trim().length > 0 &&
     unsPath.trim().length > 0;
 
@@ -3451,6 +3569,10 @@ function DataSourceEditor({
         placeholder="Enter source name"
         value={name}
         necessityIndicator="required"
+        // Duplicate-name feedback via the SDK's own field error support
+        // (compact errorText under the field) instead of a custom hint span.
+        validationState={nameTaken ? 'error' : 'none'}
+        errorText={nameTaken ? 'A data source with this name already exists.' : undefined}
         onChange={({ value }: { name: string; value: string }) => setName(value)}
       />
 
@@ -3481,14 +3603,15 @@ function DataSourceEditor({
           label="Data Precision"
           labelPosition="top"
           type="number"
-          placeholder="Enter value"
+          min={0}
+          placeholder="e.g. 2"
           value={dataPrecision}
           onChange={({ value }: { name: string; value: string }) => setDataPrecision(value)}
         />
         <TextInput
           label="Unit"
           labelPosition="top"
-          placeholder="Enter value"
+          placeholder="e.g. kWh"
           value={limit}
           onChange={({ value }: { name: string; value: string }) => setLimit(value)}
         />
@@ -3669,8 +3792,13 @@ function AxisEditor({
 // Editor: Plot Line
 // ===========================================================================
 
-const LINE_STYLE_OPTIONS: PlotLineStyle[] = ['Solid', 'Dashed'];
-const PLOT_LINE_PERIODICITIES = ['hourly', 'daily', 'weekly', 'monthly'] as const;
+// Full Highcharts dash-style set, matching the ColumnChart / CombinedBarLine
+// plot line "Dash style" dropdown. (Legacy 'Dashed' is normalized to 'Dash'.)
+const LINE_STYLE_OPTIONS: PlotLineStyle[] = ['Solid', 'Dash', 'Dot', 'DashDot', 'LongDash', 'ShortDash'];
+// The full set of selectable periodicities, matching the widget renderer's
+// PERIODICITY_ORDER (Minute is intentionally excluded — not user-selectable).
+// A dependent plot line can be scoped to any of these.
+const PLOT_LINE_PERIODICITIES = ['hourly', 'daily', 'weekly', 'monthly', 'quarterly', 'yearly'] as const;
 
 interface PlotLineEditorProps {
   initial: LineChartPlotLine | null;
@@ -3713,7 +3841,10 @@ function PlotLineEditor({
   const [lineWidth, setLineWidth] = useState<string>(
     typeof initial?.lineWidth === 'number' ? String(initial.lineWidth) : '1',
   );
-  const [lineStyle, setLineStyle] = useState<PlotLineStyle>(initial?.lineStyle ?? 'Solid');
+  const [lineStyle, setLineStyle] = useState<PlotLineStyle>(
+    // Normalize the legacy 'Dashed' value to 'Dash' so it maps to a real option.
+    initial?.lineStyle === 'Dashed' ? 'Dash' : (initial?.lineStyle ?? 'Solid'),
+  );
   const [styleDropdownOpen, setStyleDropdownOpen] = useState(false);
   // Migrate from legacy type field
   const [periodicityType, setPeriodicityType] = useState<PlotLinePeriodicityType>(
@@ -3730,7 +3861,16 @@ function PlotLineEditor({
   const [periodicityDropdownOpen, setPeriodicityDropdownOpen] = useState(false);
   const [currentPeriodicity, setCurrentPeriodicity] = useState('');
 
-  const isValid = name.trim().length > 0;
+  // When "Dependent" is selected, a line width AND at least one periodicity must
+  // be chosen — a dependent line without periodicities can never render, and its
+  // width drives the (now periodicity-gated) rendering. Independent lines only
+  // need a name.
+  const widthNum = Number(lineWidth);
+  const widthValid = lineWidth.trim() !== '' && Number.isFinite(widthNum) && widthNum > 0;
+  const isDependent = periodicityType === 'dependent';
+  const isValid =
+    name.trim().length > 0 &&
+    (!isDependent || (widthValid && periodicities.length > 0));
 
   const submit = useCallback(() => {
     if (!isValid) return;
@@ -3795,7 +3935,6 @@ function PlotLineEditor({
         value={axisId ? (axes.find((a) => a._id === axisId)?.name ?? defaultAxisLabel) : defaultAxisLabel}
         isOpen={axisDropdownOpen}
         onOpenChange={setAxisDropdownOpen}
-        onClick={() => setAxisDropdownOpen((o) => !o)}
       >
         <DropdownMenu>
           <ActionListItem
@@ -3820,8 +3959,11 @@ function PlotLineEditor({
         <TextInput
           label="Width"
           labelPosition="top"
+          type="number"
+          min={0}
           placeholder="e.g. 2"
           value={lineWidth}
+          necessityIndicator={isDependent ? 'required' : undefined}
           onChange={({ value: v }: { name: string; value: string }) => setLineWidth(v)}
         />
         <SelectInput
@@ -3830,7 +3972,6 @@ function PlotLineEditor({
           value={lineStyle}
           isOpen={styleDropdownOpen}
           onOpenChange={setStyleDropdownOpen}
-          onClick={() => setStyleDropdownOpen((o) => !o)}
         >
           <DropdownMenu>
             {LINE_STYLE_OPTIONS.map((opt) => (
@@ -3879,7 +4020,6 @@ function PlotLineEditor({
               value={currentPeriodicity ? currentPeriodicity.charAt(0).toUpperCase() + currentPeriodicity.slice(1) : ''}
               isOpen={periodicityDropdownOpen}
               onOpenChange={setPeriodicityDropdownOpen}
-              onClick={() => setPeriodicityDropdownOpen((o) => !o)}
             >
               <DropdownMenu>
                 {PLOT_LINE_PERIODICITIES.filter((p) => !periodicities.includes(p)).map((p) => (
@@ -4009,7 +4149,6 @@ function PlotBandEditor({
         value={axisLabel}
         isOpen={axisDropdownOpen}
         onOpenChange={setAxisDropdownOpen}
-        onClick={() => setAxisDropdownOpen((o) => !o)}
       >
         <DropdownMenu>
           <ActionListItem
@@ -4279,7 +4418,6 @@ function SPCEditor({
         tags={dataSourceTags}
         isOpen={dataSourceDropdownOpen}
         onOpenChange={setDataSourceDropdownOpen}
-        onClick={() => setDataSourceDropdownOpen((o) => !o)}
         isDisabled={series.length === 0}
       >
         <DropdownMenu>
@@ -4321,7 +4459,6 @@ function SPCEditor({
         value={processTypeValue}
         isOpen={processTypeDropdownOpen}
         onOpenChange={setProcessTypeDropdownOpen}
-        onClick={() => setProcessTypeDropdownOpen((o) => !o)}
       >
         <DropdownMenu>
           {PROCESS_TYPE_OPTIONS.map((t) => (
@@ -4361,6 +4498,7 @@ function SPCEditor({
                   labelPosition="top"
                   necessityIndicator="required"
                   type="number"
+                  min={0}
                   placeholder="1"
                   value={avgLineWidth}
                   onChange={({ value }: { name: string; value: string }) =>
@@ -4399,6 +4537,7 @@ function SPCEditor({
                   labelPosition="top"
                   necessityIndicator="required"
                   type="number"
+                  min={0}
                   placeholder="1"
                   value={medLineWidth}
                   onChange={({ value }: { name: string; value: string }) =>
@@ -4449,6 +4588,7 @@ function SPCEditor({
                   labelPosition="top"
                   necessityIndicator="required"
                   type="number"
+                  min={0}
                   placeholder="1"
                   value={sdLineWidth}
                   onChange={({ value }: { name: string; value: string }) =>
@@ -4595,7 +4735,6 @@ function AnomalyEditor({
         value={applyToLabel}
         isOpen={applyToDropdownOpen}
         onOpenChange={setApplyToDropdownOpen}
-        onClick={() => setApplyToDropdownOpen((o) => !o)}
         isDisabled={series.length === 0}
       >
         <DropdownMenu>
@@ -4620,7 +4759,6 @@ function AnomalyEditor({
         value={operator}
         isOpen={operatorDropdownOpen}
         onOpenChange={setOperatorDropdownOpen}
-        onClick={() => setOperatorDropdownOpen((o) => !o)}
       >
         <DropdownMenu>
           {OPERATOR_OPTIONS.map((op) => (
@@ -4658,7 +4796,6 @@ function AnomalyEditor({
           value={existingLabel}
           isOpen={existingDropdownOpen}
           onOpenChange={setExistingDropdownOpen}
-          onClick={() => setExistingDropdownOpen((o) => !o)}
           isDisabled={series.length === 0}
         >
           <DropdownMenu>
@@ -4910,14 +5047,14 @@ function DataTableColumnEditor({
             <TextInput
               label="Data Precision"
               labelPosition="top"
-              placeholder="2"
+              placeholder="e.g. 2"
               value={dataPrecision}
               onChange={({ value }: { name: string; value: string }) => setDataPrecision(value)}
             />
             <TextInput
               label="Unit"
               labelPosition="top"
-              placeholder="Enter value"
+              placeholder="e.g. kWh"
               value={unit}
               onChange={({ value }: { name: string; value: string }) => setUnit(value)}
             />
@@ -5052,6 +5189,10 @@ type StylingUpdater = (prev: LineChartStyling) => LineChartStyling;
 interface StylingSectionProps {
   value: LineChartStyling;
   onChange: (updater: StylingUpdater) => void;
+  /** True when the widget has more than one chart. The chart title then doubles
+   *  as the chart switcher, so "Hide → Chart Title" is disabled (can't hide the
+   *  only way to switch charts). */
+  isMultiChart?: boolean;
 }
 
 interface FontWeightSelectProps {
@@ -5065,10 +5206,10 @@ function FontWeightSelect({ label, value, onChange }: FontWeightSelectProps) {
   return (
     <SelectInput
       label={label}
+      placeholder="Select weight"
       value={value}
       isOpen={isOpen}
       onOpenChange={setIsOpen}
-      onClick={() => setIsOpen((o) => !o)}
     >
       <DropdownMenu>
         {FONT_WEIGHTS.map((w) => (
@@ -5088,7 +5229,7 @@ function FontWeightSelect({ label, value, onChange }: FontWeightSelectProps) {
   );
 }
 
-function StylingSection({ value, onChange }: StylingSectionProps) {
+function StylingSection({ value, onChange, isMultiChart }: StylingSectionProps) {
   // Always reads from the latest state (prev), never from the render-closure `value`.
   function update<K extends keyof LineChartStyling>(
     key: K,
@@ -5133,9 +5274,11 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
         label="Border Width"
         labelPosition="top"
         type="number"
+        min={0}
+        placeholder="e.g. 1"
         value={String(value.card.borderWidth)}
         onChange={({ value: v }: { name: string; value: string }) =>
-          update('card', { borderWidth: v === '' ? 0 : Number(v) })
+          update('card', { borderWidth: Math.max(0, Number(v) || 0) })
         }
         suffix="px"
       />
@@ -5143,16 +5286,18 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
         label="Border Radius"
         labelPosition="top"
         type="number"
+        min={0}
+        placeholder="e.g. 8"
         value={String(value.card.borderRadius)}
         onChange={({ value: v }: { name: string; value: string }) =>
-          update('card', { borderRadius: v === '' ? 0 : Number(v) })
+          update('card', { borderRadius: Math.max(0, Number(v) || 0) })
         }
         suffix="px"
       />
 
       <div className="lc-config__style-tab__block">
         <Divider />
-        <p className="LabelMediumSemibold lc-config__style-tab__block-title">
+        <p className="BodySmallSemibold cc-config__style-section-heading">
           Hide Widget Element
         </p>
         <div className="lc-config__style-tab__checkbox-col">
@@ -5172,14 +5317,40 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
               onChange(prev => ({ ...prev, hideElements: { ...prev.hideElements, exportIcon: !prev.hideElements.exportIcon } }))
             }
           />
-          <Checkbox
-            label="Chart Title"
-            size="Medium"
-            checked={value.hideElements.chartTitle}
-            onChange={() =>
-              onChange(prev => ({ ...prev, hideElements: { ...prev.hideElements, chartTitle: !prev.hideElements.chartTitle } }))
-            }
-          />
+          {(() => {
+            const chartTitleCheckbox = (
+              <Checkbox
+                label="Chart Title"
+                size="Medium"
+                // With multiple charts the title IS the chart switcher — hiding it
+                // would remove the only way to switch charts, so the option is
+                // disabled and shown unchecked (title stays visible).
+                isDisabled={isMultiChart}
+                checked={isMultiChart ? false : value.hideElements.chartTitle}
+                onChange={() =>
+                  onChange(prev => ({ ...prev, hideElements: { ...prev.hideElements, chartTitle: !prev.hideElements.chartTitle } }))
+                }
+              />
+            );
+            // Only when disabled: explain WHY via a tooltip. Placement 'Right'
+            // points into the open area beside the config panel (the tooltip
+            // portals to <body> and auto-flips, so it's never clipped by the
+            // panel's overflow). The inline-block span gives a solid hover
+            // target even though the checkbox itself is disabled (a disabled
+            // control alone may not surface the tooltip on hover).
+            return isMultiChart ? (
+              <Tooltip
+                bodyText="Can't hide the chart title while more than one chart is added — the title row is the chart switcher used to move between charts."
+                placement="Right"
+              >
+                <span style={{ display: 'inline-block', width: 'fit-content' }}>
+                  {chartTitleCheckbox}
+                </span>
+              </Tooltip>
+            ) : (
+              chartTitleCheckbox
+            );
+          })()}
         </div>
       </div>
 
@@ -5200,7 +5371,7 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
         <>
           <div className="lc-config__style-tab__block lc-config__style-tab__block--full">
             <Divider />
-            <p className="LabelMediumSemibold lc-config__style-tab__block-title">
+            <p className="BodySmallSemibold cc-config__style-section-heading">
               Chart Controls
             </p>
             <div className="lc-config__style-tab__switch-row">
@@ -5251,11 +5422,23 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
                 accessibilityLabel="Default zoom enabled"
               />
             </div>
+            <div className="lc-config__style-tab__switch-row">
+              <span className="LabelMediumRegular lc-config__style-tab__switch-label">
+                Scroll
+              </span>
+              <Switch
+                isChecked={value.defaultChartDisplay?.scroll ?? false}
+                onChange={({ isChecked }: { isChecked: boolean }) =>
+                  onChange(prev => ({ ...prev, defaultChartDisplay: { ...(prev.defaultChartDisplay ?? {}), scroll: isChecked } }))
+                }
+                accessibilityLabel="Default horizontal scroll enabled"
+              />
+            </div>
           </div>
 
           <div className="lc-config__style-tab__block lc-config__style-tab__block--full">
             <Divider />
-            <p className="LabelMediumSemibold lc-config__style-tab__block-title">
+            <p className="BodySmallSemibold cc-config__style-section-heading">
               Line Style
             </p>
             <div className="lc-config__style-tab__switch-row">
@@ -5288,21 +5471,24 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
           {!value.hideElements.chartTitle && (
           <div className="lc-config__style-tab__block">
             <Divider />
-            <p className="LabelMediumSemibold lc-config__style-tab__block-title">
+            <p className="BodySmallSemibold cc-config__style-section-heading">
               Chart Title
             </p>
             <TextInput
               label="Title Font Size"
               labelPosition="top"
               type="number"
+              min={0}
+              placeholder="e.g. 18"
               value={String(value.chartTitle.fontSize)}
               onChange={({ value: v }: { name: string; value: string }) =>
-                update('chartTitle', { fontSize: v === '' ? 0 : Number(v) })
+                update('chartTitle', { fontSize: Math.max(0, Number(v) || 0) })
               }
               suffix="px"
             />
             <ColorInput
               label="Title Font Color"
+              placeholder="Select color"
               value={value.chartTitle.fontColor}
               onChange={(v) => update('chartTitle', { fontColor: v })}
             />
@@ -5316,21 +5502,24 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
 
           <div className="lc-config__style-tab__block">
             <Divider />
-            <p className="LabelMediumSemibold lc-config__style-tab__block-title">
+            <p className="BodySmallSemibold cc-config__style-section-heading">
               X Axis
             </p>
             <ColorInput
               label="Axis Text Color"
+              placeholder="Select color"
               value={value.xAxisLabel.textColor ?? '#050505'}
               onChange={(v) => update('xAxisLabel', { textColor: v })}
             />
             <ColorInput
               label="Axis Data Points"
+              placeholder="Select color"
               value={value.xAxisLabel.dataPointColor ?? '#050505'}
               onChange={(v) => update('xAxisLabel', { dataPointColor: v })}
             />
             <ColorInput
               label="X Axis Line"
+              placeholder="Select color"
               value={value.xAxisLabel.lineColor ?? '#DEE1E3'}
               onChange={(v) => update('xAxisLabel', { lineColor: v })}
             />
@@ -5338,16 +5527,18 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
 
           <div className="lc-config__style-tab__block">
             <Divider />
-            <p className="LabelMediumSemibold lc-config__style-tab__block-title">
+            <p className="BodySmallSemibold cc-config__style-section-heading">
               Y Axis
             </p>
             <ColorInput
               label="Axis Text Color"
+              placeholder="Select color"
               value={value.yAxisLabel.textColor ?? '#050505'}
               onChange={(v) => update('yAxisLabel', { textColor: v })}
             />
             <ColorInput
               label="Axis Data Points"
+              placeholder="Select color"
               value={value.yAxisLabel.dataPointColor ?? '#050505'}
               onChange={(v) => update('yAxisLabel', { dataPointColor: v })}
             />
@@ -5355,16 +5546,18 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
 
           <div className="lc-config__style-tab__block">
             <Divider />
-            <p className="LabelMediumSemibold lc-config__style-tab__block-title">
+            <p className="BodySmallSemibold cc-config__style-section-heading">
               Data Table
             </p>
             <ColorInput
               label="Header Background Color"
+              placeholder="Select color"
               value={value.dataTable.headerBackgroundColor}
               onChange={(v) => update('dataTable', { headerBackgroundColor: v })}
             />
             <ColorInput
               label="Header Text Color"
+              placeholder="Select color"
               value={value.dataTable.headerTextColor}
               onChange={(v) => update('dataTable', { headerTextColor: v })}
             />
@@ -5372,9 +5565,11 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
               label="Header Text Size"
               labelPosition="top"
               type="number"
+              min={0}
+              placeholder="e.g. 14"
               value={String(value.dataTable.headerTextSize)}
               onChange={({ value: v }: { name: string; value: string }) =>
-                update('dataTable', { headerTextSize: v === '' ? 0 : Number(v) })
+                update('dataTable', { headerTextSize: Math.max(0, Number(v) || 0) })
               }
               suffix="px"
             />
@@ -5387,9 +5582,11 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
               label="Data Point Text Size"
               labelPosition="top"
               type="number"
+              min={0}
+              placeholder="e.g. 12"
               value={String(value.dataTable.dataPointTextSize)}
               onChange={({ value: v }: { name: string; value: string }) =>
-                update('dataTable', { dataPointTextSize: v === '' ? 0 : Number(v) })
+                update('dataTable', { dataPointTextSize: Math.max(0, Number(v) || 0) })
               }
               suffix="px"
             />
@@ -5400,6 +5597,7 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
             />
             <ColorInput
               label="Data Point Text Color"
+              placeholder="Select color"
               value={value.dataTable.dataPointTextColor}
               onChange={(v) => update('dataTable', { dataPointTextColor: v })}
             />
@@ -5407,16 +5605,18 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
 
           <div className="lc-config__style-tab__block">
             <Divider />
-            <p className="LabelMediumSemibold lc-config__style-tab__block-title">
+            <p className="BodySmallSemibold cc-config__style-section-heading">
               Others
             </p>
             <ColorInput
               label="Grid Line Color"
+              placeholder="Select color"
               value={value.misc.gridLineColor}
               onChange={(v) => update('misc', { gridLineColor: v })}
             />
             <ColorInput
               label="Legend Text Color"
+              placeholder="Select color"
               value={value.misc.legendTextColor}
               onChange={(v) => update('misc', { legendTextColor: v })}
             />

@@ -101,7 +101,6 @@
 .lc-config__accordion {
   display: flex;
   flex-direction: column;
-  gap: var(--spacing-03, 8px);
 }
 
 /* Gap between items (ItemCards / form controls) inside any accordion section body. */
@@ -112,8 +111,8 @@
 
 .lc-config__empty {
   color: var(--text-gray-tertiary);
-  padding: var(--spacing-03);
   text-align: center;
+  margin-bottom:0;
 }
 
 /* ===========================================================================
@@ -130,6 +129,42 @@
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+
+/* Chart Title selector list: cap the height so many charts scroll instead of
+   overflowing the panel — ~7 rows then a scrollbar. Target both the menu root
+   and the SDK's inner scroll wrapper so whichever owns the height scrolls. */
+.lc-config__chart-list-menu,
+.lc-config__chart-list-menu .fds-dropdown-menu__wrapper {
+  max-height: min(320px, 60vh);
+  overflow-y: auto;
+}
+
+/* Long chart titles must truncate inside the switcher list, not stretch it.
+   The SDK's `.fds-action-list-item__title` already ellipsises, but its
+   `.fds-action-list-item__content{min-width:max-content}` keeps each row as
+   wide as its text — force min-width:0 so the row shrinks and the title
+   truncates within the panel-capped width. */
+.lc-config__chart-list-menu {
+  max-width: 260px !important;
+  overflow-x: hidden;
+}
+.lc-config__chart-list-menu .fds-dropdown-menu,
+.lc-config__chart-list-menu .fds-dropdown-menu__wrapper,
+.lc-config__chart-list-menu .fds-dropdown-menu__list,
+.lc-config__chart-list-menu .fds-action-list-item,
+.lc-config__chart-list-menu .fds-action-list-item__wrapper,
+.lc-config__chart-list-menu .fds-action-list-item__body,
+.lc-config__chart-list-menu .fds-action-list-item__content,
+.lc-config__chart-list-menu .fds-action-list-item__title-row {
+  min-width: 0 !important;
+  max-width: 100% !important;
+}
+.lc-config__chart-list-menu .fds-action-list-item__title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
 }
 
 .lc-side-modal .fds-modal__body {
@@ -167,7 +202,6 @@
 }
 .lc-config__axis-hint {
   color: var(--text-gray-tertiary);
-  padding: var(--spacing-02) var(--spacing-04) var(--spacing-03);
   margin: 0;
 }
 
@@ -210,15 +244,19 @@
   inset: 0 !important;
   z-index: 10000 !important;
 }
-/* SelectInput, ColorInput, and UNSTreePicker portal their popover to <body>.
-   At root level they must beat the modal backdrop (10000). The picker's popover
-   class is `.fds-uns-tree-picker__popover` (was `.fds-uns-path-input__popover`
-   pre-migration) — this single selector is what makes the workspace list show
-   above the Data-tab side modal instead of behind it. */
+/* SelectInput, ColorInput, and UNSTreePicker portal their popover to <body>
+   (via the SDK's getPortalContainer). At root level they must beat the modal
+   backdrop (10000) AND the in-modal DropdownMenu lift (10002). We use 10003 so
+   the workspace list always floats above the Data-tab side modal — never behind.
+   The picker's popover class is `.fds-uns-tree-picker__popover` (was
+   `.fds-uns-path-input__popover` pre-migration). NOTE: if the DEPLOYED CSS still
+   references the old `path-input` class, a migrated picker falls back to the SDK
+   default (500) and renders BEHIND the 10000 backdrop — redeploy the config
+   bundle to pick up this rule. */
 .fds-select-input__popover,
 .fds-color-input__popover,
 .fds-uns-tree-picker__popover {
-  z-index: 10001 !important;
+  z-index: 10003 !important;
 }
 
 /* SDK TimeTabConfiguration's Add Duration / Add Shift popups are actually
@@ -466,6 +504,23 @@
   overflow-y: auto;
 }
 
+/* No data source yet — show the time form but disable it: dim the FORM only
+   (not the hint) and swallow all pointer interaction so nothing can be edited
+   until a source is added. `.fds-ttc` is the SDK TimeTabConfiguration root. */
+.lc-config__time-tab--disabled .fds-ttc {
+  opacity: 0.5;
+}
+.lc-config__time-tab--disabled .fds-ttc,
+.lc-config__time-tab--disabled .fds-ttc * {
+  pointer-events: none !important;
+}
+.lc-config__time-tab-hint {
+  margin: 0 0 var(--spacing-04, 12px);
+  padding: var(--spacing-03, 8px) var(--spacing-04, 12px);
+  color: var(--text-gray-tertiary, #6B7280);
+  font-size: var(--font-size-02, 14px);
+}
+
 .lc-config__time-tab-empty {
   display: flex;
   align-items: center;
@@ -620,6 +675,7 @@
   flex-direction: column;
   gap: var(--spacing-04);
   padding: var(--spacing-04);
+  padding-bottom: var(--spacing-08);
 }
 
 .lc-config__section {
@@ -675,9 +731,15 @@
   align-self: stretch;
 }
 
-.lc-config__style-tab__block-title {
+/* Standard config section heading — bolder BodySmallSemibold typography, used
+   for ALL config section headers (Hide Widget Elements, Advanced Settings, etc.)
+   so they match the other chart configs. Rendered as a <p>, so reset margin to 0
+   (kills the browser's default paragraph margin-top/bottom) — the same way the
+   Column Chart config resets its heading/title elements. Spacing between blocks
+   comes from the parent flex `gap`, not per-heading margins. */
+.cc-config__style-section-heading {
+  margin: 0;
   color: var(--text-default-primary);
-  margin-top: var(--spacing-02);
   align-self: flex-start;
   text-align: left;
 }

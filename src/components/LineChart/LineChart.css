@@ -8,6 +8,25 @@
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  /* Positioning context for the refetch loading overlay (inset: 0). */
+  position: relative;
+}
+
+/* Refetch loading overlay — sits over the whole widget while data re-resolves
+   (time / periodicity change, compare/shift toggle, or a GTP-driven requery).
+   A translucent surface lets the previous chart show through faintly, reading
+   as a refresh rather than a remount. Theme-aware via the surface token.
+   Mirrors CombinedBarLineChart's .cc-widget__loading-overlay. */
+.lcw__loading-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+  background: color-mix(in srgb, var(--background-surface-intense, #fff) 65%, transparent);
+  border-radius: inherit;
+  cursor: progress;
 }
 
 /* Empty state needs an actual surface — the dashboard layer behind us is grey,
@@ -72,6 +91,18 @@
   flex-direction: column;
 }
 
+/* Wrap Into Card OFF — strip the SDK Chart's built-in card surface (it hardcodes
+   background/border/padding/radius on `.fds-chart` via CSS). !important so it
+   always wins over the SDK rule and any inline-style ordering, making the
+   Wrap-Into-Card toggle actually take effect. The chart then sits transparently
+   in whatever the dashboard provides. */
+.lcw--no-card > .fds-chart {
+  background: transparent !important;
+  border: none !important;
+  padding: 0 !important;
+  box-shadow: none !important;
+}
+
 /* Canvas slot (direct parent of DSLineChart) must grow to fill the card. */
 .lcw .fds-chart__canvas {
   flex: 1 1 auto;
@@ -123,8 +154,71 @@
 .lcw .fds-chart__scrollable-legend,
 .lcw .fds-chart__scrollable-legend-item,
 .lcw .fds-chart__legend,
-.lcw .fds-chart__footer {
+.lcw .fds-chart__footer,
+/* SDK ≥0.7.x renamed the line-chart legend to `.fds-chart-legend`
+   (hyphen, not `__legend`). Cover both so the legend strip paints the card
+   color like the chart canvas — otherwise it stays the SDK's default white. */
+.lcw .fds-chart-legend,
+.lcw .fds-chart-legend__item,
+.lcw .fds-chart-legend__item--static,
+.lcw .fds-chart-legend__separator {
   background-color: var(--lcw-card-bg, transparent) !important;
+}
+
+/* ── Header overflow fix ──────────────────────────────────────────────────
+   The SDK (0.7.31) keeps every header control except the title from shrinking
+   via `.fds-chart__header-row > :not(.fds-chart__title):not(.fds-chart-
+   switcher__title){flex-shrink:0}`. That selector excludes only `.fds-chart__
+   title` (which the SDK builds ONLY for a STRING title) and `.fds-chart-
+   switcher__title`. LineChart always passes a React NODE as the title, so the
+   SDK renders it RAW — the node becomes the direct header-row child and, unless
+   it carries one of those two classes, gets `flex-shrink:0` forced onto it. A
+   long title then holds its full width and pushes the settings/export icons off
+   the tile instead of truncating. Two title shapes to cover:
+
+   1. Single chart → `TruncatingChartTitle`: an SDK Tooltip whose wrapper
+      (`.lcw__chart-title-wrap`, merged onto `.fds-tooltip-wrapper`) is the
+      direct header-row child, with the title `<span class="lcw__chart-title">`
+      inside it. The wrapper matches the SDK exclusion selector, so flex-shrink:0
+      is forced (specificity 3 classes, tying ours) — hence `!important` on the
+      shrink. The inner span owns the ellipsis; the full title surfaces via the
+      Tooltip only when actually clipped.
+   2. Multi chart → `ChartTitleSwitcher`'s root `.fds-chart-switcher__title`. The
+      SDK EXCLUDES it from flex-shrink:0 (so shrink stays 1) but ships NO rule
+      for it at all, leaving `min-width:auto` — which floors it at the full
+      nowrap text width, so it still won't shrink. `min-width:0` unlocks the
+      inner `.fds-chart__title` / `.fds-chart__title-label` (already ellipsised
+      by the SDK). The Tooltip wrapper nested inside it
+      (`.lcw__switcher-title-wrap`) needs `min-width:0` too, or it re-floors the
+      label at full width. The `.fds-chart__view-switcher` selector is defensive
+      cover in case a future SDK/path wraps the title in that ChartSwitcher div. */
+.lcw .fds-chart__header-row > .lcw__chart-title-wrap {
+  display: flex;
+  flex: 1 1 0 !important;   /* re-enable shrink (SDK forced flex-shrink:0) */
+  min-width: 0;
+  overflow: hidden;
+}
+
+.lcw .lcw__chart-title {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lcw .fds-chart-switcher__title,
+.lcw .fds-chart__view-switcher {
+  display: flex !important;
+  flex-shrink: 1 !important;
+  min-width: 0;
+}
+
+.lcw .lcw__switcher-title-wrap {
+  display: flex;
+  flex: 0 1 auto;
+  min-width: 0;
 }
 
 /* The header's absolute-positioned dropdown menus must float above the chart
@@ -148,11 +242,22 @@
 
 /* Stretch the underlying highcharts SVG so it reflows with the chart card,
    not its mount-time intrinsic size. Without this the canvas freezes at its
-   first measured height when the dashboard layer resizes us. */
+   first measured height when the dashboard layer resizes us.
+   HEIGHT is always forced (the responsiveness fix this was added for). */
 .lcw .highcharts-container,
 .lcw .highcharts-container svg {
-  width: 100% !important;
   height: 100% !important;
+}
+
+/* WIDTH is forced to 100% ONLY when scroll is OFF. When the "Scroll" toggle is
+   on, the SDK enables Highcharts `scrollablePlotArea`, which makes the inner
+   container/SVG WIDER than the viewport — that extra width is exactly what
+   scrolls. Forcing `width:100% !important` here would clamp it back to the
+   viewport, so the plot never overflows and nothing scrolls (labels squash
+   off instead). Excluding `.lcw--scroll` lets Highcharts own the width. */
+.lcw:not(.lcw--scroll) .highcharts-container,
+.lcw:not(.lcw--scroll) .highcharts-container svg {
+  width: 100% !important;
 }
 
 /* Periodicity dropdown that sits inside the DatePicker's periodicitySlot. */
@@ -223,3 +328,92 @@
 .lcw__data-table .fds-table__row:hover {
   --fds-row-bg: transparent;
 }
+
+/* ── Card background carry-through ────────────────────────────────────────
+   Three pieces of SDK chrome paint their OWN opaque surface
+   (`--background-surface-intense`, i.e. white) and so ignore the card
+   background the user picks in the Style tab:
+     1. the DatePicker trigger (`.fds-date-trigger__field` + its preset chip)
+     2. the periodicity SelectInput (a TextInput field under the hood)
+     3. the data table's body rows/cells
+   Repaint all three with `--lcw-card-bg` (published on `.lcw` by
+   `widgetStyle` in LineChart.tsx; `transparent` when wrap-into-card is OFF).
+   The header row is NOT included — it has its own Style tab color
+   (`dataTable.headerBackgroundColor`). */
+
+/* 1 + 2 — header controls. Hover/open states are listed explicitly because the
+   SDK swaps in `--background-gray-default` on interaction. */
+.lcw .fds-date-trigger__field,
+.lcw .fds-date-trigger__field:hover,
+.lcw .fds-date-trigger--open .fds-date-trigger__field,
+.lcw .fds-date-trigger__field:focus-visible,
+.lcw .fds-date-trigger__preset,
+.lcw .fds-date-trigger__preset:hover,
+.lcw .fds-date-trigger__preset:focus-visible,
+.lcw .fds-datepicker__periodicity .fds-text-input__field,
+.lcw .fds-datepicker__periodicity .fds-text-input__field:hover {
+  background-color: var(--lcw-card-bg, transparent) !important;
+}
+
+/* Text + icons inside those controls use hardcoded dark SDK tokens, which
+   disappear on a dark card. `--lcw-card-fg` is only published when the card
+   background is dark enough to need white text (see readableForeground in
+   LineChart.tsx) — the fallback in each `var()` is the SDK's own token, so a
+   light card renders exactly as before. */
+.lcw .fds-date-trigger__value,
+.lcw .fds-date-trigger__input,
+.lcw .fds-date-trigger__icon,
+.lcw .fds-date-trigger__preset-label,
+.lcw .fds-datepicker__periodicity .fds-text-input__input {
+  color: var(--lcw-card-fg, var(--text-gray-secondary));
+}
+
+.lcw .fds-date-trigger__preset-expand {
+  color: var(--lcw-card-fg, var(--text-gray-tertiary));
+}
+
+.lcw .fds-datepicker__periodicity .fds-select-input__chevron {
+  color: var(--lcw-card-fg, var(--text-gray-primary));
+}
+
+/* 3 — data table body. `.fds-table__cell` paints an opaque surface AND a
+   `::before` overlay driven by `--fds-row-bg`; both must follow the card. */
+.lcw__data-table .fds-table__row,
+.lcw__data-table .fds-table__row:hover {
+  --fds-row-bg: var(--lcw-card-bg, transparent);
+  background-color: var(--lcw-card-bg, transparent);
+}
+
+.lcw__data-table .fds-table__cell {
+  background-color: var(--lcw-card-bg, transparent);
+}
+
+/* Chart-switcher dropdown (portaled to <body>, so NOT scoped under .lcw). Long
+   chart titles must truncate inside the menu.
+
+   TEMPORARILY DISABLED to test SDK 0.7.38's built-in switcher-menu max-width.
+   If 0.7.38 caps the menu and truncates long titles on its own, delete this
+   block for good. If it does NOT, re-enable it (it caps the menu hard and
+   forces every ancestor of the title to shrink so the ellipsis engages). */
+/*
+.lcw__chart-switcher-menu {
+  max-width: 320px !important;
+}
+.lcw__chart-switcher-menu .fds-dropdown-menu,
+.lcw__chart-switcher-menu .fds-dropdown-menu__wrapper,
+.lcw__chart-switcher-menu .fds-dropdown-menu__list,
+.lcw__chart-switcher-menu .fds-action-list-item,
+.lcw__chart-switcher-menu .fds-action-list-item__wrapper,
+.lcw__chart-switcher-menu .fds-action-list-item__body,
+.lcw__chart-switcher-menu .fds-action-list-item__content,
+.lcw__chart-switcher-menu .fds-action-list-item__title-row {
+  min-width: 0 !important;
+  max-width: 100% !important;
+}
+.lcw__chart-switcher-menu .fds-action-list-item__title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+*/

@@ -20,7 +20,6 @@ import type {
   ShiftWindow,
   WidgetEvent,
 } from './iosense-sdk/types';
-import '@faclon-labs/design-sdk/styles.css';
 import './App.css';
 
 const TOKEN_STORAGE_KEY = 'iosense_bearer_token';

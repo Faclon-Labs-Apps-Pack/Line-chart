@@ -1,10 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 
-import Highcharts from 'highcharts';
-import HC_Exporting from 'highcharts/modules/exporting';
-import HC_ExportData from 'highcharts/modules/export-data';
-import HC_FullScreen from 'highcharts/modules/full-screen';
 import { LineChart as DSLineChart } from '@faclon-labs/design-sdk/LineChart';
 import { Chart, exportChart } from '@faclon-labs/design-sdk/Chart';
 import { IconButton } from '@faclon-labs/design-sdk/IconButton';
@@ -17,7 +13,7 @@ import type { DateRange, DatePresetOption } from '@faclon-labs/design-sdk/DatePi
 import { DropdownMenu } from '@faclon-labs/design-sdk/DropdownMenu';
 import { ActionListItem } from '@faclon-labs/design-sdk/ActionListItem';
 import { SelectInput } from '@faclon-labs/design-sdk/SelectInput';
-import { ChevronDown, Settings, Menu, Download, Info } from 'react-feather';
+import { ChevronDown, Settings, Menu, Info } from 'react-feather';
 import { Tooltip } from '@faclon-labs/design-sdk/Tooltip';
 import {
   Table,
@@ -41,23 +37,14 @@ import type {
   SeriesPayload,
   WidgetEvent,
 } from '../../iosense-sdk/types';
-import '@faclon-labs/design-sdk/base.css';
 import './LineChart.css';
 
-// Register the Highcharts modules the SDK chart's actions slot will call
-// downstream (export to PNG/SVG/CSV/XLS, fullscreen toggle). Without these
-// registered at module load, chart.exportChart() / fullscreen.toggle() are
-// undefined and silently no-op. Order matters: `exporting` must register
-// before `export-data` (the latter extends the former).
-function installHcModule(mod: unknown) {
-  const factory = typeof mod === 'function' ? mod : (mod as { default?: unknown }).default;
-  if (typeof factory === 'function') (factory as (h: typeof Highcharts) => void)(Highcharts);
-}
-if (typeof window !== 'undefined') {
-  installHcModule(HC_Exporting);
-  installHcModule(HC_ExportData);
-  installHcModule(HC_FullScreen);
-}
+// Highcharts (the SDK LineChart engine) and its exporting / export-data /
+// full-screen modules are served ONCE by the host as `window.Highcharts`, the
+// same single copy the externalised design-sdk uses — so this widget no longer
+// imports or registers Highcharts itself (mirrors ColumnChart / CombinedBarLine).
+// Export/CSV are registered by the SDK's own Chart setup; the host must load the
+// full-screen module onto window.Highcharts for the fullscreen toggle.
 
 // ---------------------------------------------------------------------------
 // LineChart widget — pure UI renderer (DataLayer architecture).
@@ -104,6 +91,12 @@ interface LineChartWidgetProps {
     sourceDeviationOverrides?: Record<string, string>;
   };
   onEvent?: (event: WidgetEvent) => void;
+  // Host-driven loading flag. Lens sets this true while it re-resolves data —
+  // including GTP-driven refetches the widget itself never emitted (the GTP
+  // broadcasts the new window, so `beginPendingFetch` never fires). Without
+  // reading it, a GTP time change leaves the stale chart on screen with no
+  // loader. Drives the refetch overlay; mirrors CombinedBarLineChart.
+  loading?: boolean;
   // Full TimeTabConfiguration UI state — Lens passes this as a separate
   // envelope-level prop so the widget can read defaultDisplayMode on mount.
   timeTabConfig?: import('../../iosense-sdk/types').TimeTabUIConfig;
@@ -119,6 +112,44 @@ const FONT_WEIGHT: Record<string, number> = {
   'Semi-Bold': 600,
   Bold: 700,
 };
+
+/** Parse `#rgb` / `#rrggbb` / `#rrggbbaa` / `rgb()` / `rgba()` into [r,g,b].
+ *  Returns null for named colors, `transparent`, or anything unparseable. */
+function parseColor(c: string): [number, number, number] | null {
+  const s = c.trim();
+  const hex = s.match(/^#([0-9a-f]{3,8})$/i)?.[1];
+  if (hex) {
+    const full =
+      hex.length === 3 || hex.length === 4
+        ? hex.slice(0, 3).split('').map((ch) => ch + ch).join('')
+        : hex.slice(0, 6);
+    if (full.length !== 6) return null;
+    return [
+      parseInt(full.slice(0, 2), 16),
+      parseInt(full.slice(2, 4), 16),
+      parseInt(full.slice(4, 6), 16),
+    ];
+  }
+  const rgb = s.match(/^rgba?\(\s*([\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)/i);
+  if (rgb) return [Number(rgb[1]), Number(rgb[2]), Number(rgb[3])];
+  return null;
+}
+
+/** Readable foreground for a given background. The SDK's DatePicker trigger and
+ *  periodicity SelectInput hardcode dark text tokens; once we repaint their
+ *  surface with a user-picked (possibly dark) card color, that text would
+ *  vanish. Flip to white on dark backgrounds. Returns null when the color can't
+ *  be parsed (e.g. `transparent`) so the SDK default is left alone. */
+function readableForeground(bg: string): string | null {
+  const rgb = parseColor(bg);
+  if (!rgb) return null;
+  const [r, g, b] = rgb.map((v) => {
+    const n = v / 255;
+    return n <= 0.03928 ? n / 12.92 : Math.pow((n + 0.055) / 1.055, 2.4);
+  });
+  const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  return luminance > 0.45 ? null : '#FFFFFF';
+}
 
 const OPERATOR_LABEL: Record<DataTableOperator, string> = {
   sum: 'Sum',
@@ -382,6 +413,9 @@ type ChartDisplay = {
   // Mutually exclusive with `clipping` (Clipping is disabled while this is on).
   inexactMultiple: boolean;
   zoom: boolean;
+  // Horizontal plot-area scroll (SDK `scrollable`). When on, a dense category
+  // axis scrolls instead of cramming every label; legend + axis titles stay put.
+  scroll: boolean;
 };
 
 function columnLabel(col: DataTableColumn, seriesById: Map<string, LineChartSeries>): string {
@@ -480,12 +514,94 @@ function shiftEventPayload(
   return { shifts, shiftAggregator: shiftAggregatorOperator(aggregator) };
 }
 
+// Coerce a backend slot value into a plottable number-or-null. The engine
+// (notably the GTP/Lens path) can serialize numeric values as STRINGS
+// ("42.5") — the old `typeof v === 'number' ? v : null` turned every one of
+// those into null, so the whole series read as empty and the widget showed the
+// "no data" screen even though ColumnChart (which coerces) plotted the same
+// data. Numbers pass through; non-empty numeric strings are parsed; null,
+// empty, and genuine non-numeric sentinels (e.g. " N/A") become null (a gap).
+function coerceSlotValue(raw: unknown): number | null {
+  if (typeof raw === 'number') return Number.isFinite(raw) ? raw : null;
+  if (typeof raw === 'string' && raw.trim() !== '') {
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+// Minimal HTML-escape for values interpolated into useHTML Highcharts strings.
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// Highcharts plot-line label. Highcharts places every plot-line label at the
+// same default right-edge spot with no collision avoidance, so a second plot
+// line's label landed directly on top of the first and only one showed (the
+// reported "second plot line text not showing"). Anchoring the label to its
+// OWN line via `verticalAlign:'middle'` fixes that: each label sits on its line
+// at a fixed small offset, so lines at different values get separated labels
+// with equal spacing. (Two labels only coincide if their lines have nearly the
+// same value — a rare edge case the user can resolve by renaming/repositioning.)
+// Horizontal (`rotation:0`) and colored to match its line so it reads at a glance.
+function buildPlotLineLabel(text: string, color: string | undefined) {
+  return {
+    text,
+    align: 'right' as const,
+    verticalAlign: 'middle' as const,
+    rotation: 0,
+    x: -6,
+    y: -6,
+    ...(color ? { style: { color } } : {}),
+  };
+}
+
+// True when `ref`'s element is horizontally clipped (its content is wider than
+// its visible box), i.e. an ellipsis is actually showing. Re-measures on resize
+// and whenever `dep` changes (title text swap). Used to gate the title tooltip
+// so it appears ONLY when the title is truncated, matching the SDK's own
+// string-title behaviour (0.7.32) that LineChart's node titles bypass.
+function useIsTruncated(ref: React.RefObject<HTMLElement | null>, dep: unknown) {
+  const [truncated, setTruncated] = useState(false);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const check = () => setTruncated(el.scrollWidth > el.clientWidth + 1);
+    check();
+    const ro = new ResizeObserver(check);
+    ro.observe(el);
+    return () => ro.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ref, dep]);
+  return truncated;
+}
+
+// Single-chart title with a full-text tooltip shown ONLY when the ellipsis is
+// engaged. The SDK Tooltip merges our className onto its `.fds-tooltip-wrapper`,
+// which becomes the direct child of `.fds-chart__header-row` — so the header-
+// overflow flex/min-width fix lives on `.lcw__chart-title-wrap` and the inner
+// span (`.lcw__chart-title`) owns the ellipsis (see LineChart.css).
+function TruncatingChartTitle({ text, style }: { text: string; style?: React.CSSProperties }) {
+  const ref = useRef<HTMLSpanElement>(null);
+  const truncated = useIsTruncated(ref, text);
+  return (
+    <Tooltip bodyText={text} placement="Bottom" isDisabled={!truncated} className="lcw__chart-title-wrap">
+      <span ref={ref} className="lcw__chart-title" style={style}>{text}</span>
+    </Tooltip>
+  );
+}
+
 export function LineChart({
   config: rawConfig,
   data = [],
   timeConfig,
   timeTabConfig,
   onEvent,
+  loading,
 }: LineChartWidgetProps) {
   const onEventRef = useRef(onEvent);
   onEventRef.current = onEvent;
@@ -496,9 +612,17 @@ export function LineChart({
   // Fall back to timeConfig.defaultDisplayMode: Lens preserves timeConfig across
   // save/restore but may strip timeTabConfig (a non-standard field). Both are
   // written by the configurator so either path gives the user's intent.
-  const defaultDisplayMode =
+  const rawDefaultDisplayMode =
     timeTabConfig?.defaultDisplayMode ??
     (timeConfig as { defaultDisplayMode?: import('../../iosense-sdk/types').TimeTabDefaultDisplayMode } | undefined)?.defaultDisplayMode;
+  // STICKY: once we've seen an explicit mode, never let a later prop update
+  // revert it to undefined. Under a GTP, Lens pushes runtime timeConfig updates
+  // (the live time window) that can omit the per-widget defaultDisplayMode — if
+  // that reset the mode to undefined, shift/comparison would silently fall back
+  // to normal on the next tick. Holding the last known mode keeps them stable.
+  const stableDisplayModeRef = useRef(rawDefaultDisplayMode);
+  if (rawDefaultDisplayMode !== undefined) stableDisplayModeRef.current = rawDefaultDisplayMode;
+  const defaultDisplayMode = rawDefaultDisplayMode ?? stableDisplayModeRef.current;
   const defaultDisplayModeRef = useRef(defaultDisplayMode);
   defaultDisplayModeRef.current = defaultDisplayMode;
   // Mount TIME_CHANGE removed: the host (Lens canvas) now reads defaultDisplayMode
@@ -533,7 +657,33 @@ export function LineChart({
 
   // Shift state — committed (shiftToggleOn) vs draft (draftShiftOn, in-picker only).
   // Draft is synced from committed on every open; committed is set on Apply.
-  const cfgShifts = timeConfig?.shifts ?? [];
+  // Shift definitions. Normally from timeConfig.shifts (Local/Fixed, or pushed
+  // by the host under GTP). Fallback: if none are supplied but the resolved DATA
+  // carries per-bucket shift TAGS (which only happens when a shift query ran —
+  // e.g. a GTP in shift mode whose runtime timeConfig omitted the shift defs),
+  // derive the shift list from those tags so shiftProp can still render. Colors
+  // come from a default palette; bucket assignment uses the tags themselves, so
+  // start/end times aren't needed here.
+  const cfgShifts = useMemo<NonNullable<NonNullable<typeof timeConfig>['shifts']>>(() => {
+    const fromConfig = timeConfig?.shifts ?? [];
+    if (fromConfig.length > 0) return fromConfig;
+    const names: string[] = [];
+    (activeChart?.series ?? []).forEach((_s, si) => {
+      const p =
+        getSeriesData(`charts[${chartIndex}].series[${si}].unsPath`, data) ??
+        getSeriesData(`charts[${chartIndex}].series[${si}].dataSource`, data);
+      (p?.slots ?? []).forEach((sl: any) => {
+        const tag = sl?.shift;
+        if (tag !== undefined && tag !== '' && !names.includes(String(tag))) names.push(String(tag));
+      });
+    });
+    if (names.length === 0) return fromConfig;
+    const palette = ['#e4553d', '#1364f1', '#0f9d58', '#f4b400', '#9c27b0', '#00acc1'];
+    return names.map((name, i) => ({
+      id: name, name, color: palette[i % palette.length], startTime: '', endTime: '',
+    }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [timeConfig?.shifts, activeChart, chartIndex, data]);
   const cfgShiftAggregator = timeConfig?.shiftAggregator;
   const cfgShiftKey = cfgShifts.map((s) => s.id).join('|');
   const isExternalTime =
@@ -554,25 +704,27 @@ export function LineChart({
   // listing isGTPMode as a dep (which would re-run and stomp manual toggles).
   const isGTPModeRef = useRef(isGTPMode);
   isGTPModeRef.current = isGTPMode;
-  const [shiftToggleOn, setShiftToggleOn] = useState(() => {
-    const legacyAutoOn = cfgShifts.length > 0 && !isGTPMode;
-    return defaultDisplayMode === 'shift' ? legacyAutoOn
-      : defaultDisplayMode === 'normal' || defaultDisplayMode === 'comparison' ? false
-      : legacyAutoOn; // undefined = legacy
-  });
-  const [draftShiftOn, setDraftShiftOn] = useState(() => {
-    const legacyAutoOn = cfgShifts.length > 0 && !isGTPMode;
-    return defaultDisplayMode === 'shift' ? legacyAutoOn
-      : defaultDisplayMode === 'normal' || defaultDisplayMode === 'comparison' ? false
-      : legacyAutoOn;
-  });
+  // Whether Shift view should be ON for a given default display mode. An EXPLICIT
+  // 'shift' mode turns shifts on whenever the timeConfig actually carries shifts
+  // — INCLUDING in GTP mode, where the GTP inherits the shifts and sets the mode.
+  // The previous `!isGTPMode` gate here wrongly kept shift permanently OFF under
+  // a GTP; that gate belongs ONLY to the legacy (undefined-mode) fallback, since
+  // Lens always ships shift definitions even when the GTP's own shift toggle is
+  // off, so a legacy GTP envelope must default off.
+  const resolveShiftOn = (mode: typeof defaultDisplayMode, gtp: boolean): boolean => {
+    // Explicit 'shift' → ON regardless of whether shifts have loaded yet (matches
+    // ColumnChart: `shiftToggleOn = defaultDisplayMode === 'shift'`). The actual
+    // render is still gated on cfgShifts by chartMode, so keying the toggle on
+    // cfgShifts here only made it fragile to load timing (shifts arriving after
+    // mount left the toggle stuck off).
+    if (mode === 'shift') return true;
+    if (mode === 'normal' || mode === 'comparison') return false;
+    return cfgShifts.length > 0 && !gtp; // undefined = legacy heuristic
+  };
+  const [shiftToggleOn, setShiftToggleOn] = useState(() => resolveShiftOn(defaultDisplayMode, isGTPMode));
+  const [draftShiftOn, setDraftShiftOn] = useState(() => resolveShiftOn(defaultDisplayMode, isGTPMode));
   useEffect(() => {
-    const mode = defaultDisplayModeRef.current;
-    const legacyAutoOn = cfgShifts.length > 0 && !isGTPModeRef.current;
-    const autoOn =
-      mode === 'shift' ? legacyAutoOn
-      : mode === 'normal' || mode === 'comparison' ? false
-      : legacyAutoOn;
+    const autoOn = resolveShiftOn(defaultDisplayModeRef.current, isGTPModeRef.current);
     setShiftToggleOn(autoOn);
     setDraftShiftOn(autoOn);
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -595,7 +747,12 @@ export function LineChart({
     !!timeTabConfig?.fixed?.disablePeriodicities;
 
   // Comparison state — mirrors shift state: draft in-picker, committed on Apply.
-  const cfgComparisonMode = !!timeConfig?.comparisonMode;
+  // Comparison is "available" when the config enables the flag OR the default
+  // display mode is comparison. The second signal matters for GTP: the GTP
+  // inherits the mode, but Lens's runtime timeConfig update may not echo the
+  // per-widget `comparisonMode` flag — so a `defaultDisplayMode === 'comparison'`
+  // must be enough on its own to enter (and stay in) comparison view.
+  const cfgComparisonMode = !!timeConfig?.comparisonMode || defaultDisplayMode === 'comparison';
   const [comparisonToggleOn, setComparisonToggleOn] = useState(
     () => defaultDisplayMode === 'comparison' && cfgComparisonMode,
   );
@@ -619,10 +776,7 @@ export function LineChart({
       return; // skip on first run — host handles the initial query
     }
     const mode = defaultDisplayMode;
-    const legacyAutoOn = cfgShifts.length > 0 && !isGTPModeRef.current;
-    const shiftOn = mode === 'shift' ? legacyAutoOn
-      : (mode === 'normal' || mode === 'comparison') ? false
-      : legacyAutoOn;
+    const shiftOn = resolveShiftOn(mode, isGTPModeRef.current);
     const compOn = mode === 'comparison' && cfgComparisonMode;
     setShiftToggleOn(shiftOn);
     setDraftShiftOn(shiftOn);
@@ -646,6 +800,33 @@ export function LineChart({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [defaultDisplayMode]);
 
+  // Live timezone change → re-emit TIME_CHANGE so the host re-resolves with the
+  // NEW zone immediately (matching what a save + reload produces). Without this,
+  // editing the timezone updates the saved envelope but the live re-resolve keeps
+  // using the stale/default zone until reload. Skip the first run (host owns the
+  // initial query) exactly like the defaultDisplayMode effect above.
+  const timezoneInitRef = useRef(false);
+  useEffect(() => {
+    if (!timezoneInitRef.current) {
+      timezoneInitRef.current = true;
+      return;
+    }
+    if (!rangeValue) return;
+    const startMs = new Date(rangeValue.start).getTime();
+    const endMs = new Date(rangeValue.end).getTime();
+    onEventRef.current?.({
+      type: 'TIME_CHANGE',
+      payload: {
+        startTime: String(startMs),
+        endTime: String(endMs),
+        periodicity: selectedPeriodicity.toLowerCase(),
+        ...modeEventFields(startMs, endMs),
+        ...controlFlags(), // carries the new timezone
+      },
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [timeConfig?.timezone]);
+
   // Shift and comparison are mutually exclusive — activating one deactivates the other.
   const draftActivateShift = (on: boolean) => {
     setDraftShiftOn(on);
@@ -664,19 +845,44 @@ export function LineChart({
     setDraftComparisonOn(comparisonToggleOn);
   };
 
+  // Under a GTP the shift/comparison controls live in the DatePicker, which the
+  // widget HIDES in GTP mode — so the toggle state can never turn on, and
+  // `defaultDisplayMode` stays 'normal'. The GTP instead drives the mode by what
+  // data it makes the host resolve (confirmed via the host's emitted payload:
+  // shift-mode → the query carries `shifts`, so the backend returns shift-tagged
+  // buckets; compare-mode → the response carries comparisonSlots). So under GTP
+  // we DERIVE the mode from the resolved DATA rather than the (unreachable)
+  // toggles: any slot with a shift tag → shift; any series with comparisonSlots
+  // → comparison. Outside GTP we stay strictly toggle-driven (see below).
+  const gtpDataMode = useMemo<'normal' | 'comparison' | 'shift' | null>(() => {
+    if (!isGTPMode) return null;
+    let hasShift = false;
+    let hasComparison = false;
+    (activeChart?.series ?? []).forEach((_s, si) => {
+      const p =
+        getSeriesData(`charts[${chartIndex}].series[${si}].unsPath`, data) ??
+        getSeriesData(`charts[${chartIndex}].series[${si}].dataSource`, data);
+      if (!p) return;
+      if (Array.isArray(p.slots) && p.slots.some((sl: any) => sl?.shift !== undefined && sl?.shift !== '')) hasShift = true;
+      if (Array.isArray((p as any).comparisonSlots) && (p as any).comparisonSlots.length > 0) hasComparison = true;
+    });
+    return hasShift ? 'shift' : hasComparison ? 'comparison' : 'normal';
+  }, [isGTPMode, activeChart, chartIndex, data]);
+
   const chartMode = useMemo<'normal' | 'comparison' | 'shift'>(() => {
-    // Purely toggle-driven — toggle state is initialized from defaultDisplayMode
-    // on mount and updated via the user's Apply action in the DatePicker.
-    // No data-driven fallback: that would make stale shift/comparison data from
-    // the previous mode bleed into the new mode while fresh data is loading, and
-    // it caused shift view to show after refresh even when defaultDisplayMode='normal'.
-    // Shift is supported in realtime too (v1 parity) — the host must send the
-    // shifts with timeFrame:'realtime' so the backend returns shift-tagged
-    // realtime data; the shiftSubDaily branch below then bridges the segments.
+    // GTP: data-driven (see gtpDataMode) — the toggles are inaccessible so the
+    // resolved data is the only source of truth for the GTP's live mode.
+    if (gtpDataMode) return gtpDataMode;
+    // Local/Fixed: purely toggle-driven — toggle state is initialized from
+    // defaultDisplayMode on mount and updated via the user's Apply action in the
+    // DatePicker. No data-driven fallback here: that would make stale shift/
+    // comparison data from the previous mode bleed into the new mode while fresh
+    // data loads, and it caused shift view to show after refresh even when
+    // defaultDisplayMode='normal'. Shift is supported in realtime too (v1 parity).
     if (shiftToggleOn && cfgShifts.length > 0) return 'shift';
     if (comparisonToggleOn && cfgComparisonMode) return 'comparison';
     return 'normal';
-  }, [shiftToggleOn, comparisonToggleOn, cfgShifts.length, cfgComparisonMode]);
+  }, [gtpDataMode, shiftToggleOn, comparisonToggleOn, cfgShifts.length, cfgComparisonMode]);
 
   // Latest committed comparison flag for TIME_CHANGE emitters that fire from
   // effects/callbacks whose dependency lists don't track it.
@@ -817,8 +1023,7 @@ export function LineChart({
       catTs.push({ from: slot.from, to: slot.to });
       catSh.push(slot.shift);
       resolved.forEach((r, si) => {
-        const v = r.slots[idx]?.value;
-        seriesData[si].push(typeof v === 'number' ? v : null);
+        seriesData[si].push(coerceSlotValue(r.slots[idx]?.value));
       });
     });
 
@@ -826,6 +1031,11 @@ export function LineChart({
       name: r.def.name || `Series ${i + 1}`,
       color: r.def.color,
       data: seriesData[i],
+      // "Add Source as Tooltip": omit from the DOM legend. The SDK builds its
+      // legend from THIS prop (filtering `showInLegend !== false`), NOT from
+      // highchartsOptions — so the flag must live here, not only in the
+      // per-series highchartsOptions overrides (which hide the line/marker).
+      ...(r.def.addAsTooltip ? { showInLegend: false } : {}),
       tooltip: {
         valueDecimals: typeof r.def.dataPrecision === 'number' ? r.def.dataPrecision : 2,
         // Custom field carried through to the tooltip formatter (Highcharts
@@ -835,6 +1045,28 @@ export function LineChart({
     }));
     return { series: out, categories: cats, catTimestamps: catTs, catShifts: catSh, hasBreakdownGaps };
   }, [activeChart, chartIndex, data, chartMode]);
+
+  // Full date+time label per category for the SDK tooltip's date footer
+  // (`tooltipCategories` prop). Without it the SDK tooltip falls back to the
+  // short axis label ("01 Aug"); this gives the hovered point's full timestamp.
+  const tooltipCategories = useMemo<string[]>(() => {
+    const tz = timeConfig?.timezone || undefined;
+    const fmt = (ms: number) => {
+      const parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: tz,
+        day: '2-digit', month: 'short', year: 'numeric',
+        hour: '2-digit', minute: '2-digit', hour12: false,
+      }).formatToParts(new Date(ms));
+      const g = (t: string) => parts.find((p) => p.type === t)?.value ?? '';
+      return `${g('day')} ${g('month')} ${g('year')} ${g('hour')}:${g('minute')}`;
+    };
+    return catTimestamps.map((t, i) => {
+      if (!t || typeof t.from !== 'number') return categories[i] ?? '';
+      const next = catTimestamps[i + 1]?.from;
+      const end = typeof next === 'number' ? next : (t.to && t.to !== t.from ? t.to : undefined);
+      return end && end !== t.from ? `${fmt(t.from)} - ${fmt(end)}` : fmt(t.from);
+    });
+  }, [catTimestamps, categories, timeConfig?.timezone]);
 
   // Realtime x-axis thinning. Live data is minute-level, so a category axis
   // labels every single slot and packs the axis solid (dense, unreadable). v1's
@@ -959,8 +1191,11 @@ export function LineChart({
   // spinner: a user time/periodicity change is in flight. Either way, cap the
   // spinner at LOADING_TIMEOUT_MS so a response that never reaches this widget
   // (binding/routing issue, or an in-place data mutation) falls back gracefully.
-  const firstLoadPending = !everResolved && dataEmpty && hasBoundSeries;
-  const loaderActive = firstLoadPending || awaitingData;
+  // `loading` is the host's flag — true while Lens re-resolves, INCLUDING
+  // GTP-driven refetches the widget never emitted (so `awaitingData` stays
+  // false). Fold it in so those still surface a loader.
+  const firstLoadPending = !everResolved && dataEmpty && (hasBoundSeries || !!loading);
+  const loaderActive = firstLoadPending || awaitingData || !!loading;
   const [loadingExpired, setLoadingExpired] = useState(false);
   useEffect(() => {
     if (!loaderActive) {
@@ -971,7 +1206,13 @@ export function LineChart({
     const t = setTimeout(() => setLoadingExpired(true), LOADING_TIMEOUT_MS);
     return () => clearTimeout(t);
   }, [data, awaitingData, loaderActive]);
-  const isLoadingData = loaderActive && !loadingExpired;
+  // Two-tier loader (mirrors CombinedBarLineChart):
+  //  • FIRST load — no data yet — replaces the empty canvas with a spinner.
+  //  • REFETCH — data already on screen (time/periodicity/compare/shift change,
+  //    or a GTP-driven requery) — an overlay over the chart so the header +
+  //    controls stay visible instead of blanking the widget.
+  const isLoadingData = firstLoadPending && !loadingExpired;
+  const isRefetching = (!!loading || awaitingData) && !dataEmpty && !loadingExpired;
 
   // "Add Source as Tooltip" — these series stay in the dataset (shared tooltip)
   // but render no line and no legend chip. Index-aligned with `series`.
@@ -999,6 +1240,21 @@ export function LineChart({
   // forwards it to resolveAndCompute so the SAME call returns comparisonSlots
   // alongside the current slots. No separate widget-side fetch.
 
+  // Source → y-axis index (0 = left/default, 1+ = a Right-position axis).
+  // Extracted here (the full `multiAxis` memo is defined later and also pulls in
+  // plotLines/bands) so the shift and comparison series — which the SDK generates
+  // from shiftProp/comparisonProp — can bind to the right axis. Without a binding
+  // every generated series defaults to axis 0 and the right axis is left with no
+  // series, so Highcharts drops its tick labels. null when there are no right axes.
+  const seriesAxisMap = useMemo<number[] | null>(() => {
+    const rightAxes = (activeChart?.axes ?? []).filter((a) => a.position === 'Right');
+    if (rightAxes.length === 0) return null;
+    return (activeChart?.series ?? []).map((s) => {
+      const idx = rightAxes.findIndex((a) => (a.linkedSeriesIds ?? []).includes(s._id));
+      return idx === -1 ? 0 : idx + 1;
+    });
+  }, [activeChart]);
+
   // Comparison mode: build ChartComparisonConfig from current + previous period data.
   const widgetDeviationPattern: DeviationPattern =
     (timeConfig?.deviationPattern as DeviationPattern) ?? 'green-up-positive';
@@ -1025,10 +1281,7 @@ export function LineChart({
       const prevData: (number | null)[] = (() => {
         const cs = compPayload?.comparisonSlots;
         if (!cs) return currentData.map(() => null);
-        return currentData.map((_, ci) => {
-          const v = cs[ci]?.value;
-          return typeof v === 'number' ? v : null;
-        });
+        return currentData.map((_, ci) => coerceSlotValue(cs[ci]?.value));
       })();
 
       const deviation = currentData.map((y, k) => {
@@ -1041,7 +1294,14 @@ export function LineChart({
         (timeConfig?.sourceDeviationOverrides?.[`${activeChart?._id}:${s._id}`] as DeviationPattern) ??
         widgetDeviationPattern;
 
-      const meta = { sourceId: s._id, sourceName: name, sourceIndex: i, shiftColor: s.color };
+      // Bind both the current and the previous-period series to THIS source's
+      // axis, so a right-axis source keeps the right axis populated in compare
+      // mode (otherwise every comparison series defaults to axis 0 and the right
+      // axis loses its tick labels).
+      const meta = {
+        sourceId: s._id, sourceName: name, sourceIndex: i, shiftColor: s.color,
+        ...(seriesAxisMap ? { yAxis: seriesAxisMap[i] ?? 0 } : {}),
+      };
 
       out.push({
         ...meta,
@@ -1067,7 +1327,7 @@ export function LineChart({
 
     return { series: out, showDeviation: true, deviationPattern: widgetDeviationPattern, comparisonCategories: categories };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chartMode, activeChart, chartIndex, series, categories, catTimestamps, data, widgetDeviationPattern, timeConfig?.sourceDeviationOverrides]);
+  }, [chartMode, activeChart, chartIndex, series, categories, catTimestamps, data, widgetDeviationPattern, timeConfig?.sourceDeviationOverrides, seriesAxisMap]);
 
   // Shift mode: build ChartShiftConfig directly from slot data + shift windows.
   // Each source × enabled shift becomes a ShiftSeriesInput; the SDK renders
@@ -1075,6 +1335,17 @@ export function LineChart({
   const shiftProp = useMemo<ChartShiftConfig | undefined>(() => {
     if (chartMode !== 'shift' || cfgShifts.length === 0 || series.length === 0) return undefined;
     const tz = timeConfig?.timezone;
+    // Every value the backend might use to tag a bucket's shift — the shift NAME
+    // or its ID. Used to tell "tag belongs to a known shift" (trust it) from
+    // "tag is absent / unrecognized" (fall back to the time-of-day window). The
+    // old code only compared the tag to `shift.name`; if the backend tagged with
+    // the shift ID instead, every bucket hit the `return null` path (tag present
+    // but != name, and the time fallback was skipped) → all-null series → shift
+    // never drew. Matching name OR id, plus falling back on an unknown tag, fixes it.
+    const knownShiftKeys = new Set<string>();
+    cfgShifts.forEach((sh) => { if (sh.name) knownShiftKeys.add(sh.name); if (sh.id) knownShiftKeys.add(sh.id); });
+    const matchesShift = (tag: unknown, sh: typeof cfgShifts[number]) =>
+      tag === sh.name || tag === sh.id;
     const out: ShiftSeriesInput[] = [];
     series.forEach((s, si) => {
       cfgShifts.forEach((shift, shIdx) => {
@@ -1087,25 +1358,23 @@ export function LineChart({
           shiftName: shift.name,
           shiftIndex: shIdx,
           shiftColor: shift.color,
+          seriesType: 'line',
+          // Bind to this SOURCE's axis so right-axis sources land on the right
+          // axis. Without it every generated shift series defaults to axis 0 and
+          // the right axis is left with no series → its tick labels disappear.
+          ...(seriesAxisMap ? { yAxis: seriesAxisMap[si] ?? 0 } : {}),
           data: s.data.map((v, ci) => {
-            // Prefer the backend's per-bucket shift tag — with multiple shifts
-            // it authoritatively says which shift each bucket belongs to. Match
-            // by shift name (the tag is the shift's name).
             const tag = catShifts[ci];
-            if (tag !== undefined) {
-              if (tag === shift.name) return v;
-              // Boundary bridge — sub-daily (minute/hourly) ONLY. Here shifts
-              // are contiguous time-of-day blocks, so emitting the value at the
-              // FIRST bucket after this shift's run (the next shift's opening
-              // bucket) makes segments join into ONE continuous line: 00–08,
-              // 08–16, 16–00 share endpoints. At Daily and coarser we DON'T
-              // bridge — each shift stays its own line across days (connected
-              // via connectNulls, see highchartsOptions).
-              if (shiftSubDaily && catShifts[ci - 1] === shift.name) return v;
+            // Trust the tag only if it names a KNOWN shift (by name or id).
+            if (tag !== undefined && tag !== '' && knownShiftKeys.has(String(tag))) {
+              if (matchesShift(tag, shift)) return v;
+              // Boundary bridge — sub-daily (minute/hourly) ONLY: emit the value
+              // at the first bucket after this shift's run (the next shift's
+              // opening bucket) so 00–08 / 08–16 / 16–00 join into one line.
+              if (shiftSubDaily && matchesShift(catShifts[ci - 1], shift)) return v;
               return null;
             }
-            // Fall back to the time-window check only when the backend didn't
-            // tag the bucket (e.g. an older backend that ignores `shifts`).
+            // Tag absent OR unrecognized → time-of-day window check.
             const ts = catTimestamps[ci];
             if (!ts?.from) return null;
             return isSlotInShift(ts.from, shift.startTime, shift.endTime, tz) ? v : null;
@@ -1129,45 +1398,128 @@ export function LineChart({
       onToggleSource: () => {},
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chartMode, cfgShiftKey, series, catTimestamps, catShifts, enabledShiftIds, activeChart, timeConfig?.timezone, shiftSubDaily]);
+  }, [chartMode, cfgShiftKey, series, catTimestamps, catShifts, enabledShiftIds, activeChart, timeConfig?.timezone, shiftSubDaily, seriesAxisMap]);
+
+  // TEMP mode diagnostic — logs how the widget resolves shift vs compare vs
+  // normal, so a failed SWITCH between them can be pinpointed. Remove once
+  // confirmed. Key fields for the shift↔compare switch bug:
+  //   • chartMode / gtpDataMode  → what the widget decided
+  //   • dataHasShiftTags / dataHasComparisonSlots → what the RESOLVED DATA carries
+  //     (if BOTH are true, the source data isn't mode-exclusive — host issue)
+  //   • shiftToggleOn / comparisonToggleOn → local toggle state (local mode only)
+  useEffect(() => {
+    let dataHasShiftTags = false;
+    let dataHasComparisonSlots = false;
+    (activeChart?.series ?? []).forEach((_s, i) => {
+      const p =
+        getSeriesData(`charts[${chartIndex}].series[${i}].unsPath`, data) ??
+        getSeriesData(`charts[${chartIndex}].series[${i}].dataSource`, data);
+      if (!p) return;
+      if (Array.isArray(p.slots) && p.slots.some((sl: any) => sl?.shift !== undefined && sl?.shift !== '')) dataHasShiftTags = true;
+      if (Array.isArray((p as any).comparisonSlots) && (p as any).comparisonSlots.length > 0) dataHasComparisonSlots = true;
+    });
+    // eslint-disable-next-line no-console
+    console.error('[LCW mode debug]', {
+      chartMode,
+      gtpDataMode,
+      isGTPMode,
+      dataHasShiftTags,
+      dataHasComparisonSlots,
+      bothPresent: dataHasShiftTags && dataHasComparisonSlots,
+      shiftToggleOn,
+      comparisonToggleOn,
+      cfgComparisonMode,
+      catShiftsSample: catShifts.slice(0, 8),
+      selectedPeriodicity,
+      // Bucket timing + label → the true periodicity of the returned data.
+      // durDays ≈ 7 → weekly buckets (so a monthly label is a BACKEND label bug);
+      // durDays ≈ 28–31 → monthly buckets (so the GTP's weekly periodicity never
+      // reached the query). Either way it's upstream of the chart.
+      bucketsSample: catTimestamps.slice(0, 5).map((t, i) => ({
+        from: typeof t?.from === 'number' ? new Date(t.from).toISOString() : null,
+        durDays: t?.from && t?.to ? Math.round((t.to - t.from) / 86_400_000) : null,
+        label: categories[i],
+      })),
+    });
+  }, [chartMode, gtpDataMode, isGTPMode, shiftToggleOn, comparisonToggleOn, cfgComparisonMode, catShifts, activeChart, chartIndex, data, selectedPeriodicity, catTimestamps, categories]);
 
   // Plot lines (fixed values only — periodicity-dependent lines need the live
   // periodicity context which the host owns, so they're rendered server-side).
   const plotLines = useMemo<ChartPlotLine[]>(() => {
     const BINDING_RE = /^\{\{.+\}\}$/;
+    const activePeriodicity = selectedPeriodicity.toLowerCase();
     const out: ChartPlotLine[] = [];
     (activeChart?.plotLines ?? []).forEach((p, pi) => {
+      // BUG 1 — enforce periodicity dependence. A plot line marked
+      // 'dependent' with a periodicities list should ONLY render when the
+      // chart's current periodicity is in that list. This filter was missing,
+      // so dependent lines rendered for every periodicity.
+      if (
+        p.periodicityType === 'dependent' &&
+        p.periodicities?.length &&
+        !p.periodicities.map((x) => String(x).toLowerCase()).includes(activePeriodicity)
+      ) {
+        return; // not for the active periodicity — skip
+      }
+
       const rawValue = p.value ?? p.fixedValue ?? p.dynamicTopic ?? '';
       const isBinding = BINDING_RE.test(rawValue);
 
       if (isBinding) {
-        const key = `charts[${chartIndex}].plotLines[${pi}].value`;
-        const entry = (data ?? []).find((d) => d.key === key);
-        if (!entry) return;
-        const payload = entry.value as SeriesPayload | null;
-        if (!payload || payload.__type !== 'series') return;
-        const slots = payload.slots.filter((s) => s.value !== null);
-        if (slots.length === 0) return;
-        const v = slots[slots.length - 1].value!;
-        out.push({ value: v, color: p.color, width: p.lineWidth, dashStyle: p.lineStyle === 'Dashed' ? 'Dash' : 'Solid', label: p.name, _axisId: p.axisId ?? '' } as any);
+        let payload = getSeriesData(`charts[${chartIndex}].plotLines[${pi}].value`, data ?? []);
+        // BUG 2 — dedupe-by-topic fallback. When a plot line is bound to the
+        // SAME topic as a data source in this chart, the resolve API returns a
+        // single entry keyed to the SERIES' binding path, not the plot line's —
+        // so the plot line's own key finds nothing. Fall back to the matching
+        // series' already-resolved payload.
+        if (!payload) {
+          const twin = (activeChart?.series ?? []).findIndex(
+            (s) => (s.unsPath || (s as { dataSource?: string }).dataSource) === rawValue,
+          );
+          if (twin >= 0) {
+            payload =
+              getSeriesData(`charts[${chartIndex}].series[${twin}].unsPath`, data ?? []) ??
+              getSeriesData(`charts[${chartIndex}].series[${twin}].dataSource`, data ?? []);
+          }
+        }
+        if (!payload) return;
+        // Last non-null slot value (coerced — the value may arrive as a string).
+        const nums = payload.slots
+          .map((s) => coerceSlotValue(s.value))
+          .filter((n): n is number => n !== null);
+        if (nums.length === 0) return;
+        const v = nums[nums.length - 1];
+        out.push({ value: v, color: p.color, width: p.lineWidth, dashStyle: p.lineStyle === 'Dashed' ? 'Dash' : (p.lineStyle || 'Solid'), label: p.name, _axisId: p.axisId ?? '' } as any);
       } else {
         const v = Number(rawValue);
         if (!Number.isFinite(v)) return;
-        out.push({ value: v, color: p.color, width: p.lineWidth, dashStyle: p.lineStyle === 'Dashed' ? 'Dash' : 'Solid', label: p.name, _axisId: p.axisId ?? '' } as any);
+        out.push({ value: v, color: p.color, width: p.lineWidth, dashStyle: p.lineStyle === 'Dashed' ? 'Dash' : (p.lineStyle || 'Solid'), label: p.name, _axisId: p.axisId ?? '' } as any);
       }
     });
     return out;
-  }, [activeChart, chartIndex, data]);
+  }, [activeChart, chartIndex, data, selectedPeriodicity]);
 
   const plotBands = useMemo<(ChartPlotBand & { _axisId?: string })[]>(
     () =>
-      (activeChart?.plotBands ?? []).map((b) => ({
-        from: b.startValue,
-        to: b.endValue,
-        color: b.color,
-        label: b.name,
-        _axisId: b.axisId ?? '',
-      })),
+      (activeChart?.plotBands ?? [])
+        .map((b) => {
+          // Coerce to numbers (envelopes can carry strings) and NORMALIZE so the
+          // band always spans low→high. Highcharts renders a plotBand as a rect
+          // from `from` to `to`; if the user typed startValue > endValue, an
+          // un-normalized band renders empty/mis-positioned.
+          const a = Number(b.startValue);
+          const z = Number(b.endValue);
+          return {
+            from: Math.min(a, z),
+            to: Math.max(a, z),
+            color: b.color,
+            label: b.name,
+            _axisId: b.axisId ?? '',
+          };
+        })
+        // Drop bands with non-numeric or zero-height ranges — they'd render
+        // nothing (or a degenerate line) and just confuse the picture.
+        .filter((b) => Number.isFinite(b.from) && Number.isFinite(b.to) && b.from !== b.to),
     [activeChart],
   );
 
@@ -1223,9 +1575,9 @@ export function LineChart({
           if (!entry) continue;
           const payload = entry.value as SeriesPayload | null;
           if (!payload || payload.__type !== 'series') continue;
-          const v = payload.slots[pi]?.value;
-          if (v === null || v === undefined || !Number.isFinite(v as number)) continue;
-          threshold = v as number;
+          const v = coerceSlotValue(payload.slots[pi]?.value);
+          if (v === null) continue;
+          threshold = v;
         } else {
           continue;
         }
@@ -1288,12 +1640,22 @@ export function LineChart({
       const idx = rightAxes.findIndex((a) => (a.linkedSeriesIds ?? []).includes(s._id));
       return idx === -1 ? 0 : idx + 1;
     });
-    const leftPlotLines = plotLines.filter((p) => !(p as any)._axisId);
-    const leftPlotBands = plotBands.filter((b) => !b._axisId);
+    // A plot line/band belongs on the LEFT (default) axis when it has no axisId
+    // OR its axisId doesn't correspond to one of the current RIGHT axes (e.g. it
+    // targets the default axis's own id, or an axis that was since deleted).
+    // Without the second condition those items silently vanish in multi-axis
+    // mode — they match neither the left axis nor any right axis.
+    const rightAxisIds = new Set(rightAxes.map((a) => a._id));
+    const leftPlotLines = plotLines.filter(
+      (p) => !(p as any)._axisId || !rightAxisIds.has((p as any)._axisId),
+    );
+    const leftPlotBands = plotBands.filter(
+      (b) => !b._axisId || !rightAxisIds.has(b._axisId),
+    );
     const leftAxis = {
       title: { text: leftAxisTitle },
       ...(leftPlotLines.length
-        ? { plotLines: leftPlotLines.map((p) => ({ value: p.value, color: p.color, width: p.width, dashStyle: p.dashStyle, ...(p.label ? { label: { text: p.label } } : {}) })) }
+        ? { plotLines: leftPlotLines.map((p) => ({ value: p.value, color: p.color, width: p.width, dashStyle: p.dashStyle, ...(p.label ? { label: buildPlotLineLabel(p.label, p.color) } : {}) })) }
         : {}),
       ...(leftPlotBands.length
         ? { plotBands: leftPlotBands.map((b) => ({ from: b.from, to: b.to, color: b.color, ...(b.label ? { label: { text: b.label } } : {}) })) }
@@ -1305,7 +1667,7 @@ export function LineChart({
       return {
         title: { text: a.name || 'Axis' },
         opposite: true,
-        ...(rpl.length ? { plotLines: rpl.map((p) => ({ value: p.value, color: p.color, width: p.width ?? 2, dashStyle: p.dashStyle ?? 'Dash', zIndex: 5, ...(p.label ? { label: { text: p.label, align: 'right', style: { color: p.color } } } : {}) })) } : {}),
+        ...(rpl.length ? { plotLines: rpl.map((p) => ({ value: p.value, color: p.color, width: p.width ?? 2, dashStyle: p.dashStyle ?? 'Dash', zIndex: 5, ...(p.label ? { label: buildPlotLineLabel(p.label, p.color) } : {}) })) } : {}),
         ...(rpb.length ? { plotBands: rpb.map((b) => ({ from: b.from, to: b.to, color: b.color, ...(b.label ? { label: { text: b.label } } : {}) })) } : {}),
       };
     });
@@ -1394,6 +1756,7 @@ export function LineChart({
     clipping: dcd?.clipping ?? false,
     inexactMultiple: false,
     zoom: dcd?.zoom ?? true,
+    scroll: dcd?.scroll ?? false,
   });
   // Latest control flags for the scattered TIME_CHANGE emit sites (mount,
   // preset, periodicity, drilldown) whose closures read via a ref.
@@ -1404,7 +1767,54 @@ export function LineChart({
   const controlFlags = () => ({
     clipping: chartDisplayRef.current.clipping,
     inexactMultiple: chartDisplayRef.current.inexactMultiple,
+    // Ride the current timezone on every TIME_CHANGE so a LIVE re-resolve uses
+    // the freshly-edited zone. On mount/save the host reads timeConfig.timezone
+    // (correct), but a live edit re-resolves from the widget's payload — which
+    // otherwise omits timezone and the host falls back to its default
+    // (Asia/Kolkata). Sending it here keeps live edits and saved reloads identical.
+    ...(timeConfig?.timezone ? { timezone: timeConfig.timezone } : {}),
   });
+
+  // In full screen the widget owns the whole viewport, so the header chrome
+  // (date/time picker, periodicity, duration label, export + settings icons) is
+  // noise — hide it and let the chart fill the screen; the title is drawn in the
+  // Highcharts canvas instead (see opts.title). Two ways a widget goes full
+  // screen, so detect both:
+  //   1. Browser Fullscreen API — the widget's own "View in full screen", OR a
+  //      host that calls requestFullscreen() on the tile. `document
+  //      .fullscreenElement` is non-null for the presenting element OR any of
+  //      its ancestors, so a single check covers all API paths.
+  //   2. A dashboard "maximize/expand" that just ENLARGES the tile with CSS
+  //      fires no `fullscreenchange` at all. Detect it geometrically: the widget
+  //      root covering (essentially) the entire viewport IS a maximize. In a
+  //      multi-tile dashboard a normal widget never fills both axes to the edge,
+  //      so this won't false-positive; the dev-harness split layout never does
+  //      either. Re-checked on fullscreenchange, window resize, and a
+  //      ResizeObserver on the root so it flips the moment the tile grows/shrinks.
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const lcwRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const compute = () => {
+      if (document.fullscreenElement) return true;
+      const el = lcwRef.current;
+      if (el) {
+        const r = el.getBoundingClientRect();
+        if (r.width >= window.innerWidth - 4 && r.height >= window.innerHeight - 4) return true;
+      }
+      return false;
+    };
+    const onChange = () => setIsFullscreen(compute());
+    onChange();
+    document.addEventListener('fullscreenchange', onChange);
+    window.addEventListener('resize', onChange);
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(onChange) : null;
+    if (ro && lcwRef.current) ro.observe(lcwRef.current);
+    return () => {
+      document.removeEventListener('fullscreenchange', onChange);
+      window.removeEventListener('resize', onChange);
+      ro?.disconnect();
+    };
+  }, []);
 
   const highchartsOptions = useMemo(() => {
     const titleEllipsis = { textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
@@ -1441,6 +1851,31 @@ export function LineChart({
     xAxis.plotLines = chartMode === 'normal' ? (anomalyOverlay?.xPlotLines ?? []) : [];
 
     const opts: any = { xAxis };
+    // Chart title INSIDE the Highcharts canvas — rendered ONLY in full screen.
+    // The SDK header title lives outside the reliably-painted area on some
+    // fullscreen hosts (so it can go missing), whereas the Highcharts title is
+    // part of the chart SVG and is always visible wherever the chart is. In full
+    // screen we therefore draw the title here and hide the SDK header title (the
+    // `title` slot is set to undefined when isFullscreen) to avoid a duplicate.
+    // Left-aligned and styled to match the configured chart-title style.
+    // Full-screen canvas title. useHTML lets a long title TRUNCATE with an
+    // ellipsis (max-width ~ viewport) and carry a native `title` attribute so
+    // hovering shows the full text — same truncate+tooltip behaviour as the
+    // non-fullscreen header title (TruncatingChartTitle).
+    if (isFullscreen) {
+      const fullTitle = activeChart?.title || 'Line Chart';
+      const esc = escapeHtml(fullTitle);
+      const fs = (titleStyle.fontSize as number) || 18;
+      const fw = String(titleStyle.fontWeight ?? 600);
+      const col = titleStyle.color ? `color:${titleStyle.color as string};` : '';
+      opts.title = {
+        useHTML: true,
+        align: 'left',
+        text: `<span title="${esc}" style="display:inline-block;max-width:90vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom;font-size:${fs}px;font-weight:${fw};${col}">${esc}</span>`,
+      };
+    } else {
+      opts.title = { text: undefined };
+    }
     // Highcharts paints `<rect class="highcharts-background">` with an
     // explicit fill — `fill: transparent` via CSS only works if NOTHING
     // else (SDK chrome, theme classes) paints white between us and the
@@ -1449,13 +1884,33 @@ export function LineChart({
     // card has no surface of its own). Same approach mirrors the deployed
     // Column Chart widget.
     opts.chart = {
+      // Paint the card's background on the Highcharts canvas so the plot area
+      // actually shows it. Match `--lcw-card-bg` semantics EXACTLY: wrap-in-card
+      // ON → the configured card color; OFF → transparent (blend with the
+      // dashboard). Previously ON was 'transparent', but nothing behind the
+      // canvas painted the card color, so the plot area rendered the SDK's
+      // default white instead of the user's chosen background.
       backgroundColor:
-        style?.card?.wrapInCard !== false
+        style?.card?.wrapInCard === false
           ? 'transparent'
           : style?.card?.backgroundColor || '#FFFFFF',
       // The SDK hardcodes zooming: { type: 'x' } internally; override here
       // explicitly so disabling zoom via the gear menu actually takes effect.
       zooming: { type: chartDisplay.zoom ? 'x' : (null as any) },
+      // Horizontal scroll (settings-menu "Scroll" toggle). The SDK's
+      // scrollableMinWidth defaults to 800px and only kicks in when the plot
+      // would be NARROWER than that — so on any widget wider than 800px the
+      // toggle did nothing (dense labels just crammed). Scale the minimum with
+      // the category count (50px each) so it exceeds the container once there
+      // are enough points to squeeze, which is what actually forces the scroll.
+      // Set it here (highchartsOptions is deep-merged LAST) with an explicit
+      // minWidth:0 when OFF — Highcharts' chart.update() only MERGES, so the
+      // SDK's own `scrollable && {scrollablePlotArea}` never CLEARS a stale
+      // minWidth on toggle-off; setting 0 does.
+      scrollablePlotArea: {
+        minWidth: chartDisplay.scroll ? Math.max(800, categories.length * 50) : 0,
+        opacity: 1,
+      },
     };
     // Shift mode — connectNulls depends on granularity:
     //  • Sub-daily (minute/hourly): OFF. Each shift carries its own buckets plus
@@ -1491,6 +1946,34 @@ export function LineChart({
       // can't silently connect across dead periods.
       opts.plotOptions = { series: { connectNulls: false } };
     }
+    // Disable the initial series-draw animation. On a flex / loader-swapped
+    // mount the container can still be settling its size when Highcharts runs
+    // the line's grow animation, leaving the path animated to an empty state
+    // that only a later redraw (e.g. the user hovering) corrects — the
+    // "line only appears after hover" bug. Drawing without animation paints the
+    // full line immediately at the correct geometry.
+    if (opts.plotOptions?.series) {
+      opts.plotOptions.series.animation = false;
+      // Never clip series to the plot rect. This is the definitive guard for the
+      // "line invisible until hover" bug: when the chart first draws during the
+      // loader→chart swap, Highcharts captures the series clip-path at the (then
+      // collapsed) plot size. The axes/box later resize correctly, but the series
+      // clip-path can stay 0-sized — so the axes render yet the line stays hidden
+      // until a hover forces a full redraw. With clip:false the line is never
+      // hidden by a stale clip; auto-scaled axes (startOnTick/endOnTick) keep the
+      // data within bounds so nothing paints outside the plot area in practice.
+      opts.plotOptions.series.clip = false;
+      // Data labels on the SHARED series base so they apply to EVERY series type.
+      // The SDK only sets dataLabels on plotOptions.line + plotOptions.spline via
+      // its `showDataLabels` prop — but with Area Fill on our series are
+      // `areaspline`, which does NOT inherit spline's plotOptions, so the labels
+      // never showed. Setting them here covers line/spline/areaspline uniformly.
+      // (Tooltip-only series re-disable dataLabels per-series, which wins.)
+      opts.plotOptions.series.dataLabels = {
+        enabled: !!chartDisplay.dataLabel,
+        allowOverlap: true,
+      };
+    }
     // startOnTick/endOnTick ensure Highcharts always pads above and below
     // the data range, preventing a single-tick collapsed axis when all
     // data points share the same value (flat/constant data).
@@ -1522,7 +2005,7 @@ export function LineChart({
       if (plotLines.length) {
         yAxis.plotLines = plotLines.map((p: any) => ({
           value: p.value, color: p.color, width: p.width ?? 2, dashStyle: p.dashStyle ?? 'Dash', zIndex: 5,
-          ...(p.label ? { label: { text: p.label, align: 'right', style: { color: p.color } } } : {}),
+          ...(p.label ? { label: buildPlotLineLabel(p.label, p.color) } : {}),
         }));
       }
       if (plotBands.length) {
@@ -1580,25 +2063,35 @@ export function LineChart({
     });
     // In shift mode the SDK generates its own Highcharts series internally from
     // the `shift` prop. highchartsOptions.series[i] IS deep-merged onto those
-    // generated series, so we can inject per-shift fillColor gradients here.
-    // We override opts.series entirely for shift+areaFill because effectiveSeries
-    // (source-indexed, length = #sources) doesn't align with the SDK's expanded
-    // series (length = #sources × #shifts). Shift tooltip/legend are SDK-owned
-    // in this mode so the effectiveSeries-based per-series opts aren't needed.
-    if (chartMode === 'shift' && style?.enableAreaFill && shiftProp) {
-      opts.series = (shiftProp.series as any[]).map((ss: any) => ({
-        // Fill down to the axis MINIMUM, not the default threshold of 0 — else
-        // each shift area fills from 0 up to its value, rendering as tall solid
-        // bars from the axis bottom instead of a gradient under the line.
-        threshold: null,
-        fillColor: {
-          linearGradient: { x1: 0, y1: 0, x2: 0, y2: 1 },
-          stops: [
-            [0, hexToRgba(ss.shiftColor || '#7cb5ec', 0.5)],
-            [1, hexToRgba(ss.shiftColor || '#7cb5ec', 0)],
-          ],
-        },
-      }));
+    // generated series (index-aligned with shiftProp.series, length = #sources ×
+    // #shifts), so we override opts.series ENTIRELY here — the source-indexed
+    // effectiveSeries opts above (length = #sources) don't align with the
+    // expanded shift series, so their per-series yAxis binding never reaches
+    // them. Rebuild aligned to shiftProp.series and:
+    //   • bind each shift series to its SOURCE's axis (multiAxis.seriesAxis keyed
+    //     by sourceIndex) — WITHOUT this every shift series falls to yAxis 0, so
+    //     a right-axis source (e.g. AM) plotted against the LEFT axis scale.
+    //   • add the area-fill gradient when Area Fill is on.
+    // Shift tooltip/legend are SDK-owned in this mode.
+    if (chartMode === 'shift' && shiftProp) {
+      opts.series = (shiftProp.series as any[]).map((ss: any) => {
+        const so: any = {};
+        if (multiAxis) so.yAxis = multiAxis.seriesAxis[ss.sourceIndex] ?? 0;
+        if (style?.enableAreaFill) {
+          // Fill down to the axis MINIMUM, not the default threshold of 0 — else
+          // each shift area fills from 0 up to its value, rendering as tall solid
+          // bars from the axis bottom instead of a gradient under the line.
+          so.threshold = null;
+          so.fillColor = {
+            linearGradient: { x1: 0, y1: 0, x2: 0, y2: 1 },
+            stops: [
+              [0, hexToRgba(ss.shiftColor || '#7cb5ec', 0.5)],
+              [1, hexToRgba(ss.shiftColor || '#7cb5ec', 0)],
+            ],
+          };
+        }
+        return so;
+      });
     }
     // Override the SDK's defaultTooltip so per-series dataPrecision (valueDecimals)
     // is actually applied. The SDK renders c.y as a raw number via a custom HTML
@@ -1675,8 +2168,81 @@ export function LineChart({
         },
       };
     }
+    // Shift mode: the SDK's own shift tooltip formats each value with
+    // formatChartValue() (plain toLocaleString) and has NO way to append the
+    // measurement unit — it never reads our per-series `tooltip.unit`. So we
+    // override it with a formatter that mirrors the SDK's shift rows
+    // (source glyph + "Source (Shift)" + value) AND appends the unit, exactly
+    // like normal mode. Our `highchartsOptions.tooltip` deep-merges over the
+    // SDK's, so our formatter wins while the native box chrome is preserved.
+    // The unit is per-SOURCE (same `meta.unit` source as normal mode) — shift
+    // series carry their `sourceIndex` in `userOptions.custom`, so we look the
+    // unit up on the matching effectiveSeries entry.
+    if (chartMode === 'shift') {
+      const TOOLTIP_FONT = "'Noto Sans Variable', 'Noto Sans', sans-serif";
+      const root = typeof document !== 'undefined' ? document.documentElement : null;
+      const cs = root ? getComputedStyle(root) : null;
+      const primary = cs?.getPropertyValue('--text-gray-primary').trim() || '#192839';
+      const secondary = cs?.getPropertyValue('--text-gray-secondary').trim() || '#40566d';
+      opts.tooltip = {
+        shared: true,
+        useHTML: true,
+        formatter(this: any) {
+          const points: any[] = (this as any).points ?? [this];
+          const rows = points.map((c: any) => {
+            // Shift metadata the SDK stashed on the series (sourceIndex,
+            // sourceName, shiftName, shiftColor).
+            const custom = c.series?.userOptions?.custom ?? c.series?.options?.custom ?? {};
+            const srcIdx: number = typeof custom.sourceIndex === 'number' ? custom.sourceIndex : 0;
+            const srcSeries: any = effectiveSeries[srcIdx];
+            const precision = Math.max(0, Math.min(20, srcSeries?.tooltip?.valueDecimals ?? 2));
+            const unit: string = srcSeries?.tooltip?.unit ?? '';
+            const yVal = typeof c.y === 'number' ? c.y.toFixed(precision) : '—';
+            const valueWithUnit = typeof c.y === 'number' && unit ? `${yVal} ${unit}` : yVal;
+            const rawColor = custom.shiftColor ?? c.color ?? c.series?.color ?? primary;
+            const color = typeof rawColor === 'string' ? rawColor : primary;
+            const sourceName: string = custom.sourceName ?? c.series?.name ?? '';
+            const name = sourceName + (custom.shiftName ? ` (${custom.shiftName})` : '');
+            const svg = `<svg width="16" height="12" viewBox="0 0 16 12" style="flex:0 0 auto;vertical-align:-2px"><rect x="0" y="5" width="16" height="2" rx="1" fill="${color}"/><circle cx="8" cy="6" r="3" fill="${color}"/></svg>`;
+            return `<div style="display:flex;align-items:center;gap:6px;padding:1px 0;white-space:nowrap;font-family:${TOOLTIP_FONT}"><span style="display:inline-flex">${svg}</span><span style="font:400 14px/1.3 ${TOOLTIP_FONT};color:${primary}">${name} : </span><span style="font:600 14px/1.3 ${TOOLTIP_FONT};color:${primary}">${valueWithUnit}</span></div>`;
+          });
+          // Footer — hovered bucket START – END range, identical to normal mode.
+          const idx = (points[0] as any)?.point?.index;
+          const bucket = typeof idx === 'number' ? catTimestamps[idx] : undefined;
+          const tzFooter = timeConfig?.timezone || undefined;
+          const fmtTs = (ms: number) => {
+            const parts = new Intl.DateTimeFormat('en-GB', {
+              timeZone: tzFooter,
+              day: '2-digit', month: 'short', year: 'numeric',
+              hour: '2-digit', minute: '2-digit', hour12: false,
+            }).formatToParts(new Date(ms));
+            const g = (t: string) => parts.find((p) => p.type === t)?.value ?? '';
+            return `${g('day')} ${g('month')} ${g('year')} ${g('hour')}:${g('minute')}`;
+          };
+          const start = bucket?.from;
+          const rawNext = typeof idx === 'number' ? catTimestamps[idx + 1]?.from : undefined;
+          const nextFrom = typeof rawNext === 'number' && !Number.isNaN(rawNext) ? rawNext : undefined;
+          const end = nextFrom ?? (bucket?.to && bucket.to !== bucket.from ? bucket.to : undefined);
+          const footer = start
+            ? end && end !== start ? `${fmtTs(start)} - ${fmtTs(end)}` : fmtTs(start)
+            : ((points[0] as any)?.point?.category ?? (this as any).x ?? '');
+          return rows.join('') + `<div style="margin-top:4px;font:400 12px/1.2 ${TOOLTIP_FONT};color:${secondary};white-space:nowrap">${footer}</div>`;
+        },
+      };
+    }
+    // Tooltip render target. Highcharts renders the useHTML tooltip into <body>
+    // when `outside` is true — and it DEFAULTS to true whenever a
+    // scrollablePlotArea is set (which we always set for the Scroll feature). A
+    // body-rendered tooltip sits BEHIND the fullscreen top-layer element, so it
+    // is invisible in full screen. Force it INSIDE the chart while full screen
+    // (so it paints within the fullscreened .fds-chart); keep it outside
+    // otherwise so a small dashboard tile's overflow:hidden never clips it.
+    // The SDK's own tooltip merge (`{ ...ours, ...sdkFormatter }`) never sets
+    // `outside`, so setting it here on `opts.tooltip` wins for every mode —
+    // including shift/comparison where we otherwise leave the tooltip to the SDK.
+    opts.tooltip = { ...(opts.tooltip ?? {}), outside: !isFullscreen };
     return opts as any;
-  }, [axisColors, miscColors, multiAxis, effectiveSeries, effectiveTooltipOnlyFlags, style?.card?.wrapInCard, style?.card?.backgroundColor, style?.enableAreaFill, style?.showDataPoints, chartDisplay.zoom, anomalyOverlay, chartMode, plotLines, plotBands, activeChart, shiftSubDaily, shiftProp, config?.realtimeMode, hasBreakdownGaps, realtimeTicks, catTimestamps, timeConfig?.timezone]);
+  }, [axisColors, miscColors, multiAxis, effectiveSeries, effectiveTooltipOnlyFlags, style?.card?.wrapInCard, style?.card?.backgroundColor, style?.enableAreaFill, style?.showDataPoints, chartDisplay.zoom, chartDisplay.dataLabel, chartDisplay.scroll, categories.length, anomalyOverlay, chartMode, plotLines, plotBands, activeChart, shiftSubDaily, shiftProp, config?.realtimeMode, hasBreakdownGaps, realtimeTicks, catTimestamps, timeConfig?.timezone, isFullscreen, titleStyle]);
 
   // The data table is portalled into the chart card (sibling of the canvas).
   const [cardEl, setCardEl] = useState<HTMLDivElement | null>(null);
@@ -1757,10 +2323,20 @@ export function LineChart({
   // Skip the first run — the mount effect already emits the initial TIME_CHANGE.
   const allDurations = timeConfig?.allDurations;
   const presetInitialized = useRef(false);
+  // Tracks the last preset so we can detect a genuine duration change (vs an
+  // allDurations/cycleTime refresh) and reset periodicity to the new duration's
+  // coarsest option on that change.
+  const prevPresetRef = useRef<string | null>(null);
   // Blocks onRangeChange from re-emitting TIME_CHANGE when the SDK DatePicker
   // fires it as a side-effect of a preset chip selection (preset effect already
   // handles the emit). Mirrors the reference widget's presetSelectingRef pattern.
   const presetSelectingRef = useRef(false);
+  // The SDK DatePicker fires onRangeChange once on MOUNT with the initial
+  // (unchanged) range. The host already ran the first resolveAndCompute from the
+  // saved envelope, so re-emitting here duplicates that call. Skip that first
+  // mount echo — but ONLY when the range is unchanged, so a genuine first user
+  // pick (a different range) still emits. Emit-on-interaction only.
+  const rangeInitRef = useRef(false);
   useEffect(() => {
     if (!selectedPreset || !allDurations) return;
     const preset = allDurations.find((d) => d.id === selectedPreset);
@@ -1775,6 +2351,11 @@ export function LineChart({
       setRangeValue(derived);
     }
 
+    // Detect a genuine duration change (preset id differs from last run) — used
+    // to force the new duration's coarsest periodicity below.
+    const presetChanged = prevPresetRef.current !== null && prevPresetRef.current !== selectedPreset;
+    prevPresetRef.current = selectedPreset;
+
     if (!presetInitialized.current) {
       presetInitialized.current = true;
       return; // initial mount — mount effect handles the first TIME_CHANGE
@@ -1787,10 +2368,26 @@ export function LineChart({
     // list / minute-band), NOT bucket-count heuristic. Bucket count allows
     // Hourly for a partial-month range — the preset definition is the authority.
     const nextOptions = getPresetPeriodicities(preset) ?? getValidPeriodicities(eventRange);
-    const nextPeriodicity = pickPeriodicity(
-      nextOptions, selectedPeriodicity, periodicityTouchedRef.current,
-    );
+    // On a genuine duration change, ALWAYS reset to the highest (coarsest)
+    // periodicity mapped to the new duration — e.g. Today (Hourly) → Current
+    // Year sends Monthly/Quarterly, not the stale Hourly. `nextOptions` is
+    // descending (coarsest first), so [0] is the highest-order option. A prior
+    // manual pick is cleared. When the preset didn't change (an allDurations /
+    // cycleTime refresh), preserve the user's current choice as before.
+    const nextPeriodicity =
+      presetChanged && nextOptions.length
+        ? nextOptions[0]
+        : pickPeriodicity(nextOptions, selectedPeriodicity, periodicityTouchedRef.current);
+    if (presetChanged) periodicityTouchedRef.current = false;
     if (nextPeriodicity !== selectedPeriodicity) setSelectedPeriodicity(nextPeriodicity);
+
+    // Emit ONLY on a genuine duration change (the user picked a preset, or the
+    // configurator changed the default duration). When this effect re-runs
+    // merely because the host handed us a new `allDurations`/`cycleTime` object
+    // reference (a config re-push on init or refresh) with the SAME preset, do
+    // NOT emit — that was firing a spurious TIME_CHANGE on initialization. The
+    // window state (rangeValue/periodicity) is still kept in sync above.
+    if (!presetChanged) return;
 
     const evStart = new Date(eventRange.start).getTime();
     const evEnd = new Date(eventRange.end).getTime();
@@ -1801,10 +2398,6 @@ export function LineChart({
       ...modeEventFields(evStart, evEnd),
       ...controlFlags(),
     };
-    console.log('[LineChart] emitting TIME_CHANGE (preset select)', {
-      selectedPreset,
-      payload: presetPayload,
-    });
     beginPendingFetch(); // show the loader until the host answers the new window
     onEventRef.current?.({ type: 'TIME_CHANGE', payload: presetPayload });
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1828,7 +2421,6 @@ export function LineChart({
       ...modeEventFields(startTime, endTime),
       ...controlFlags(),
     };
-    console.log('[LineChart] emitting TIME_CHANGE (control toggle)', payload);
     ev({ type: 'TIME_CHANGE', payload });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chartDisplay.clipping, chartDisplay.inexactMultiple]);
@@ -1861,7 +2453,6 @@ export function LineChart({
       ...modeEventFields(startMs, endMs),
       ...controlFlags(),
     };
-    console.log('[LineChart] emitting TIME_CHANGE (realtime mount)', payload);
     ev({ type: 'TIME_CHANGE', payload });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [config?.realtimeMode, initialRange]);
@@ -1870,26 +2461,58 @@ export function LineChart({
     return getPresetPeriodicities(activePreset) ?? getValidPeriodicities(rangeValue);
   }, [activePreset, rangeValue]);
 
-  // Keep the selection in step with the available options: default to the
-  // highest-order (coarsest) option until the user picks one, then hold their
-  // choice unless the range renders it invalid.
+  // Keep the selection in step with the available options. The dropdown lists
+  // options highest-order first (index 0 = coarsest), and for the LOCAL picker
+  // index 0 is the default — selected on load AND on EVERY duration/range change,
+  // even when the previous pick is still valid in the new set (e.g. Current Month
+  // [Daily] → Previous 3 Months [Monthly, Weekly, Daily] snaps to Monthly, not
+  // Daily). A manual pick only holds while the SAME option set stays on screen.
+  // External time (fixed/global/GTP) stays config-driven, so it's not forced.
+  const prevOptionsKeyRef = useRef<string>('');
   useEffect(() => {
     if (!periodicityOptions.length) return;
-    const next = pickPeriodicity(
-      periodicityOptions, selectedPeriodicity, periodicityTouchedRef.current,
-    );
-    if (next !== selectedPeriodicity) setSelectedPeriodicity(next);
-  }, [periodicityOptions, selectedPeriodicity]);
+    const key = periodicityOptions.join('|');
+    const optionsChanged = key !== prevOptionsKeyRef.current;
+    prevOptionsKeyRef.current = key;
+    if (!isExternalTime && optionsChanged) {
+      periodicityTouchedRef.current = false;
+      if (selectedPeriodicity !== periodicityOptions[0]) setSelectedPeriodicity(periodicityOptions[0]);
+    } else if (!periodicityOptions.includes(selectedPeriodicity)) {
+      setSelectedPeriodicity(periodicityOptions[0]);
+    }
+  }, [periodicityOptions, selectedPeriodicity, isExternalTime]);
 
   // Highcharts instance handle for the export menu and fullscreen toggle.
   const chartInstanceRef = useRef<
-    { reflow: () => void; fdsToggleFullscreen?: () => void } | null
+    { reflow: () => void; redraw?: () => void; fdsToggleFullscreen?: () => void } | null
   >(null);
 
-  // Root element ref for the ResizeObserver — triggers chart.reflow() when the
-  // dashboard resizes or repositions this widget so Highcharts recalculates
-  // tick positions and label layout rather than stretching the mount-time SVG.
-  const lcwRef = useRef<HTMLDivElement | null>(null);
+
+  // Force the Highcharts line to (re)paint. reflow()/redraw() alone refresh the
+  // box + axes but do NOT recompute the series graph path — so a line drawn to a
+  // stale/empty geometry during the loader→chart swap stays invisible until a
+  // hover forces the SDK to update. Marking every series isDirty + isDirtyData
+  // makes redraw() rebuild the actual <path> (what hover effectively triggers).
+  const repaintChart = useCallback(() => {
+    const c = chartInstanceRef.current as unknown as {
+      reflow?: () => void;
+      redraw?: (a?: boolean) => void;
+      isDirtyBox?: boolean;
+      series?: Array<{ isDirty: boolean; isDirtyData: boolean }>;
+    } | null;
+    if (!c) return;
+    try {
+      c.reflow?.();
+      (c.series ?? []).forEach((s) => { s.isDirty = true; s.isDirtyData = true; });
+      c.isDirtyBox = true;
+      c.redraw?.(false);
+    } catch { /* chart destroyed */ }
+  }, []);
+
+  // Root element ref (declared above for the fullscreen detector) also drives
+  // the ResizeObserver below — triggers chart.reflow() when the dashboard
+  // resizes or repositions this widget so Highcharts recalculates tick
+  // positions and label layout rather than stretching the mount-time SVG.
   const resizeRafRef = useRef<number | undefined>(undefined);
   useEffect(() => {
     const el = lcwRef.current;
@@ -1902,7 +2525,7 @@ export function LineChart({
       if (resizeRafRef.current !== undefined) cancelAnimationFrame(resizeRafRef.current);
       resizeRafRef.current = requestAnimationFrame(() => {
         resizeRafRef.current = undefined;
-        try { chart.reflow(); } catch { /* chart destroyed mid-resize */ }
+        repaintChart();
       });
     });
     ro.observe(el);
@@ -1913,6 +2536,18 @@ export function LineChart({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Loader→chart swap paint. When the spinner is replaced by the chart (data
+  // arrived), the series can be drawn to a clip-rect captured while the spinner
+  // still owned the box — the "line only appears after hover" bug. onChartReady
+  // covers the mount, but its timing is racy relative to the swap, so force an
+  // explicit reflow+redraw here too once the chart exists and data is present.
+  useEffect(() => {
+    if (isLoadingData || !hasPlottableData) return;
+    const raf = requestAnimationFrame(repaintChart);
+    const t = setTimeout(repaintChart, 120);
+    return () => { cancelAnimationFrame(raf); clearTimeout(t); };
+  }, [isLoadingData, hasPlottableData]);
+
   // Date presets surfaced in the DatePicker's preset rail. Derived from the
   // host-passed allDurations so what's offered here matches what was
   // configured in the configurator's Time tab.
@@ -1920,10 +2555,15 @@ export function LineChart({
     () => [
       // "Custom" is always first — lets the user pick a free-form date range.
       { value: 'custom', label: 'Custom' },
-      ...(timeConfig?.allDurations ?? []).map((d) => ({
-        value: d.id,
-        label: (d as { label?: string }).label || d.id,
-      })),
+      // Skip durations the user hid: the SDK keeps them in `allDurations` with
+      // hidden:true instead of removing them, so without this filter a hidden
+      // custom duration reappears in the picker (Bug 2).
+      ...(timeConfig?.allDurations ?? [])
+        .filter((d) => !d.hidden)
+        .map((d) => ({
+          value: d.id,
+          label: (d as { label?: string }).label || d.id,
+        })),
     ],
     [timeConfig?.allDurations],
   );
@@ -1944,7 +2584,15 @@ export function LineChart({
       style?.card?.wrapInCard === false
         ? 'transparent'
         : style?.card?.backgroundColor || '#FFFFFF';
-    return { '--lcw-card-bg': bg } as React.CSSProperties;
+    // Chrome we repaint but the user can't recolor (DatePicker trigger,
+    // periodicity dropdown) needs a foreground that survives a dark card.
+    // Only published when a flip is actually needed — the CSS falls back to
+    // the SDK's own text token when the variable is absent.
+    const fg = readableForeground(bg);
+    return {
+      '--lcw-card-bg': bg,
+      ...(fg ? { '--lcw-card-fg': fg } : {}),
+    } as React.CSSProperties;
   }, [style?.card?.wrapInCard, style?.card?.backgroundColor]);
 
   // ----- Render states ------------------------------------------------------
@@ -1983,9 +2631,16 @@ export function LineChart({
   const durationSlot =
     timeConfig?.pickerType === 'fixed'
       ? `${timeConfig?.fixedDuration?.label || 'Fixed'}: ${selectedPeriodicity}`
-      : undefined;
+      : isGTPMode
+        // Mirrors the fixed-time "Fixed: …" caption — tells the user the widget's
+        // time is driven by the Global Time Picker (its own date picker is hidden).
+        ? 'Linked to Global Time Picker'
+        : undefined;
 
   const allHeaderItemsHidden =
+    // Multiple charts always show the title (switcher), so the title can't be
+    // hidden then — the header chrome is never fully empty.
+    charts.length <= 1 &&
     style?.hideElements?.chartTitle === true &&
     style?.hideElements?.settingsIcon === true &&
     style?.hideElements?.exportIcon === true;
@@ -1997,12 +2652,37 @@ export function LineChart({
         hideDatePicker ? 'lcw--gtp' : '',
         showDataTable ? 'lcw--with-table' : '',
         allHeaderItemsHidden ? 'lcw--no-header-chrome' : '',
+        // Wrap-into-card OFF → strip the SDK Chart's hardcoded card surface. A
+        // class with !important is authoritative regardless of SDK CSS
+        // specificity or inline-style ordering (the inline cardStyle alone
+        // wasn't reliably winning).
+        style?.card?.wrapInCard === false ? 'lcw--no-card' : '',
+        // Scroll ON — the widget's `.highcharts-container { width:100% }` reflow
+        // override must NOT apply, or it clamps the wide scrollable plot back to
+        // the viewport width and there's nothing to scroll (see LineChart.css).
+        chartDisplay.scroll ? 'lcw--scroll' : '',
       ].filter(Boolean).join(' ')}
       style={widgetStyle}
       ref={lcwRef}
     >
+      {/* Refetch overlay — a time / periodicity change, compare/shift toggle, or
+          a GTP-driven requery re-resolves data while the previous chart stays on
+          screen. Overlay a spinner so the header + controls remain visible,
+          instead of blanking the widget. Mirrors CombinedBarLineChart. */}
+      {isRefetching && (
+        <div className="lcw__loading-overlay" aria-busy="true">
+          <Spinner size="Large" label="Loading data" labelPosition="Bottom" />
+        </div>
+      )}
       {miscColors.legend && (
-        <style>{`.lcw [class*="legend-label"] { color: ${miscColors.legend} !important; }`}</style>
+        // The SDK renders two legend variants with DIFFERENT label classes:
+        //   • regular   → .fds-chart-legend__label        (double underscore)
+        //   • scrollable → .fds-chart__scrollable-legend-label
+        // The old `[class*="legend-label"]` matched only the scrollable one
+        // (its class contains "legend-label"); the regular legend's
+        // "legend__label" never matched, so the color silently no-op'd for the
+        // common (few-series) case. Target both explicitly.
+        <style>{`.lcw .fds-chart-legend__label, .lcw .fds-chart__scrollable-legend-label { color: ${miscColors.legend} !important; }`}</style>
       )}
       {/* Suppress legend chips for "Add Source as Tooltip" series (SDK builds
           its HTML legend from the series prop). When shifts are on, names
@@ -2024,22 +2704,36 @@ export function LineChart({
         ref={setCardEl}
         style={cardStyle}
         status={hasAnySeries ? undefined : 'not-configured'}
-        duration={durationSlot}
+        duration={isFullscreen ? undefined : durationSlot}
         title={
-          style?.hideElements?.chartTitle ? undefined : charts.length > 1 ? (
+          // With multiple charts the title IS the chart switcher — always show
+          // it (the "Hide → Chart Title" option is disabled in that case), so a
+          // stale hidden flag can't strip the only way to switch charts.
+          // In full screen the title is drawn inside the Highcharts canvas
+          // (opts.title) so it's always visible; suppress the SDK header title
+          // here to avoid rendering it twice.
+          isFullscreen ? undefined :
+          charts.length > 1 ? (
             <ChartTitleSwitcher
               charts={charts}
               activeChart={activeChart}
               onSelect={setPreviewChartId}
               titleStyle={titleStyle}
             />
-          ) : (
-            <span style={titleStyle}>{activeChart.title || 'Line Chart'}</span>
+          ) : style?.hideElements?.chartTitle ? undefined : (
+            // A React node (not a string) as the Chart `title` slot is rendered
+            // RAW by the SDK — it only wraps/tooltips a STRING title in
+            // `.fds-chart__title` (`C = typeof title === 'string'`). So we render
+            // our own truncating title: the Tooltip wrapper becomes the direct
+            // child of `.fds-chart__header-row` (carrying the header-overflow
+            // flex fix) and the inner span truncates + surfaces the full title
+            // on hover only when clipped.
+            <TruncatingChartTitle text={activeChart.title || 'Line Chart'} style={titleStyle} />
           )
         }
         // DatePicker in the filters slot — hidden for fixed-time mode and when
         // no data source is configured yet (nothing to time-filter).
-        filters={hideDatePicker ? undefined : (
+        filters={hideDatePicker || isFullscreen ? undefined : (
           <DatePicker
             mode="range"
             isOpen={datePickerOpen}
@@ -2049,11 +2743,6 @@ export function LineChart({
             }}
             rangeValue={rangeValue}
             onRangeChange={(v) => {
-              console.log('[LineChart] DatePicker onRangeChange fired', {
-                value: v,
-                presetSelecting: presetSelectingRef.current,
-                hasOnEvent: !!onEvent,
-              });
               setRangeValue(v);
               commitToggles();
               // Preset chip selection fires onRangeChange as a side-effect
@@ -2062,23 +2751,42 @@ export function LineChart({
               // second fetch with the old (un-snapped) periodicity.
               if (presetSelectingRef.current) {
                 presetSelectingRef.current = false;
-                console.log('[LineChart] onRangeChange skipped — presetSelecting guard');
                 return;
               }
               if (!v || !onEvent) {
-                console.log('[LineChart] onRangeChange bailed — no value or no onEvent', {
-                  hasValue: !!v,
-                  hasOnEvent: !!onEvent,
-                });
                 return;
+              }
+              // Mount-echo guard: the picker fires this once on mount with the
+              // initial range. `rangeValue` here is still the pre-update value
+              // (setRangeValue above only schedules a re-render), so if the
+              // incoming range equals it, this is the mount echo — skip it. The
+              // host already queried this window; emitting would duplicate it.
+              // A real first pick has a different range and passes through.
+              if (!rangeInitRef.current) {
+                rangeInitRef.current = true;
+                const unchanged =
+                  !!rangeValue &&
+                  new Date(v.start).getTime() === new Date(rangeValue.start).getTime() &&
+                  new Date(v.end).getTime() === new Date(rangeValue.end).getTime();
+                if (unchanged) {
+                  return;
+                }
               }
               // Manual range pick: snap using preset-definition periodicities
               // first (calendarType / explicit list / minute-band), then fall
               // back to bucket-count heuristic for fully custom ranges.
               const nextOptions = getPresetPeriodicities(activePreset) ?? getValidPeriodicities(v);
-              const nextPeriodicity = pickPeriodicity(
-                nextOptions, selectedPeriodicity, periodicityTouchedRef.current,
-              );
+              // A genuine window change defaults periodicity to the highest-order
+              // option (index 0), clearing any prior manual pick; a toggle-only
+              // apply (same window) keeps the current selection.
+              const rangeChanged =
+                !rangeValue ||
+                new Date(v.start).getTime() !== new Date(rangeValue.start).getTime() ||
+                new Date(v.end).getTime() !== new Date(rangeValue.end).getTime();
+              const nextPeriodicity = rangeChanged && nextOptions.length
+                ? nextOptions[0]
+                : pickPeriodicity(nextOptions, selectedPeriodicity, periodicityTouchedRef.current);
+              if (rangeChanged) periodicityTouchedRef.current = false;
               if (nextPeriodicity !== selectedPeriodicity) {
                 setSelectedPeriodicity(nextPeriodicity);
               }
@@ -2102,7 +2810,6 @@ export function LineChart({
                     : {}),
                 ...controlFlags(),
               };
-              console.log('[LineChart] emitting TIME_CHANGE (manual range pick)', manualPayload);
               beginPendingFetch(); // show the loader until the host answers the new window
               onEvent({ type: 'TIME_CHANGE', payload: manualPayload });
             }}
@@ -2112,6 +2819,13 @@ export function LineChart({
             selectedPreset={selectedPreset}
             onPresetSelect={(v: string) => {
               presetSelectingRef.current = true;
+              // A duration pick always resets periodicity to that duration's
+              // highest (coarsest) option — clear the manual-pick flag so every
+              // resolver (preset effect, sync effect, manual-range path) defaults
+              // to options[0] instead of preserving a value that happens to be
+              // valid in both durations (e.g. Current Month Daily → Previous 3
+              // Months should jump to Monthly, not stay on Daily).
+              periodicityTouchedRef.current = false;
               setSelectedPreset(v);
             }}
             placeholder="Select date range"
@@ -2128,9 +2842,19 @@ export function LineChart({
                   label=""
                   value={selectedPeriodicity}
                   placeholder="Periodicity"
+                  // Only one periodicity maps to this duration — nothing else to
+                  // pick, so disable the dropdown.
+                  isDisabled={periodicityOptions.length <= 1}
                   isOpen={periodicityOpen}
-                  onOpenChange={setPeriodicityOpen}
-                  onClick={() => setPeriodicityOpen((o) => !o)}
+                  // `onOpenChange` is the SDK's controlled-mode open/close
+                  // channel — it fires on trigger click AND on outside-click /
+                  // Escape. A separate `onClick` toggle made the SDK think WE
+                  // drive the open state, so it stopped reporting outside-clicks
+                  // and the dropdown never closed. Drive it solely from
+                  // onOpenChange (guarded so a single-option list can't open).
+                  onOpenChange={(open) =>
+                    setPeriodicityOpen(open && periodicityOptions.length > 1)
+                  }
                 >
                   <DropdownMenu className="lcw__periodicity-menu">
                     {periodicityOptions.map((opt) => (
@@ -2173,7 +2897,9 @@ export function LineChart({
         // by default when hideElements is absent or false (not explicitly true).
         actions={
           // Pass undefined when nothing is visible — SDK Chart skips the
-          // header entirely (no empty-div gap above the canvas).
+          // header entirely (no empty-div gap above the canvas). Also hidden
+          // entirely in full screen (export + settings chrome is noise there).
+          isFullscreen ? undefined :
           (style?.hideElements?.settingsIcon === true &&
            style?.hideElements?.exportIcon === true &&
            !activeChart.description?.trim()) ? undefined : (
@@ -2233,6 +2959,14 @@ export function LineChart({
             // apply its own type/marker settings after our overrides.
             areaFill: style?.enableAreaFill,
             dataPoints: style?.showDataPoints,
+            // "Add Source as Tooltip" per-series signature. A tooltip-only
+            // series is built with lineWidth:0 / showInLegend:false / marker
+            // off; when the flag is UNCHECKED the rebuilt options simply OMIT
+            // those fields, but chart.update() MERGES — it keeps the stale
+            // lineWidth:0 / showInLegend:false, so the line never reappears.
+            // Keying on the flags forces a fresh instance so the series redraws
+            // as a normal visible line the moment the toggle changes.
+            tooltipOnly: effectiveTooltipOnlyFlags.map((f) => (f ? '1' : '0')).join(''),
             // Data SHAPE signature — category count + total null-gap count.
             // Highcharts updates category-axis series in place via chart.update()
             // and does NOT reliably reopen a gap when breakdown null-fillers are
@@ -2244,6 +2978,13 @@ export function LineChart({
               (n, s) => n + (s.data?.reduce((m: number, v: any) => m + (v == null ? 1 : 0), 0) ?? 0),
               0,
             )}`,
+            // Highcharts only applies `scrollablePlotArea` when the chart is
+            // FIRST constructed — a later chart.update() with a changed (or
+            // cleared) minWidth never re-applies it (confirmed in ColumnChart:
+            // toggling Scroll off left the same scrollWidth in place). Keying on
+            // `scroll` forces a fresh Highcharts instance on toggle so the option
+            // is honored both when turned on AND off.
+            scroll: chartDisplay.scroll,
           })}
           bare
           // null entries are valid Highcharts gaps; the SDK's LineSeries types
@@ -2252,12 +2993,20 @@ export function LineChart({
           comparison={chartMode === 'comparison' ? comparisonProp : undefined}
           shift={chartMode === 'shift' ? shiftProp : undefined}
           categories={categories}
+          // Full timestamp per bucket for the SDK tooltip's date footer.
+          tooltipCategories={tooltipCategories}
           // SDK renders its own ShiftLegend inside the viewport in shift mode;
           // suppress the scrollable series legend so it doesn't show alongside.
           showLegend={shiftProp ? false : chartDisplay.legends}
           showDataLabels={chartDisplay.dataLabel}
           showMarkers={style?.showDataPoints ? true : false}
           smooth={!style?.enableAreaFill}
+          // Horizontal plot-area scroll for dense category axes. The authoritative
+          // scroll config (computed minWidth, explicit 0-when-off) is set in
+          // highchartsOptions.chart.scrollablePlotArea (deep-merged last); these
+          // props keep the SDK's own path in sync.
+          scrollable={chartDisplay.scroll}
+          scrollableMinWidth={Math.max(800, categories.length * 50)}
           plotLines={[]}
           plotBands={[]}
           xAxisTitle={activeChart?.defaultAxis?.xAxisLabel || undefined}
@@ -2284,14 +3033,16 @@ export function LineChart({
               },
             });
           }}
-          onChartReady={(inst: { reflow: () => void; fdsToggleFullscreen?: () => void }) => {
+          onChartReady={(inst: { reflow: () => void; redraw?: () => void; fdsToggleFullscreen?: () => void }) => {
             chartInstanceRef.current = inst;
-            // Reflow on the next animation frame so Highcharts measures the
-            // container AFTER the DOM settles. Without this, key-driven
-            // remounts during config editing can initialize at a stale size.
-            requestAnimationFrame(() => {
-              try { inst.reflow(); } catch { /* chart destroyed before frame */ }
-            });
+            // The series can be drawn to a stale/empty geometry at first paint
+            // (loader→chart swap): the axes render but the line stays invisible
+            // until a hover forces the SDK to redraw the path. repaintChart marks
+            // every series dirty and redraws — reproducing that hover. Several
+            // passes cover layout still settling across the first frames.
+            requestAnimationFrame(repaintChart);
+            setTimeout(repaintChart, 80);
+            setTimeout(repaintChart, 300);
           }}
         />
         )}
@@ -2381,6 +3132,7 @@ function ChartActionIcons({
         { key: 'dataLabel',       label: 'Data Labels' },
         { key: 'clipping',        label: 'Clipping' },
         { key: 'zoom',            label: 'Zoom' },
+        { key: 'scroll',          label: 'Scroll' },
       ],
     },
   ];
@@ -2408,20 +3160,24 @@ function ChartActionIcons({
         </Tooltip>
       )}
       {showSettings && (
-        <IconButton
-          icon={<Settings size={16} />}
-          size="Medium"
-          accessibilityLabel="Settings"
-          onClick={(e) => { capturePos(e); setSettingsOpen((o) => !o); setMoreOpen(false); }}
-        />
+        <Tooltip bodyText="Chart Settings" placement="Bottom" isDisabled={settingsOpen || moreOpen}>
+          <IconButton
+            icon={<Settings size={16} />}
+            size="Medium"
+            accessibilityLabel="Chart Settings"
+            onClick={(e) => { capturePos(e); setSettingsOpen((o) => !o); setMoreOpen(false); }}
+          />
+        </Tooltip>
       )}
       {showMore && (
-        <IconButton
-          icon={<Menu size={16} />}
-          size="Medium"
-          accessibilityLabel="Export"
-          onClick={(e) => { capturePos(e); setMoreOpen((o) => !o); setSettingsOpen(false); }}
-        />
+        <Tooltip bodyText="More" placement="Bottom" isDisabled={settingsOpen || moreOpen}>
+          <IconButton
+            icon={<Menu size={16} />}
+            size="Medium"
+            accessibilityLabel="Export"
+            onClick={(e) => { capturePos(e); setMoreOpen((o) => !o); setSettingsOpen(false); }}
+          />
+        </Tooltip>
       )}
       {settingsOpen && createPortal(
         <>
@@ -2452,7 +3208,9 @@ function ChartActionIcons({
       {moreOpen && createPortal(
         <>
           <div style={backdropStyle} onClick={() => setMoreOpen(false)} />
-          <div style={menuStyle}>
+          {/* Fixed 150px width for the More menu (overrides the shared menuStyle
+              minWidth, which the settings menu keeps). */}
+          <div style={{ ...menuStyle, minWidth: 150, width: 150 }}>
             <DropdownMenu>
               <ActionListItem title="View in full screen" selectionType="None" onClick={toggleFullscreen} />
               <ActionListItem contentType="Separator" />
@@ -2500,31 +3258,40 @@ function ChartTitleSwitcher({
   }, [open]);
 
   const label = activeChart?.title || 'Untitled Chart';
+  const labelRef = useRef<HTMLSpanElement>(null);
+  const truncated = useIsTruncated(labelRef, label);
   return (
     <div className="fds-chart-switcher__title">
-      <button
-        type="button"
-        className="fds-chart__title"
-        onClick={(e) => {
-          const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-          setMenuPos({ top: rect.bottom + 4, left: rect.left });
-          setOpen((o) => !o);
-        }}
-        aria-haspopup="menu"
-        aria-expanded={open}
-      >
-        <span className="fds-chart__title-label HeadingSmallSemibold" style={titleStyle}>
-          {label}
-        </span>
-        <ChevronDown className="fds-chart__title-icon" aria-hidden="true" />
-      </button>
+      {/* Full-title tooltip only when the switcher label is clipped. isDisabled
+          suppresses it otherwise; the wrapper className keeps min-width:0 so the
+          label can still shrink/truncate inside the header (see LineChart.css). */}
+      <Tooltip bodyText={label} placement="Bottom" isDisabled={!truncated} className="lcw__switcher-title-wrap">
+        <button
+          type="button"
+          className="fds-chart__title"
+          onClick={(e) => {
+            const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+            setMenuPos({ top: rect.bottom + 4, left: rect.left });
+            setOpen((o) => !o);
+          }}
+          aria-haspopup="menu"
+          aria-expanded={open}
+        >
+          <span ref={labelRef} className="fds-chart__title-label HeadingSmallSemibold" style={titleStyle}>
+            {label}
+          </span>
+          <ChevronDown className="fds-chart__title-icon" aria-hidden="true" />
+        </button>
+      </Tooltip>
       {open && createPortal(
         <>
           <div
             style={{ position: 'fixed', inset: 0, zIndex: 9999 }}
             onClick={() => setOpen(false)}
           />
-          <div style={{ position: 'fixed', top: menuPos.top, left: menuPos.left, zIndex: 10000, minWidth: 200 }}>
+          {/* Cap the chart list height so many charts scroll instead of running
+              off-screen; ~7 rows then a scrollbar. */}
+          <div className="lcw__chart-switcher-menu" style={{ position: 'fixed', top: menuPos.top, left: menuPos.left, zIndex: 10000, minWidth: 200, maxWidth: 300, maxHeight: 'min(320px, 60vh)', overflowY: 'auto', overflowX: 'hidden' }}>
             <DropdownMenu>
               {charts.map((c) => (
                 <ActionListItem
@@ -2596,8 +3363,8 @@ function DataTablePreview({
               getSeriesData(`charts[${chartIndex}].series[${si}].unsPath`, data) ??
               getSeriesData(`charts[${chartIndex}].series[${si}].dataSource`, data);
             values = (payload?.slots ?? [])
-              .map((slot) => slot.value)
-              .filter((v): v is number => typeof v === 'number');
+              .map((slot) => coerceSlotValue(slot.value))
+              .filter((v): v is number => v !== null);
           }
         } else if (col.sourceMode === 'AddNew') {
           // AddNew columns are fetched via their own binding key (not tied to
@@ -2608,8 +3375,8 @@ function DataTablePreview({
             data,
           );
           values = (payload?.slots ?? [])
-            .map((slot) => slot.value)
-            .filter((v): v is number => typeof v === 'number');
+            .map((slot) => coerceSlotValue(slot.value))
+            .filter((v): v is number => v !== null);
         }
         const prec = Number.isFinite(col.dataPrecision) ? col.dataPrecision : 2;
         return { id: col._id, label, values, prec };

@@ -76,6 +76,12 @@ export interface DataEntry {
 export interface Duration {
   id: string;
   label?: string;
+  // Present in the SDK/host duration data but previously undeclared here:
+  // `isBuiltIn` marks the platform's stock presets; `hidden` is how the SDK
+  // flags a custom duration the user removed — it stays in `allDurations` with
+  // hidden:true rather than being deleted, so consumers MUST filter it out.
+  isBuiltIn?: boolean;
+  hidden?: boolean;
   navigation?: string;
   x?: number;
   xPeriod?: string;
@@ -210,7 +216,17 @@ export interface LineChartAxis {
   linkedSeriesIds: string[];  // legacy fallback for renderer; kept for backward compat
 }
 
-export type PlotLineStyle = 'Solid' | 'Dashed';
+// Highcharts dash-style names (matches the ColumnChart / CombinedBarLine plot
+// line "Dash style" options). `'Dashed'` is retained only for legacy envelopes
+// saved before the expanded set — it is normalized to `'Dash'` on load/render.
+export type PlotLineStyle =
+  | 'Solid'
+  | 'Dash'
+  | 'Dot'
+  | 'DashDot'
+  | 'LongDash'
+  | 'ShortDash'
+  | 'Dashed';
 export type PlotLinePeriodicityType = 'independent' | 'dependent';
 
 export interface LineChartPlotLine {
@@ -335,6 +351,7 @@ export interface LineChartStyling {
     dataLabel?: boolean;
     clipping?: boolean;
     zoom?: boolean;
+    scroll?: boolean;
   };
 }
 
