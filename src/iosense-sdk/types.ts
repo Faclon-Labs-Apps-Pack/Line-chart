@@ -13,6 +13,10 @@ export interface SeriesSlot {
   value: number | null;
   quality: string;
   isPartial?: boolean;
+  /** Shift name this bucket belongs to — set by the backend when the request
+   *  carried a `shifts` array. Used to plot each bucket under the correct shift
+   *  series instead of re-deriving the window client-side. */
+  shift?: string;
 }
 
 export interface SeriesAggregation {
@@ -37,6 +41,21 @@ export interface SeriesPayload {
   meta: SeriesMeta;
   range: { from: number; to: number };
   slots: SeriesSlot[];
+  /** Previous-period buckets — present only when resolveAndCompute is called
+   *  with comparison params (comparisonMode + comparisonStartTime/EndTime).
+   *  Index-aligned to `slots` (comparisonSlots[i] pairs with slots[i]). */
+  comparisonSlots?: SeriesSlot[];
+}
+
+// A single shift window (time-of-day range). Mirrors the SDK's GTPShift shape
+// that the configurator stores in timeTabConfig.shifts. Forwarded verbatim to
+// resolveAndCompute so the backend can bucket series into shift windows.
+export interface ShiftWindow {
+  id: string;
+  name: string;
+  color: string;
+  startTime: string; // "HH:mm"
+  endTime: string;   // "HH:mm"
 }
 
 export interface ScalarBinding { key: string; topic: string; }
@@ -57,22 +76,77 @@ export interface DataEntry {
 export interface Duration {
   id: string;
   label?: string;
+  // Present in the SDK/host duration data but previously undeclared here:
+  // `isBuiltIn` marks the platform's stock presets; `hidden` is how the SDK
+  // flags a custom duration the user removed — it stays in `allDurations` with
+  // hidden:true rather than being deleted, so consumers MUST filter it out.
+  isBuiltIn?: boolean;
+  hidden?: boolean;
+  navigation?: string;
   x?: number;
-  xPeriod: string; // "minute" | "hour" | "day" | "week" | "month" | "year"
+  xPeriod?: string;
+  xEvent?: string;
+  y?: number;
+  yPeriod?: string;
+  yEvent?: string;
+  calendarType?: string;
+  periodicities?: string[];
+}
+
+export interface CycleTime {
+  identifier?: string;
+  hour?: string | number;
+  minute?: string | number;
+  dayOfWeek?: number | null;
+  date?: string | number;
+  // 1-based month number (1 = January … 4 = April), as emitted by design-sdk
+  // ≥0.7.8. Legacy envelopes may still hold a month NAME string ("April") —
+  // both are resolved via monthIndex() in time.ts.
+  month?: string | number | null;
 }
 
 export interface TimeConfig {
   timezone: string;
   type: 'local' | 'fixed' | string;
+  pickerType?: 'local' | 'fixed' | 'global';
+  cycleTime?: CycleTime;
   startTime: number | null;
   endTime: number | null;
+  fixedDuration?: Duration;
   defaultDurationId: string;
   allDurations: Duration[];
   defaultPeriodicity: 'minute' | 'hourly' | 'daily' | 'weekly' | 'monthly';
+  globalTimepickerId?: string;
+  globalTimepickerName?: string;
 }
 
 export type WidgetEvent =
-  | { type: 'TIME_CHANGE'; payload: { startTime: string; endTime: string; periodicity: string } }
+  | {
+      type: 'TIME_CHANGE';
+      payload: {
+        startTime: string;
+        endTime: string;
+        periodicity: string;
+        /** Present only when comparison mode is active — the previous-period
+         *  window. The data layer forwards these to resolveAndCompute so the
+         *  same call returns `comparisonSlots` alongside the current `slots`. */
+        comparisonStartTime?: string;
+        comparisonEndTime?: string;
+        /** Present only when the shift toggle is active. The data layer forwards
+         *  these to resolveAndCompute so the backend buckets each series into the
+         *  configured shift windows (aggregated by `shiftAggregator`). Omitted
+         *  when shift is off, so the same call returns the normal series. */
+        shifts?: ShiftWindow[];
+        shiftAggregator?: string;
+        /** Chart-control toggles from the settings menu. These ride on every
+         *  TIME_CHANGE (not a separate event) so the host always refetches the
+         *  current window with the flags applied. `clipping` trims partial
+         *  edge buckets to the exact window; `inexactMultiple` allows a
+         *  non-whole number of buckets across the range. Mutually exclusive. */
+        clipping?: boolean;
+        inexactMultiple?: boolean;
+      };
+    }
   | { type: 'FILTER_CHANGE'; payload: Record<string, unknown> };
 
 // ---------------------------------------------------------------------------
@@ -102,7 +176,15 @@ export interface LineChartSeries {
   _id: string;
   name: string;
   color: string;
-  dataSource: string; // bindable: stores {{uns:wsId://path}}
+  // Bindable: stores {{uns:wsId://path}}. Field name MUST be `unsPath` —
+  // iosense's host engine reads binding keys whose path ends in `.unsPath`
+  // and treats them as series sources (same convention the deployed Column
+  // Chart widget uses). `dataSource` is kept as a legacy read-side field for
+  // existing envelopes saved before the rename; configurator/widget never
+  // emit it anymore.
+  unsPath: string;
+  /** @deprecated Use `unsPath`. Legacy field kept for envelope migration only. */
+  dataSource?: string;
   downsampling?: string;
   downsamplingUnit?: string;
   dataPrecision?: number;
@@ -127,37 +209,52 @@ export interface LineChartAxis {
   _id: string;
   name: string;
   position: 'Left' | 'Right';
-  dataSource: string;         // bindable: stores {{uns:wsId://path}}
+  // See LineChartSeries.unsPath for the rename rationale.
+  unsPath: string;
+  /** @deprecated Use `unsPath`. Legacy field for envelope migration. */
+  dataSource?: string;
   linkedSeriesIds: string[];  // legacy fallback for renderer; kept for backward compat
 }
 
-export type PlotLineType = 'Independent' | 'Dependent';
-export type PlotLineValueType = 'Fixed' | 'Dynamic';
-export type PlotLineStyle = 'Solid' | 'Dashed';
-
-export interface PlotLinePeriodicityEntry {
-  periodicity: string;
-  value: number;
-}
+// Highcharts dash-style names (matches the ColumnChart / CombinedBarLine plot
+// line "Dash style" options). `'Dashed'` is retained only for legacy envelopes
+// saved before the expanded set — it is normalized to `'Dash'` on load/render.
+export type PlotLineStyle =
+  | 'Solid'
+  | 'Dash'
+  | 'Dot'
+  | 'DashDot'
+  | 'LongDash'
+  | 'ShortDash'
+  | 'Dashed';
+export type PlotLinePeriodicityType = 'independent' | 'dependent';
 
 export interface LineChartPlotLine {
   _id: string;
   name: string;
   color: string;
-  type: PlotLineType;
-  valueType: PlotLineValueType;
-  fixedValue?: string;
-  dynamicTopic?: string;
-  downsampling?: string;
-  downsamplingUnit?: string;
-  dataPrecision?: number;
-  unit?: string;
-  periodicities?: PlotLinePeriodicityEntry[];
-  durationType?: string;
-  startDate?: string;
-  endDate?: string;
+  /** Numeric string ("1.5") or {{uns:...}} binding template */
+  value: string;
   lineWidth: number;
   lineStyle: PlotLineStyle;
+  /** Y-axis to draw on. Empty/undefined = default left axis. Matches LineChartAxis._id for right axes. */
+  axisId?: string;
+  periodicityType?: PlotLinePeriodicityType;
+  /** Active periodicities when type is 'dependent' */
+  periodicities?: string[];
+  // Legacy fields — migration only, kept so old envelopes don't lose data
+  /** @deprecated Use `value`. */
+  fixedValue?: string;
+  /** @deprecated Use `value`. */
+  dynamicTopic?: string;
+  /** @deprecated Use `periodicityType`. */
+  type?: string;
+  /** @deprecated */
+  valueType?: string;
+  /** @deprecated */
+  dataPrecision?: number;
+  /** @deprecated */
+  unit?: string;
 }
 
 export interface LineChartPlotBand {
@@ -212,9 +309,6 @@ export interface ChartInstance {
   _id: string;
   title: string;
   description?: string;
-  // 'Aggregated' (default) uses periodicity-based bucketing; 'Realtime' removes
-  // all periodicity controls (preview picker, Time tab, periodicity plotlines).
-  chartType?: 'Aggregated' | 'Realtime';
   series: LineChartSeries[];
   defaultAxis: LineChartDefaultAxis;
   axes: LineChartAxis[];
@@ -225,6 +319,12 @@ export interface ChartInstance {
   // Per-chart data table config (each chart has its own; the preview/widget show
   // a data table only for the chart that configured one).
   dataTable: DataTableConfig;
+  // Break-series timeout (BT) in SECONDS. When set, a gap between consecutive
+  // buckets larger than this severs the line (device-inactive break), matching
+  // v1's `breakSeriesTimeout`. When unset, the widget falls back to an adaptive
+  // median-gap heuristic. (Later: fall back to the source device's admin BT once
+  // the backend exposes it in the resolveAndCompute meta.)
+  breakSeriesTimeout?: number;
 }
 
 export type StylingFontWeight = 'Regular' | 'Medium' | 'Semi-Bold' | 'Bold';
@@ -244,10 +344,19 @@ export interface LineChartStyling {
     dataPointTextWeight: StylingFontWeight; dataPointTextColor: string;
   };
   misc: { gridLineColor: string; legendTextColor: string };
+  enableAreaFill?: boolean;
+  showDataPoints?: boolean;
+  defaultChartDisplay?: {
+    legends?: boolean;
+    dataLabel?: boolean;
+    clipping?: boolean;
+    zoom?: boolean;
+    scroll?: boolean;
+  };
 }
 
 export type DataTableSourceMode = 'Existing' | 'AddNew';
-export type DataTableOperator = 'sum' | 'avg' | 'min' | 'max' | 'median' | 'first' | 'last';
+export type DataTableOperator = 'sum' | 'avg' | 'min' | 'max' | 'median' | 'first' | 'last' | 'std';
 
 export interface DataTableColumn {
   _id: string;
@@ -279,6 +388,9 @@ export type DeviationIndicatorMode = 'standard' | 'inverse';
 export interface LineChartUIConfig {
   charts: ChartInstance[];
   activeChartId: string | null;
+  // When true: live streaming mode — no periodicity controls, shift coloring
+  // uses time-window grouping with null-gap insertion for data breaks.
+  realtimeMode?: boolean;
   dataTable: DataTableConfig;
   style: LineChartStyling;
   // Tooltip deviation indicator behavior — only used when timeConfig.comparisonMode is true.
@@ -306,8 +418,15 @@ export type {
   GTPCycleTimeConfig,
 };
 
-// Not publicly re-exported by the SDK index — mirrored from the SDK's internal
-// types (see node_modules/@faclon-labs/design-sdk/.../TimeTabConfiguration/types.d.ts).
+// Mirrors TimeTabUIConfig.defaultDisplayMode — defined locally because the
+// SDK's TimeTabConfiguration subpath does not re-export it.
+export type TimeTabDefaultDisplayMode = 'normal' | 'shift' | 'comparison';
+
+// GTPCycleTimeType drives the first dropdown in the Cycle Time accordion.
+// The SDK defines it internally but does not re-export it from the
+// `TimeTabConfiguration` subpath entry, so we mirror the union locally.
+export type GTPCycleTimeType = 'calendar' | 'financial' | 'custom';
+
 export type GTPTimeType = 'fixed' | 'local' | 'global';
 
 export interface GTPGlobalTimepicker {
@@ -337,14 +456,65 @@ export interface GTPChart {
   sources: GTPChartSource[];
 }
 
+// Host (iosense Lens) time config shape — distinct from the SDK's
+// TimeTabUIConfig. Iosense's query-engine reads this to derive `startTime`,
+// `endTime`, `timezone`, `shifts` for resolveAndCompute. Mirrors the shape
+// the deployed Column Chart widget emits (`timezone, type, pickerType,
+// cycleTime, startTime, endTime, fixedDuration, defaultDurationId,
+// allDurations, defaultPeriodicity`). Reverse-engineered from the
+// column chart bundle's onChange transform.
+export interface HostTimeConfig {
+  timezone: string;
+  type: 'local' | 'fixed' | 'global';
+  pickerType: 'local' | 'fixed' | 'global';
+  cycleTime: import('@faclon-labs/design-sdk/TimeTabConfiguration').GTPCycleTimeConfig | null;
+  startTime: number | null;
+  endTime: number | null;
+  fixedDuration?: {
+    id: 'fixed';
+    label: string;
+    navigation: string;
+    x: number;
+    xPeriod: string;
+    xEvent: string;
+    y: number;
+    yPeriod: string;
+    yEvent: string;
+  };
+  defaultDurationId: string;
+  allDurations: TimeTabUIConfig['allDurations'];
+  defaultPeriodicity: string;
+  /** When true, periodicity selection is disabled in the Time tab. The widget
+   *  reads this to hide the periodicity dropdown in its header. Mirrored here so
+   *  it survives Lens save/restore even when timeTabConfig is stripped. */
+  disablePeriodicities?: boolean;
+  shifts?: TimeTabUIConfig['shifts'];
+  /** Aggregation operator applied within each shift window (Sum/Average/Min/
+   *  Max/First/Last as configured in the Time tab's Shift Aggregator dropdown).
+   *  Read by the widget and forwarded to resolveAndCompute when shift is on. */
+  shiftAggregator?: string;
+  comparisonMode?: boolean;
+  deviationPattern?: string;
+  sourceDeviationOverrides?: Record<string, string>;
+  /** Preserved from timeTabConfig so it survives Lens save/restore (Lens reads
+   *  timeConfig but may not preserve timeTabConfig across sessions). The widget
+   *  falls back to this field when timeTabConfig is unavailable. */
+  defaultDisplayMode?: TimeTabDefaultDisplayMode;
+  /** When true, the LineChart is in realtime (live-streaming) mode. Embedded
+   *  here so query-engine.ts can set timeFrame='realtime' without reading uiConfig. */
+  realtimeMode?: boolean;
+}
+
 export interface LineChartEnvelope {
   _id: string;
   type: 'LineChart';
   general: { title: string };
-  // Mini-engine reads timeConfig to compute startTime/endTime for resolveAndCompute.
-  timeConfig?: TimeTabUIConfig;
-  // Full TimeTabConfiguration UI state — configurator re-hydrates from this; mini-engine ignores it.
-  // Must always be emitted alongside timeConfig, never alone.
+  // Host (Lens) reads timeConfig in HostTimeConfig shape to derive
+  // startTime/endTime/timezone/shifts for resolveAndCompute. The legacy
+  // TimeTabUIConfig is accepted as input but always normalized via
+  // toHostTimeConfig() before persisting.
+  timeConfig?: HostTimeConfig | TimeTabUIConfig;
+  // Full TimeTabConfiguration UI state — configurator re-hydrates from this.
   timeTabConfig?: TimeTabUIConfig;
   uiConfig: LineChartUIConfig;
   dynamicBindingPathList: Array<BindingEntry>;

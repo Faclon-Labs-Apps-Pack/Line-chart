@@ -1,4 +1,4 @@
-import { LineChartEnvelope, LineChartUIConfig, DataEntry, SeriesPayload, GTPPreset } from './types';
+import { LineChartEnvelope, LineChartUIConfig, DataEntry, SeriesPayload, GTPPreset, ShiftWindow } from './types';
 import { resolveAndCompute } from './api';
 
 interface MiniEngineCtx {
@@ -7,6 +7,17 @@ interface MiniEngineCtx {
   /** Periodicity override from the widget's periodicity dropdown.
    *  Sent to backend so all series aggregate at the picked granularity. */
   periodicity?: string;
+  /** Previous-period window. When set, resolveAndCompute runs comparison mode
+   *  and returns `comparisonSlots` on each series alongside the current `slots`
+   *  — one call, no separate comparison fetch. */
+  comparison?: { startTime: number; endTime: number };
+  /** Shift windows. When set, resolveAndCompute buckets each series into these
+   *  time-of-day windows, aggregated by `shiftAggregator`. Sent only while the
+   *  widget's shift toggle is on. */
+  shifts?: ShiftWindow[];
+  /** Aggregation operator applied within each shift window (backend vocab, e.g.
+   *  'mean'). Paired with `shifts`. */
+  shiftAggregator?: string;
 }
 
 export interface MiniEngineResult {
@@ -73,6 +84,10 @@ export async function resolve(
       startTime,
       endTime,
       resolution,
+      ctx.comparison,
+      ctx.shifts && ctx.shifts.length
+        ? { shifts: ctx.shifts, shiftAggregator: ctx.shiftAggregator }
+        : undefined,
     );
     const data: DataEntry[] = items.map((item) => ({ key: item.key, value: item.value }));
     // Diagnostic — summarize series payload shape per key so we can see the
@@ -106,11 +121,32 @@ export async function resolve(
 }
 
 export function getSeriesData(key: string, data: DataEntry[]): SeriesPayload | null {
-  const entry = data.find((d) => d.key === key);
+  // Two host shapes converge here:
+  // (a) Our dev mini-engine wraps each item as `{ key, value: { __type:'series', slots, ... } }`.
+  // (b) Lens's production query-engine passes the raw API item straight through:
+  //     `{ key, path, meta, range, slots }` (no `__type`, no `value` wrapper).
+  // Accept both so the widget renders in both environments.
+  const entry = data.find((d) => d.key === key) as
+    | (DataEntry & Partial<SeriesPayload>)
+    | undefined;
   if (!entry) return null;
-  const v = entry.value;
+  // (a) wrapped shape
+  const v = entry.value as SeriesPayload | string | number | null | undefined;
   if (v !== null && typeof v === 'object' && (v as SeriesPayload).__type === 'series') {
     return v as SeriesPayload;
+  }
+  // (b) raw shape — recognise by `slots` array on the entry itself.
+  if (Array.isArray(entry.slots)) {
+    return {
+      __type: 'series',
+      path: entry.path ?? '',
+      meta: entry.meta as SeriesPayload['meta'],
+      range: entry.range as SeriesPayload['range'],
+      slots: entry.slots as SeriesPayload['slots'],
+      ...(Array.isArray(entry.comparisonSlots)
+        ? { comparisonSlots: entry.comparisonSlots as SeriesPayload['slots'] }
+        : {}),
+    };
   }
   return null;
 }

@@ -1,7 +1,6 @@
 import { createRoot, Root } from 'react-dom/client';
 import React from 'react';
 import { LineChartConfiguration } from './LineChartConfiguration';
-import '@faclon-labs/design-sdk/styles.css';
 
 const roots = new Map<string, Root>();
 
@@ -12,8 +11,8 @@ function mount(containerId: string, props: any) {
   container.setAttribute('data-zone-ignore', '');
 
   if (roots.has(containerId)) {
-    roots.get(containerId)!.unmount();
-    roots.delete(containerId);
+    roots.get(containerId)!.render(React.createElement(LineChartConfiguration, props));
+    return;
   }
 
   const root = createRoot(container);

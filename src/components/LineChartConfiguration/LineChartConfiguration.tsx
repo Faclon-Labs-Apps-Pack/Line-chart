@@ -1,8 +1,10 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
-import { UNSPathInput } from '@faclon-labs/design-sdk/UNSPathInput';
+import { UNSTreePicker } from '@faclon-labs/design-sdk/UNSTreePicker';
+import type { UNSWorkspace, UNSNode } from '@faclon-labs/design-sdk/UNSTreePicker';
 import { ColorInput } from '@faclon-labs/design-sdk/ColorPicker';
-import { useUNSTree, UNSTree } from '../../iosense-sdk/useUNSTree';
+import { Tag } from '@faclon-labs/design-sdk/Tag';
+import { useUNSTreePicker } from '../../iosense-sdk/useUNSTreePicker';
 import {
   ArrowLeft,
   X,
@@ -11,35 +13,29 @@ import {
   Edit2,
   ChevronDown,
 } from 'react-feather';
-import {
-  Tabs,
-  TabItem,
-  TextInput,
-  Button,
-  IconButton,
-  RadioGroup,
-  Radio,
-  SelectInput,
-  DropdownMenu,
-  ActionListItem,
-  DatePicker,
-  Modal,
-  ModalHeader,
-  ModalBody,
-  ModalFooter,
-  ModalLeadingItem,
-  Switch,
-  Checkbox,
-  Divider,
-  Badge,
-  ListCard,
-  ListCardLeadingItem,
-  ListCardTrailingItem,
-  ComparisonToggle,
-  TimeTabConfiguration,
-  ProductAccordionItem,
-  Tooltip,
-} from '@faclon-labs/design-sdk';
+// Per-component subpath imports (NOT the root barrel). The root barrel's
+// index.js side-effect-imports every component's CSS, which would pull the full
+// SDK stylesheet into this bundle and defeat the per-component CSS split. Each
+// subpath below pulls only its own co-located CSS.
+import { Tabs, TabItem } from '@faclon-labs/design-sdk/Tabs';
+import { TextInput } from '@faclon-labs/design-sdk/TextInput';
+import { Button } from '@faclon-labs/design-sdk/Button';
+import { IconButton } from '@faclon-labs/design-sdk/IconButton';
+import { RadioGroup, Radio } from '@faclon-labs/design-sdk/Radio';
+import { SelectInput } from '@faclon-labs/design-sdk/SelectInput';
+import { DropdownMenu } from '@faclon-labs/design-sdk/DropdownMenu';
+import { ActionListItem } from '@faclon-labs/design-sdk/ActionListItem';
+import { DatePicker } from '@faclon-labs/design-sdk/DatePicker';
+import { Modal, ModalHeader, ModalBody, ModalFooter, ModalLeadingItem } from '@faclon-labs/design-sdk/Modal';
+import { Switch } from '@faclon-labs/design-sdk/Switch';
+import { Checkbox } from '@faclon-labs/design-sdk/Checkbox';
+import { Divider } from '@faclon-labs/design-sdk/Divider';
+import { Badge } from '@faclon-labs/design-sdk/Badge';
+import { ListCard, ListCardLeadingItem, ListCardTrailingItem } from '@faclon-labs/design-sdk/ListCard';
+import { ComparisonToggle } from '@faclon-labs/design-sdk/ComparisonToggle';
+import { TimeTabConfiguration } from '@faclon-labs/design-sdk/TimeTabConfiguration';
+import { ProductAccordionItem } from '@faclon-labs/design-sdk/ProductAccordion';
+import { Tooltip } from '@faclon-labs/design-sdk/Tooltip';
 import {
   LineChartEnvelope,
   LineChartUIConfig,
@@ -51,15 +47,14 @@ import {
   LineChartPlotBand,
   LineChartSPC,
   LineChartAnomaly,
-  PlotLineType,
-  PlotLineValueType,
   PlotLineStyle,
-  PlotLinePeriodicityEntry,
+  PlotLinePeriodicityType,
   SPCProcessType,
   SPCSigmaLevel,
   AnomalyOperator,
   AnomalyLabelMode,
   TimeTabUIConfig,
+  HostTimeConfig,
   GTPGlobalTimepicker,
   GTPChart,
   DataTableConfig,
@@ -80,129 +75,160 @@ interface LineChartConfigurationProps {
   config?: LineChartEnvelope;
   authentication?: string;
   onChange: (config: LineChartEnvelope) => void;
-  // Angular runtime injection — all-or-none; dev harness falls back to useUNSTree hook
-  unsTree?: UNSTree;
-  isLoadingTree?: boolean;
-  onLoadWorkspaces?: () => void;
-  resolveUNSValue?: (rawValue: string) => string;
+  // Angular runtime injection — all-or-none; dev harness falls back to
+  // useUNSTreePicker hook. The lazy UNSTreePicker source (workspaces + async
+  // loaders) — host injects all; dev harness omits and the hook supplies them.
+  unsWorkspaces?: UNSWorkspace[];
+  isLoadingWorkspaces?: boolean;
+  loadUnsChildren?: (wsId: string, parentId?: string) => Promise<UNSNode[]>;
+  searchUnsNodes?: (wsId: string, query: string, limit?: number) => Promise<UNSNode[]>;
   // Angular runtime injection — list of global timepickers for the "Link Time With" dropdown.
   globalTimepickers?: GTPGlobalTimepicker[];
+  // Angular injects this to navigate back to the widget panel.
+  onBack?: () => void;
 }
 
 const VARIABLE_REGEX = /^\{\{(.+)\}\}$/;
 
-// Walk uiConfig and emit BindingEntry for every {{topic}} string found.
-// seriesKeys: explicit dot-paths that get type:'series' — all others are scalar.
+// Build the dynamicBindingPathList from the explicit set of bindable fields
+// (series[].unsPath and axes[].unsPath). Every binding gets type:'series' since
+// all our data sources are time-series UNS topics. We do NOT walk the entire
+// uiConfig because other string fields (e.g. plotLines[].dynamicTopic,
+// dataTable.columns[].topic) would emit bindings without a `type` field, which
+// crashes the host DataLayer when it calls `binding.type.toLowerCase()`.
 function buildDynamicBindingPathList(
-  uiConfig: unknown,
-  seriesKeys: string[] = [],
-): Array<{ key: string; topic: string; type?: 'series' }> {
-  const seriesKeySet = new Set(seriesKeys);
-  const paths: Array<{ key: string; topic: string; type?: 'series' }> = [];
+  uiConfig: LineChartUIConfig,
+): Array<{ key: string; topic: string; type: 'series' }> {
+  const paths: Array<{ key: string; topic: string; type: 'series' }> = [];
 
-  function walk(obj: unknown, currentPath: string): void {
-    if (obj === null || obj === undefined) return;
-    if (typeof obj === 'string') {
-      const match = VARIABLE_REGEX.exec(obj.trim());
+  uiConfig.charts.forEach((chart, ci) => {
+    chart.series.forEach((s, si) => {
+      const raw = (s.unsPath || '').trim();
+      const match = VARIABLE_REGEX.exec(raw);
       if (match) {
-        const entry: { key: string; topic: string; type?: 'series' } = {
-          key: currentPath,
-          topic: match[1],
-        };
-        if (seriesKeySet.has(currentPath)) entry.type = 'series';
-        paths.push(entry);
+        paths.push({ key: `charts[${ci}].series[${si}].unsPath`, topic: match[1], type: 'series' });
       }
-      return;
-    }
-    if (Array.isArray(obj)) {
-      obj.forEach((item, index) => walk(item, `${currentPath}[${index}]`));
-      return;
-    }
-    if (typeof obj === 'object') {
-      Object.entries(obj as Record<string, unknown>).forEach(([key, val]) => {
-        walk(val, currentPath ? `${currentPath}.${key}` : key);
-      });
-    }
-  }
+    });
+    chart.axes.forEach((a, ai) => {
+      const raw = (a.unsPath || '').trim();
+      const match = VARIABLE_REGEX.exec(raw);
+      if (match) {
+        paths.push({ key: `charts[${ci}].axes[${ai}].unsPath`, topic: match[1], type: 'series' });
+      }
+    });
+    chart.plotLines.forEach((p, pi) => {
+      const raw = (p.value || '').trim();
+      const match = VARIABLE_REGEX.exec(raw);
+      if (match) {
+        paths.push({ key: `charts[${ci}].plotLines[${pi}].value`, topic: match[1], type: 'series' });
+      }
+    });
+    chart.anomalies.forEach((anom, ai) => {
+      if (anom.labelMode === 'NewSource') {
+        const raw = (anom.newSourceTopic || '').trim();
+        const match = VARIABLE_REGEX.exec(raw);
+        if (match) {
+          paths.push({ key: `charts[${ci}].anomalies[${ai}].newSourceTopic`, topic: match[1], type: 'series' });
+        }
+      }
+    });
 
-  walk(uiConfig, '');
+    // AddNew data table columns have their own UNS topic — not linked to any
+    // chart series — so we register them separately. The widget reads the
+    // resolved payload via the same key and shows it only in the data table.
+    chart.dataTable.columns.forEach((col, colIdx) => {
+      if (col.sourceMode === 'AddNew') {
+        const raw = (col.topic || '').trim();
+        const match = VARIABLE_REGEX.exec(raw);
+        if (match) {
+          paths.push({
+            key: `charts[${ci}].dataTable.columns[${colIdx}].topic`,
+            topic: match[1],
+            type: 'series',
+          });
+        }
+      }
+    });
+  });
+
   return paths;
 }
 
-// Sensible default for a fresh envelope's timeConfig.
-const DEFAULT_TIME_CONFIG: TimeTabUIConfig = {
+// Default timeConfig persisted in the envelope when the user hasn't opened
+// the Time tab. Iosense's host gates the widget on `envelope.timeConfig`
+// AND uses `defaultDurationId` to look up the matching preset in
+// `allDurations` to derive the window. We must ship the FULL set of
+// built-in presets so when the user selects any of them in the Time tab
+// (today / yesterday / last7d / current_week / …), the chosen id is
+// present in allDurations and iosense's engine can compute time.
+// Mirrors the SDK TimeTabConfiguration's own built-in preset roster.
+const FALLBACK_TIME_CONFIG: TimeTabUIConfig = {
   timezone: 'Asia/Kolkata',
   timeType: 'local',
-  defaultDurationId: 'last24h',
-  allDurations: [
-    {
-      id: 'today',
-      label: 'Today',
-      calendarType: 'today',
-      isBuiltIn: true,
-      periodicities: ['minute', 'hourly', 'daily'],
-    },
-    {
-      id: 'yesterday',
-      label: 'Yesterday',
-      calendarType: 'yesterday',
-      isBuiltIn: true,
-      periodicities: ['minute', 'hourly', 'daily'],
-    },
-    {
-      id: 'last24h',
-      label: 'Last 24 Hours',
-      x: 24,
-      xPeriod: 'hour',
-      isBuiltIn: true,
-      periodicities: ['minute', 'hourly'],
-    },
-    {
-      id: 'last7d',
-      label: 'Last 7 Days',
-      x: 7,
-      xPeriod: 'day',
-      isBuiltIn: true,
-      periodicities: ['hourly', 'daily'],
-    },
-    {
-      id: 'last30d',
-      label: 'Last 30 Days',
-      x: 30,
-      xPeriod: 'day',
-      isBuiltIn: true,
-      periodicities: ['daily', 'weekly'],
-    },
-    {
-      id: 'current_week',
-      label: 'Current Week',
-      calendarType: 'current_week',
-      isBuiltIn: true,
-      periodicities: ['hourly', 'daily'],
-    },
-    {
-      id: 'previous_week',
-      label: 'Previous Week',
-      calendarType: 'previous_week',
-      isBuiltIn: true,
-      periodicities: ['hourly', 'daily'],
-    },
-    {
-      id: 'current_month',
-      label: 'Current Month',
-      calendarType: 'current_month',
-      isBuiltIn: true,
-      periodicities: ['daily', 'weekly'],
-    },
-    {
-      id: 'previous_month',
-      label: 'Previous Month',
-      calendarType: 'previous_month',
-      isBuiltIn: true,
-      periodicities: ['daily', 'weekly'],
-    },
-  ],
+  defaultDurationId: 'today',
   defaultPeriodicity: 'hourly',
+  allDurations:[
+  {
+    id: 'today', label: 'Today', calendarType: 'today', isBuiltIn: true,
+    navigation: 'Previous', x: 0, xPeriod: 'day',   xEvent: 'Start',
+                             y: 0, yPeriod: 'day',   yEvent: 'End',
+    periodicities: ['Hourly'],
+  },
+  {
+    id: 'yesterday', label: 'Yesterday', calendarType: 'yesterday', isBuiltIn: true,
+    navigation: 'Previous', x: 1, xPeriod: 'day',   xEvent: 'Start',
+                             y: 1, yPeriod: 'day',   yEvent: 'End',
+    periodicities: ['Hourly'],
+  },
+  {
+    id: 'current_week', label: 'Current Week', calendarType: 'current_week', isBuiltIn: true,
+    navigation: 'Previous', x: 0, xPeriod: 'week',  xEvent: 'Start',
+                             y: 0, yPeriod: 'week',  yEvent: 'Now',
+    periodicities: ['Hourly', 'Daily'],
+  },
+  {
+    id: 'previous_7_days', label: 'Previous 7 Days', isBuiltIn: true,
+    navigation: 'Previous', x: 7, xPeriod: 'day',   xEvent: 'Start',
+                             y: 0, yPeriod: 'day',   yEvent: 'Now',
+    periodicities: ['Hourly', 'Daily'],
+  },
+  {
+    id: 'current_month', label: 'Current Month', calendarType: 'current_month', isBuiltIn: true,
+    navigation: 'Previous', x: 0, xPeriod: 'month', xEvent: 'Start',
+                             y: 0, yPeriod: 'month', yEvent: 'Now',
+    periodicities: ['Hourly', 'Daily', 'Weekly'],
+  },
+  {
+    id: 'previous_month', label: 'Previous Month', calendarType: 'previous_month', isBuiltIn: true,
+    navigation: 'Previous', x: 1, xPeriod: 'month', xEvent: 'Start',
+                             y: 1, yPeriod: 'month', yEvent: 'End',
+    periodicities: ['Hourly', 'Daily', 'Weekly'],
+  },
+  {
+    id: 'previous_3_month', label: 'Previous 3 Month', isBuiltIn: true,
+    navigation: 'Previous', x: 3, xPeriod: 'month', xEvent: 'Start',
+                             y: 0, yPeriod: 'month', yEvent: 'Now',
+    periodicities: ['Daily', 'Weekly', 'Monthly', 'Quarterly'],
+  },
+  {
+    id: 'previous_12_month', label: 'Previous 12 Month', isBuiltIn: true,
+    navigation: 'Previous', x: 12, xPeriod: 'month', xEvent: 'Start',
+                             y: 0,  yPeriod: 'month', yEvent: 'Now',
+    periodicities: ['Daily', 'Weekly', 'Monthly', 'Quarterly'],
+  },
+  {
+    id: 'current_year', label: 'Current Year', isBuiltIn: true,
+    navigation: 'Previous', x: 0, xPeriod: 'year', xEvent: 'Start',
+                             y: 0, yPeriod: 'year', yEvent: 'Now',
+    periodicities: ['Daily', 'Weekly', 'Monthly', 'Quarterly'],
+  },
+  {
+    id: 'previous_year', label: 'Previous Year', isBuiltIn: true,
+    navigation: 'Previous', x: 1, xPeriod: 'year', xEvent: 'Start',
+                             y: 1, yPeriod: 'year', yEvent: 'End',
+    periodicities: ['Daily', 'Weekly', 'Monthly', 'Quarterly'],
+  },
+],
 };
 
 const DEFAULT_DATA_TABLE: DataTableConfig = {
@@ -233,7 +259,7 @@ const FONT_WEIGHTS: StylingFontWeight[] = ['Regular', 'Medium', 'Semi-Bold', 'Bo
 const DEFAULT_STYLING: LineChartStyling = {
   size: { preset: 'Medium', customWidth: 880, customHeight: 400, lockAspectRatio: false },
   card: {
-    wrapInCard: false,
+    wrapInCard: true,
     backgroundColor: '#FFFFFF',
     borderColor: '#EEEEEE',
     borderWidth: 1,
@@ -261,12 +287,27 @@ function normalizeStyling(raw: unknown): LineChartStyling {
     const obj = raw as Record<string, unknown>;
     if ('size' in obj && 'advancedEnabled' in obj) {
       const styling = obj as unknown as LineChartStyling;
+      const dcd = styling.defaultChartDisplay;
       // Wrap Into Card defaults to off — only on when explicitly set true.
       return {
         ...styling,
         card: {
           ...styling.card,
           wrapInCard: styling.card?.wrapInCard === true,
+        },
+        // Merge defaults so keys missing from old saved configs (before
+        // hideElements was introduced) always initialize to false (= visible).
+        hideElements: {
+          ...DEFAULT_STYLING.hideElements,
+          ...(styling.hideElements ?? {}),
+        },
+        // Always produce explicit booleans so switch renders never rely on ?? fallbacks.
+        defaultChartDisplay: {
+          legends: dcd?.legends ?? true,
+          dataLabel: dcd?.dataLabel ?? false,
+          clipping: dcd?.clipping ?? false,
+          zoom: dcd?.zoom ?? true,
+          scroll: dcd?.scroll ?? false,
         },
       };
     }
@@ -275,7 +316,7 @@ function normalizeStyling(raw: unknown): LineChartStyling {
       ...DEFAULT_STYLING,
       card: {
         ...DEFAULT_STYLING.card,
-        wrapInCard: typeof card.wrapInCard === 'boolean' ? card.wrapInCard : false,
+        wrapInCard: typeof card.wrapInCard === 'boolean' ? card.wrapInCard : true,
         backgroundColor:
           typeof card.bg === 'string' && card.bg.trim().length > 0
             ? card.bg
@@ -286,26 +327,174 @@ function normalizeStyling(raw: unknown): LineChartStyling {
   return DEFAULT_STYLING;
 }
 
+// Transform the SDK's TimeTabUIConfig into the HostTimeConfig shape that
+// iosense's Lens query-engine reads. Reverse-engineered from the deployed
+// Column Chart configurator bundle (`iolens-columnchart-widget`) — that
+// widget's onChange wraps the SDK value in this exact shape, which is why
+// its envelope's `timeConfig` is recognized by the host (and produces
+// `startTime`/`endTime`/`timezone`/`shifts` in the resolveAndCompute call).
+// Setting `timeConfig: rawTimeTabConfig` does NOT work — the host needs
+// `type`, `pickerType`, `startTime: null`, `endTime: null`, etc.
+function toHostTimeConfig(
+  t: TimeTabUIConfig,
+  globalTimepickers?: GTPGlobalTimepicker[],
+): HostTimeConfig {
+  const pickerType = (t.linkTimeWith ?? t.timeType ?? 'local') as
+    | 'local'
+    | 'fixed'
+    | 'global';
+  // Under a GTP, shifts/aggregator are INHERITED from the linked Global Time
+  // Picker (the SDK only persists the GTP id under `global.globalTimepickerId`;
+  // the shifts themselves live in the injected `globalTimepickers` prop, NOT in
+  // the config). Look them up from there — exactly like Column / Combined
+  // Bar-Line. The old code fell back to `t.shifts`, i.e. the LOCAL picker's
+  // shifts, so a GTP-linked chart emitted the user's local shifts (and, once
+  // the panel re-seeded, leaked them back into Local) — the reported bug.
+  const globalId =
+    (t.global as { globalTimepickerId?: string; id?: string } | undefined)?.globalTimepickerId ??
+    (t.global as { id?: string } | undefined)?.id ??
+    t.globalTimepickerId;
+  const linkedGtp =
+    pickerType === 'global'
+      ? (globalTimepickers ?? []).find((g) => g.id === globalId)
+      : undefined;
+  const fd = t.fixed?.duration;
+  const fixedDuration =
+    pickerType === 'fixed' && fd
+      ? {
+          id: 'fixed' as const,
+          label: fd.name || 'Fixed',
+          navigation: fd.navigation,
+          x: Number(fd.x) || 0,
+          xPeriod: fd.xPeriod,
+          xEvent: fd.xEvent,
+          y: Number(fd.y) || 0,
+          yPeriod: fd.yPeriod,
+          yEvent: fd.yEvent,
+        }
+      : undefined;
+  const cycleTime = pickerType === 'fixed' ? t.fixed?.cycleTime ?? null : t.cycleTime ?? null;
+  return {
+    // Timezone is stored PER-MODE by the SDK (Local → top-level `timezone`,
+    // Fixed → `fixed.timezone`, Global → the inherited `global.timezone`).
+    // Read it the same per-mode way every other setting below is read —
+    // otherwise a Fixed/Global timezone change is dropped and the stale
+    // top-level default (Asia/Kolkata) is sent in the payload.
+    timezone:
+      pickerType === 'fixed' ? (t.fixed?.timezone ?? t.timezone) :
+      pickerType === 'global' ? ((t.global as { timezone?: string } | undefined)?.timezone ?? t.timezone) :
+      t.timezone,
+    type: pickerType === 'global' ? 'local' : pickerType,
+    pickerType,
+    // Preserve the GTP id so the widget can detect GTP mode even when Lens
+    // pushes a runtime timeConfig update that doesn't include pickerType.
+    ...(pickerType === 'global' && globalId
+      ? { globalTimepickerId: globalId }
+      : {}),
+    cycleTime,
+    startTime: null,
+    endTime: null,
+    fixedDuration,
+    defaultDurationId: t.defaultDurationId,
+    allDurations: t.allDurations ?? [],
+    defaultPeriodicity:
+      pickerType === 'fixed' && fd?.periodicity ? fd.periodicity.toLowerCase() : t.defaultPeriodicity,
+    // The SDK's native "Disable Periodicities" switch writes the top-level flag
+    // in Local mode and a Fixed-scoped one in Fixed mode. Read top-level first,
+    // fall back to the Fixed scope. Mirror into HostTimeConfig so the widget can
+    // hide its periodicity dropdown even when timeTabConfig is unavailable.
+    disablePeriodicities: !!(t.disablePeriodicities ?? t.fixed?.disablePeriodicities),
+    // GTP: read the linked GTP's own shifts (never fall back to `t.shifts` =
+    // Local's). When the GTP isn't resolvable yet, emit none — the renderer
+    // derives shift identities from the resolved data's shift tags, same as the
+    // peer widgets. Fixed → fixed scope; Local → top level.
+    shifts:
+      pickerType === 'fixed' ? (t.fixed?.shifts ?? []) :
+      pickerType === 'global' ? (linkedGtp?.shifts ?? []) :
+      (t.shifts ?? []),
+    shiftAggregator:
+      pickerType === 'fixed' ? ((t.fixed as any)?.shiftAggregator ?? (t as any).shiftAggregator) :
+      pickerType === 'global' ? (linkedGtp?.shiftAggregator ?? (t as any).shiftAggregator) :
+      (t as any).shiftAggregator,
+    comparisonMode:
+      pickerType === 'fixed' ? t.fixed?.comparisonMode :
+      pickerType === 'global' ? t.global?.comparisonMode :
+      t.comparisonMode,
+    deviationPattern:
+      pickerType === 'fixed' ? t.fixed?.deviationPattern :
+      pickerType === 'global' ? t.global?.deviationPattern :
+      t.deviationPattern,
+    sourceDeviationOverrides:
+      pickerType === 'fixed' ? t.fixed?.sourceDeviationOverrides :
+      pickerType === 'global' ? t.global?.sourceDeviationOverrides :
+      t.sourceDeviationOverrides,
+    // Mirror to HostTimeConfig so Lens preserves it across save/restore cycles.
+    // Lens reads timeConfig but may not persist timeTabConfig (a non-standard
+    // field); the widget falls back to this when timeTabConfig is absent.
+    defaultDisplayMode: t.defaultDisplayMode,
+  };
+}
+
 function buildEnvelope(
   existing: LineChartEnvelope | undefined,
   uiConfig: LineChartUIConfig,
   timeTabConfig?: TimeTabUIConfig,
+  globalTimepickers?: GTPGlobalTimepicker[],
 ): LineChartEnvelope {
-  // timeTabConfig = full TimeTabConfiguration UI state (for re-hydration).
-  // timeConfig    = same value; mini-engine reads this to compute the time window.
-  // Both must always be in sync — never emit one without the other.
-  const tc = timeTabConfig ?? existing?.timeTabConfig ?? existing?.timeConfig ?? DEFAULT_TIME_CONFIG;
-  const dynamicBindingPathList = buildDynamicBindingPathList(
-    uiConfig,
-    [
-      ...uiConfig.charts.flatMap((chart, ci) =>
-        chart.series.map((_s, si) => `charts[${ci}].series[${si}].dataSource`),
-      ),
-      ...uiConfig.charts.flatMap((chart, ci) =>
-        chart.axes.map((_a, ai) => `charts[${ci}].axes[${ai}].dataSource`),
-      ),
-    ],
-  );
+  // tc is the raw SDK TimeTabUIConfig used to rebuild both the host-shape
+  // `timeConfig` (via toHostTimeConfig) and the re-hydration `timeTabConfig`.
+  // Legacy envelopes might only have `existing.timeConfig` in the old
+  // TimeTabUIConfig shape (pre-HostTimeConfig refactor); cast at that step
+  // since we know historical data has those fields.
+  const rawTc: TimeTabUIConfig =
+    timeTabConfig ??
+    existing?.timeTabConfig ??
+    (existing?.timeConfig as TimeTabUIConfig | undefined) ??
+    FALLBACK_TIME_CONFIG;
+  // When "Link Time With" is switched away from Global (e.g. back to Local or
+  // Fixed), the SDK's TimeTabConfiguration leaves the previously-selected
+  // `global` scope (and the deprecated `globalTimepickerId` / `timeType:
+  // 'global'` back-compat fields) lingering on the config. If we persist those,
+  // the host keeps the widget subscribed to the GTP — so the chart still reacts
+  // to the Global Timepicker even though the user picked Local. Strip every
+  // GTP-scoped remnant whenever the resolved picker type is not global.
+  const resolvedPickerType = (rawTc.linkTimeWith ?? rawTc.timeType ?? 'local');
+  let tc: TimeTabUIConfig = rawTc;
+  if (resolvedPickerType !== 'global') {
+    const {
+      global: _global,
+      globalTimepickerId: _globalTimepickerId,
+      ...restTc
+    } = rawTc as TimeTabUIConfig & { globalTimepickerId?: string };
+    tc = {
+      ...restTc,
+      // Drop the stale deprecated `timeType: 'global'` marker so no downstream
+      // reader (or fallback in toHostTimeConfig) re-derives global mode.
+      ...(restTc.timeType === 'global' ? { timeType: undefined } : {}),
+    };
+  }
+  // Defensive cleanup: even after the in-memory migration runs, an existing
+  // envelope hitting buildEnvelope might still carry the legacy `dataSource`
+  // field on series/axes (e.g. on the first save after upgrade). The walker
+  // would emit duplicate bindings (one for `…dataSource`, one for `…unsPath`)
+  // pointing at the same topic, doubling API call rate and producing
+  // backend-rejected requests. Strip the legacy field from every series/axis
+  // before walking so the bindings list is canonical.
+  const cleanedUiConfig: LineChartUIConfig = {
+    ...uiConfig,
+    charts: uiConfig.charts.map((c) => ({
+      ...c,
+      series: c.series.map((s) => {
+        const { dataSource: _legacy, ...rest } = s as LineChartSeries & { dataSource?: string };
+        return rest as LineChartSeries;
+      }),
+      axes: c.axes.map((a) => {
+        const { dataSource: _legacy, ...rest } = a as LineChartAxis & { dataSource?: string };
+        return rest as LineChartAxis;
+      }),
+    })),
+  };
+  const dynamicBindingPathList = buildDynamicBindingPathList(cleanedUiConfig);
   // Warn on bindings whose topic isn't a resolved UNS path. Catches the common
   // case where resolveUNSValue cache-missed and stored the workspace-name path
   // verbatim — mini-engine would reject it and the chart would never load.
@@ -318,15 +507,24 @@ function buildEnvelope(
       );
     }
   }
-  return {
+  const env = {
     _id: existing?._id ?? `linechart_${Date.now()}`,
-    type: 'LineChart',
+    type: 'LineChart' as const,
     general: existing?.general ?? { title: '' },
-    timeConfig: tc,
-    timeTabConfig: tc,
-    uiConfig,
+    // timeConfig is the HOST-shape (HostTimeConfig) the Lens engine reads.
+    // timeTabConfig is the raw SDK shape (TimeTabUIConfig) used to
+    // re-hydrate the SDK TimeTabConfiguration component when the user
+    // re-opens the configurator.
+    // Embed realtimeMode into both shapes so save.strategy.ts finds it in
+    // whichever field it reads first — no dependency on widget.instance.config.uiConfig.
+    timeConfig: { ...toHostTimeConfig(tc, globalTimepickers), ...(cleanedUiConfig.realtimeMode ? { realtimeMode: true as const } : {}) },
+    timeTabConfig: cleanedUiConfig.realtimeMode ? ({ ...tc, realtimeMode: true } as typeof tc) : tc,
+    // Persist the legacy-field-stripped uiConfig — never re-introduce
+    // `series[].dataSource` into the saved envelope.
+    uiConfig: cleanedUiConfig,
     dynamicBindingPathList,
   };
+  return env;
 }
 
 const DEFAULT_DEFAULT_AXIS: LineChartDefaultAxis = {
@@ -351,6 +549,37 @@ function migrateSpc(raw: unknown): LineChartSPC {
 function migrateChartSpcs(chart: ChartInstance): ChartInstance {
   if (!Array.isArray(chart.spcs)) return chart;
   return { ...chart, spcs: chart.spcs.map((s) => migrateSpc(s)) };
+}
+
+// Migrate legacy envelopes that stored the bindable UNS path under the field
+// name `dataSource` into the new field name `unsPath`. Iosense's host engine
+// extracts bindings from keys whose path ends in `.unsPath` (the convention
+// the deployed Column Chart widget uses), so envelopes saved before the
+// rename would otherwise have their bindings ignored entirely.
+// CRITICAL: we must STRIP the legacy `dataSource` field, not just add
+// `unsPath` alongside — otherwise `buildDynamicBindingPathList` walks the
+// uiConfig and finds the `{{topic}}` literal under BOTH fields, emitting
+// duplicate bindings per series (one with key `…dataSource`, one with
+// `…unsPath`). The backend gets the same topic twice with different keys,
+// the host's resolveAndCompute call rate doubles, and at least one of the
+// two keys is incorrect for the schema and the request fails.
+function migrateChartUnsPath(chart: ChartInstance): ChartInstance {
+  type LegacySeries = LineChartSeries & { dataSource?: string };
+  type LegacyAxis = LineChartAxis & { dataSource?: string };
+  const series = (chart.series ?? []).map((s) => {
+    const legacy = s as LegacySeries;
+    if (legacy.unsPath) return s;
+    // Strip the legacy field, replace with the renamed one.
+    const { dataSource, ...rest } = legacy;
+    return { ...rest, unsPath: dataSource ?? '' } as LineChartSeries;
+  });
+  const axes = (chart.axes ?? []).map((a) => {
+    const legacy = a as LegacyAxis;
+    if (legacy.unsPath) return a;
+    const { dataSource, ...rest } = legacy;
+    return { ...rest, unsPath: dataSource ?? '' } as LineChartAxis;
+  });
+  return { ...chart, series, axes };
 }
 
 // Normalize a single DataTableConfig (fills defaults + migrates the legacy
@@ -383,11 +612,18 @@ function normalizeLineChartUIConfig(raw: unknown): LineChartUIConfig {
   const advanceSettings: boolean =
     typeof obj.advanceSettings === 'boolean' ? obj.advanceSettings : false;
 
+  // Widget-level realtimeMode: read from envelope (new), or migrate from any
+  // per-chart chartType = 'Realtime' (old envelopes stored it per chart).
+  const migrateRealtimeFromCharts = (rawCharts: unknown[]): boolean =>
+    rawCharts.some((c) => c && typeof c === 'object' && (c as any).chartType === 'Realtime');
+
   // Already in new shape — pass through (migrate inner SPC shape + per-chart
   // data table; charts without their own table inherit the legacy widget one).
   if (Array.isArray(obj.charts)) {
+    const realtimeMode: boolean =
+      obj.realtimeMode === true ? true : migrateRealtimeFromCharts(obj.charts);
     const charts = (obj.charts as ChartInstance[]).map((c) => ({
-      ...migrateChartSpcs(c),
+      ...migrateChartUnsPath(migrateChartSpcs(c)),
       dataTable: normalizeDataTable(
         (c as { dataTable?: Partial<DataTableConfig> }).dataTable ?? dataTable,
       ),
@@ -398,7 +634,7 @@ function normalizeLineChartUIConfig(raw: unknown): LineChartUIConfig {
         : charts.length > 0
           ? charts[0]._id
           : null;
-    return { charts, activeChartId, dataTable, style, deviationIndicator, advanceSettings };
+    return { charts, activeChartId, realtimeMode, dataTable, style, deviationIndicator, advanceSettings };
   }
 
   // Old single-chart shape — wrap into one ChartInstance.
@@ -435,16 +671,11 @@ function normalizeLineChartUIConfig(raw: unknown): LineChartUIConfig {
 }
 
 // Factory for a fresh ChartInstance.
-function newChart(
-  title: string,
-  description: string,
-  chartType: 'Aggregated' | 'Realtime' = 'Aggregated',
-): ChartInstance {
+function newChart(title: string, description: string): ChartInstance {
   return {
     _id: `chart_${Date.now()}`,
     title: title.trim(),
     description: description.trim() || undefined,
-    chartType,
     series: [],
     defaultAxis: { ...DEFAULT_DEFAULT_AXIS },
     axes: [],
@@ -541,23 +772,34 @@ export function LineChartConfiguration({
   config,
   authentication,
   onChange,
-  unsTree: injectedUnsTree,
-  isLoadingTree: injectedIsLoadingTree,
-  onLoadWorkspaces,
-  resolveUNSValue: injectedResolveUNSValue,
+  unsWorkspaces: injectedWorkspaces,
+  isLoadingWorkspaces: injectedIsLoadingWorkspaces,
+  loadUnsChildren: injectedLoadChildren,
+  searchUnsNodes: injectedSearchNodes,
   globalTimepickers,
+  onBack,
 }: LineChartConfigurationProps) {
+  // Host injects workspaces + loadChildren together; if it does, use those.
+  // Otherwise fall back to the dev-harness hook (called unconditionally per the
+  // Rules of Hooks; it no-ops in the host where it's passed `undefined`).
   const hasInjectedUNS =
-    injectedUnsTree !== undefined &&
-    onLoadWorkspaces !== undefined &&
-    injectedResolveUNSValue !== undefined;
-  const hookResult = useUNSTree(hasInjectedUNS ? undefined : authentication);
-  const unsTree         = hasInjectedUNS ? injectedUnsTree!              : hookResult.unsTree;
-  const isLoadingTree   = hasInjectedUNS ? (injectedIsLoadingTree ?? false) : hookResult.isLoadingTree;
-  const loadWorkspaces  = hasInjectedUNS ? onLoadWorkspaces!             : hookResult.loadWorkspaces;
-  const resolveUNSValue = hasInjectedUNS ? injectedResolveUNSValue!      : hookResult.resolveUNSValue;
+    injectedWorkspaces !== undefined && injectedLoadChildren !== undefined;
+  const hookResult = useUNSTreePicker(hasInjectedUNS ? undefined : authentication);
+  const unsWorkspaces       = hasInjectedUNS ? injectedWorkspaces!                    : hookResult.workspaces;
+  const isLoadingWorkspaces = hasInjectedUNS ? (injectedIsLoadingWorkspaces ?? false) : hookResult.isLoadingWorkspaces;
+  const loadUnsChildren     = hasInjectedUNS ? injectedLoadChildren!                  : hookResult.loadChildren;
+  const searchUnsNodes      = hasInjectedUNS ? (injectedSearchNodes ?? hookResult.searchNodes) : hookResult.searchNodes;
   // Top-level tab state
   const [topTab, setTopTab] = useState<TopTab>('Data');
+  // Switching to the Time tab mounts a fresh TimeTabConfiguration, which fires
+  // its init onChange synchronously via a child useEffect. Reset the settled
+  // guard HERE (synchronously, before the re-render) so that child callback is
+  // blocked. The topTab useEffect below reschedules the re-enable after the SDK's
+  // init callback has fired and been discarded.
+  function handleTopTabChange(tab: TopTab) {
+    if (tab === 'Time') timeConfigSettledRef.current = false;
+    setTopTab(tab);
+  }
 
   // Which sections are expanded in Column 1 (Chart Settings is always inline,
   // not part of this set).
@@ -601,6 +843,12 @@ export function LineChartConfiguration({
 
   // Full styling config (widget-level).
   const [styling, setStyling] = useState<LineChartStyling>(initialUiConfig.style);
+  // Mirror the latest committed styling in a ref so handleStylingChange can
+  // compute the next value synchronously (React does NOT guarantee the
+  // setStyling updater runs before the following emit — relying on that left a
+  // stale value in the emitted envelope, so the preview lagged one toggle).
+  const stylingRef = useRef<LineChartStyling>(initialUiConfig.style);
+  stylingRef.current = styling;
 
 
   // Deviation indicator preference — only meaningful when comparison mode is on.
@@ -613,11 +861,16 @@ export function LineChartConfiguration({
   // configured setting went).
   const initialAdvanceOpen = useMemo(() => {
     if (typeof initialUiConfig.advanceSettings === 'boolean') return initialUiConfig.advanceSettings;
-    const tc = config?.timeTabConfig ?? config?.timeConfig;
+    const tc = (config?.timeTabConfig ?? (config?.timeConfig as TimeTabUIConfig | undefined));
     return !!(tc?.disableTimeSelection || (tc?.futureDaysAllowed && tc.futureDaysAllowed !== ''));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   const [advanceSettings, setAdvanceSettings] = useState<boolean>(initialAdvanceOpen);
+
+  // Widget-level realtime toggle.
+  const [realtimeMode, setRealtimeMode] = useState<boolean>(
+    initialUiConfig.realtimeMode ?? false,
+  );
 
   // Ref to the Time tab wrapper; the portal uses it to inject the deviation
   // indicator selector directly after the SDK's Comparison Mode row.
@@ -660,11 +913,62 @@ export function LineChartConfiguration({
     };
   }, [topTab]);
 
+  // The SDK's TimeTabConfiguration renders its "Add Duration" / "Add Shift"
+  // forms as an in-place panel (`.fds-ttc__panel-overlay`) that's
+  // `position: absolute; inset: 0` inside the (narrow) configurator column.
+  // In the host (Lens) canvas, the configurator column is too narrow to fit
+  // the form, so it overflows into the canvas area and dashboard widgets
+  // stack above it. Float it like the Data tab side modal instead:
+  // publish the configurator's right-edge as a CSS variable so the static
+  // CSS rule for `.fds-ttc__panel-overlay` can `position: fixed` it just
+  // beside us with a huge z-index. Keep updated on resize.
+  useEffect(() => {
+    function publishConfigRightEdge() {
+      const panelEl =
+        (rootRef.current?.closest('.app__config') as HTMLElement | null) ??
+        rootRef.current;
+      if (!panelEl) return;
+      const r = panelEl.getBoundingClientRect();
+      document.documentElement.style.setProperty('--lc-config-right-edge', `${r.right}px`);
+    }
+    publishConfigRightEdge();
+    window.addEventListener('resize', publishConfigRightEdge);
+    const ro = new ResizeObserver(publishConfigRightEdge);
+    if (rootRef.current) ro.observe(rootRef.current);
+    return () => {
+      window.removeEventListener('resize', publishConfigRightEdge);
+      ro.disconnect();
+    };
+  }, []);
+
   // Full TimeTabConfiguration state — prefer timeTabConfig for re-hydration so the
   // component restores its exact UI state; fall back to timeConfig for older envelopes.
-  const [timeTabConfig, setTimeTabConfig] = useState<TimeTabUIConfig>(
-    config?.timeTabConfig ?? config?.timeConfig ?? DEFAULT_TIME_CONFIG,
+  const [timeTabConfig, setTimeTabConfig] = useState<TimeTabUIConfig | undefined>(
+    config?.timeTabConfig ?? (config?.timeConfig as TimeTabUIConfig | undefined),
   );
+  // Ref tracks the latest committed timeTabConfig without triggering a re-render.
+  // Used in emit() so other emit calls (e.g. chart changes) don't lose the latest
+  // time config. NOT fed back into TimeTabConfiguration's `value` prop — doing so
+  // would reset the SDK's internal panel state and close the "Add Shift" form mid-edit.
+  const timeTabConfigRef = useRef<TimeTabUIConfig | undefined>(
+    config?.timeTabConfig ?? (config?.timeConfig as TimeTabUIConfig | undefined),
+  );
+  // The SDK's TimeTabConfiguration fires onChange on initial mount (an initialization
+  // The SDK's TimeTabConfiguration fires onChange on mount (init normalization) and
+  // on every re-mount (when the user switches back to the Time tab). We must block
+  // that init callback each time to prevent it from re-emitting the stored config
+  // back as a "change" — which triggers a new resolve and blanks the chart.
+  //
+  // Strategy: setting timeConfigSettledRef.current = false SYNCHRONOUSLY in the
+  // tab-change handler (before React re-renders and mounts TimeTabConfiguration)
+  // ensures the ref is false when the SDK's child mount useEffect fires. The
+  // setTimeout below then re-enables it after the SDK's init callback has passed.
+  const timeConfigSettledRef = useRef(false);
+  useEffect(() => {
+    if (topTab !== 'Time') return;
+    const t = setTimeout(() => { timeConfigSettledRef.current = true; }, 0);
+    return () => clearTimeout(t);
+  }, [topTab]);
 
   // Pending delete (modal) — keyed by section so a single modal can serve all.
   const [pendingDelete, setPendingDelete] = useState<
@@ -683,15 +987,18 @@ export function LineChartConfiguration({
       const next = normalizeLineChartUIConfig(config.uiConfig);
       setCharts(next.charts);
       setActiveChartId(next.activeChartId);
+      setRealtimeMode(next.realtimeMode ?? false);
       setStyling(next.style);
       setDeviationIndicator(next.deviationIndicator ?? 'standard');
-      const tc = config.timeTabConfig ?? config.timeConfig;
+      const tc =
+        config.timeTabConfig ?? (config.timeConfig as TimeTabUIConfig | undefined);
       const shouldAutoOpen =
         typeof next.advanceSettings === 'boolean'
           ? next.advanceSettings
           : !!(tc?.disableTimeSelection || (tc?.futureDaysAllowed && tc.futureDaysAllowed !== ''));
       setAdvanceSettings(shouldAutoOpen);
-      setTimeTabConfig(config.timeTabConfig ?? config.timeConfig ?? DEFAULT_TIME_CONFIG);
+      setTimeTabConfig(tc);
+      timeTabConfigRef.current = tc;
       setChartEditMode(false);
       setNewChartDraft(false);
     }
@@ -714,34 +1021,46 @@ export function LineChartConfiguration({
   // Derived: hasChart + inEditMode — drive section disabling.
   const hasChart = charts.length > 0;
   const inEditMode = chartEditMode || newChartDraft;
-  // Active chart's type drives periodicity availability (Time tab + plotlines).
-  const activeChartIsRealtime = (activeChart?.chartType ?? 'Aggregated') === 'Realtime';
+  // Widget-level realtime mode drives periodicity availability (Time tab + plotlines).
+  const activeChartIsRealtime = realtimeMode;
 
-  // The SDK TimeTabConfiguration has no prop to hide periodicity (its
-  // `disablePeriodicities` is type-only / a runtime no-op). When the active chart
-  // is Realtime, DOM-patch the Time tab + its Add/Edit Duration modal to hide all
-  // periodicity controls (the inputs carry stable `name`s; duration cards render a
-  // "Periodicity: …" subtitle). Shifts are left intact. Scoped + cheap; re-applies
-  // via MutationObserver since the modal is portal-rendered and the list re-renders.
+  // DOM-patch the Time tab to hide periodicity controls when the active chart is
+  // Realtime (live streaming has no periodicity concept). The "Disable
+  // Periodicities" toggle is intentionally NOT hidden here — it stays fully
+  // visible/editable in the configurator; its only effect is to hide the
+  // periodicity dropdown in the widget renderer at runtime.
+  // Strategy: keep ONE always-on MutationObserver while on the Time tab.  Every
+  // DOM mutation (including the SDK's own re-render and the portal-append when the
+  // Add Duration modal opens) fires patch().
   useEffect(() => {
-    if (topTab !== 'Time' || !activeChartIsRealtime) return;
-    const hide = (el: Element | null) => {
-      if (el instanceof HTMLElement) el.style.display = 'none';
-    };
+    if (topTab !== 'Time') return;
     const patch = () => {
+      const shouldHide = activeChartIsRealtime;
+      // `forceShow` FORCE-shows (not just clears inline) so this config's
+      // periodicity survives a leftover hide from a previously-open config — e.g.
+      // a Pie chart (no periodicity concept) that hid the periodicity field and
+      // didn't clean it up on unmount. An inline `!important` beats any leftover
+      // stylesheet rule, so a normal (non-realtime) Line/other chart always shows
+      // its periodicity again. Non-force elements just clear their inline display.
+      const setVis = (el: HTMLElement | null, forceShow = false) => {
+        if (!el) return;
+        if (shouldHide) el.style.setProperty('display', 'none', 'important');
+        else if (forceShow) el.style.setProperty('display', 'block', 'important');
+        else el.style.removeProperty('display');
+      };
       // Periodicity SelectInputs (Add/Edit Duration modal + fixed-time config).
       document
         .querySelectorAll('input[name="periodicity"], input[name="fixed-duration-periodicity"]')
-        .forEach((inp) => hide(inp.closest('.fds-ttc__required-select')));
+        .forEach((inp) => setVis(inp.closest<HTMLElement>('.fds-ttc__required-select'), true));
       // Duration-card "Periodicity: …" subtitles in the Time tab list.
       const root = timeTabRef.current;
       if (root) {
-        root.querySelectorAll('*').forEach((el) => {
+        root.querySelectorAll<HTMLElement>('*').forEach((el) => {
           if (
             el.children.length === 0 &&
             /^Periodicity:/.test(el.textContent?.trim() ?? '')
           ) {
-            hide(el);
+            setVis(el);
           }
         });
       }
@@ -749,7 +1068,18 @@ export function LineChartConfiguration({
     patch();
     const mo = new MutationObserver(patch);
     mo.observe(document.body, { childList: true, subtree: true });
-    return () => mo.disconnect();
+    return () => {
+      mo.disconnect();
+      // CRITICAL: the patch sets inline `display` (an `!important` force-show or
+      // a realtime hide) via a GLOBAL query, and inline styles PERSIST on the
+      // DOM node after this config unmounts. Without clearing them, a force-shown
+      // periodicity field would stay force-shown for the NEXT widget's config —
+      // e.g. showing periodicity in a Pie chart that has none. Clear every inline
+      // display this config may have set so the force-show never outlives it.
+      document
+        .querySelectorAll('input[name="periodicity"], input[name="fixed-duration-periodicity"]')
+        .forEach((inp) => inp.closest<HTMLElement>('.fds-ttc__required-select')?.style.removeProperty('display'));
+    };
   }, [topTab, activeChartIsRealtime]);
 
   // Single-open accordion behaviour for the Time tab (mirrors the Data tab).
@@ -791,6 +1121,63 @@ export function LineChartConfiguration({
     return () => obs.disconnect();
   }, [topTab]);
 
+  // Keep the TimeTabConfiguration / configurator side modals (Add/Edit Duration,
+  // Add Shift, Add Data Source, …) open when interacting with a pop-out surface
+  // inside them. The Start/End Hour+Minute selects (a portaled `DropdownMenu`,
+  // `.fds-dropdown-menu`), the Periodicity / generic `SelectInput` dropdowns
+  // (`.fds-select-input__popover`), the shift-colour `ColorInput`
+  // (`.fds-color-input__popover`) and the UNS pickers
+  // (`.fds-uns-tree-picker__popover`) all render their popover through a portal
+  // OUTSIDE the modal's DOM. Clicking an option/hour/swatch therefore reads as
+  // "outside the modal" and dismisses it.
+  //
+  // Fix (ported verbatim from the working ColumnChart / Combined widget): ONE
+  // bubble-phase (NOT capture) `document` listener that inspects
+  // `composedPath()` — the event's real ancestor chain, accurate regardless of
+  // portals — and, when any ancestor matches a popover selector, calls BOTH
+  // `stopPropagation()` AND `preventDefault()`:
+  //   • `stopPropagation()` pre-empts the SDK's own outside-click check (also a
+  //     bubble-phase `document` mousedown listener) — same-node same-phase
+  //     listeners fire in REGISTRATION ORDER, and this effect mounts with the
+  //     whole configurator, before any modal can open, so it always wins.
+  //   • `preventDefault()` is the KEY the previous stopPropagation-only guard
+  //     missed. The Add-Shift hour/minute dropdown does NOT dismiss via a
+  //     mousedown outside-click listener — it dismisses via a FOCUS TRAP
+  //     (blur/focusout). A mousedown's native default action moves
+  //     `document.activeElement` to the clicked option (in a portal outside the
+  //     panel), so focus "escapes" the panel and the trap closes it before
+  //     `click` (the selection) even fires. Stopping propagation can't stop a
+  //     native focus shift; `preventDefault()` on mousedown suppresses it so the
+  //     field stays focused. `click` still fires afterward, so selection works.
+  // Bubble phase is deliberate: the event has already reached its real target
+  // (the option / swatch) before it bubbles to `document`, so nothing in the
+  // popover loses its own interaction. Remove once the SDK ships a fix.
+  useEffect(() => {
+    const SELECTORS = ['.fds-select-input__popover', '.fds-color-input__popover', '.fds-uns-tree-picker__popover', '.fds-dropdown-menu'];
+    const EVENTS: Array<keyof DocumentEventMap> = ['pointerdown', 'mousedown'];
+    const guard = (e: Event) => {
+      const path = (e as { composedPath?: () => EventTarget[] }).composedPath?.() ?? [];
+      const matched = path.find(
+        (n): n is Element => n instanceof Element && SELECTORS.some((sel) => n.matches(sel)),
+      );
+      if (matched) {
+        // MUST be stopImmediatePropagation, not stopPropagation. The SDK's
+        // TimeTabConfiguration closes the Add/Edit Duration panel from its OWN
+        // `document` mousedown listener (keeps open only if the click is inside
+        // `.fds-ttc__panel-modal`/`.fds-list-card`; its dropdowns portal OUTSIDE
+        // the panel, so an option click reads as "outside"). Both listeners are
+        // on `document` — stopPropagation does NOT stop a same-node listener, so
+        // the panel still closed. stopImmediatePropagation stops later same-node
+        // listeners; ours registers on config mount (before the panel opens), so
+        // it wins and the panel stays open through the selection.
+        e.stopImmediatePropagation();
+        if (e.cancelable) e.preventDefault();
+      }
+    };
+    EVENTS.forEach((ev) => document.addEventListener(ev, guard));
+    return () => EVENTS.forEach((ev) => document.removeEventListener(ev, guard));
+  }, []);
+
   // Derived: GTPChart[] view of local charts — passed to TimeTabConfiguration's
   // `charts` prop (SDK 0.6.5+) so the SDK can render the per-source deviation
   // override section natively when Comparison Mode + Advance Settings are on.
@@ -808,6 +1195,7 @@ export function LineChartConfiguration({
     overrides?: Partial<{
       charts: ChartInstance[];
       activeChartId: string | null;
+      realtimeMode: boolean;
       styling: LineChartStyling;
       dataTable: DataTableConfig;
       timeTabConfig: TimeTabUIConfig;
@@ -824,13 +1212,14 @@ export function LineChartConfiguration({
     const uiConfig: LineChartUIConfig = {
       charts: resolvedCharts,
       activeChartId: resolvedActiveId,
+      realtimeMode: overrides?.realtimeMode ?? realtimeMode,
       dataTable: overrides?.dataTable ?? dataTable,
       style: overrides?.styling ?? styling,
       deviationIndicator: overrides?.deviationIndicator ?? deviationIndicator,
       advanceSettings: overrides?.advanceSettings ?? advanceSettings,
     };
 
-    onChange(buildEnvelope(config, uiConfig, overrides?.timeTabConfig ?? timeTabConfig));
+    onChange(buildEnvelope(config, uiConfig, overrides?.timeTabConfig ?? timeTabConfigRef.current, globalTimepickers));
   }
 
   // Update one field across the active chart, persisting downstream.
@@ -845,12 +1234,19 @@ export function LineChartConfiguration({
           {
             charts: next,
             activeChartId,
+            realtimeMode,
             dataTable,
             style: styling,
             deviationIndicator,
             advanceSettings,
           },
-          timeTabConfig,
+          // Use the REF, not the `timeTabConfig` state — the state is
+          // intentionally NOT updated on every Time-tab change (that would reset
+          // the SDK panel), so it lags. Emitting with the stale state drops the
+          // latest time settings (e.g. comparisonMode), which flips the renderer
+          // back to normal the moment a plot line / axis / source is edited.
+          timeTabConfigRef.current,
+          globalTimepickers,
         ),
       );
       return next;
@@ -1121,12 +1517,8 @@ export function LineChartConfiguration({
   // ---- Chart Settings mutators ---------------------------------------------
 
   // Save the State-1 first chart from the inline form.
-  function handleCreateFirstChart(
-    title: string,
-    description: string,
-    chartType: 'Aggregated' | 'Realtime',
-  ) {
-    const c = newChart(title, description, chartType);
+  function handleCreateFirstChart(title: string, description: string) {
+    const c = newChart(title, description);
     const nextCharts = [c];
     setCharts(nextCharts);
     setActiveChartId(c._id);
@@ -1136,12 +1528,8 @@ export function LineChartConfiguration({
   }
 
   // Save the new-chart draft (Plus button flow in State 2/4).
-  function handleSaveNewChart(
-    title: string,
-    description: string,
-    chartType: 'Aggregated' | 'Realtime',
-  ) {
-    const c = newChart(title, description, chartType);
+  function handleSaveNewChart(title: string, description: string) {
+    const c = newChart(title, description);
     const nextCharts = [...charts, c];
     setCharts(nextCharts);
     setActiveChartId(c._id);
@@ -1150,18 +1538,13 @@ export function LineChartConfiguration({
     emit({ charts: nextCharts, activeChartId: c._id });
   }
 
-  // Save edits to the active chart's title/description/type.
-  function handleSaveChartEdits(
-    title: string,
-    description: string,
-    chartType: 'Aggregated' | 'Realtime',
-  ) {
+  // Save edits to the active chart's title/description only (chartType is widget-level).
+  function handleSaveChartEdits(title: string, description: string) {
     if (!activeChartId) return;
     updateActiveChart((c) => ({
       ...c,
       title: title.trim(),
       description: description.trim() || undefined,
-      chartType,
     }));
     setChartEditMode(false);
   }
@@ -1234,8 +1617,31 @@ export function LineChartConfiguration({
 
   // ---- Time tab mutator ----------------------------------------------------
   function handleTimeConfigChange(next: TimeTabUIConfig) {
-    setTimeTabConfig(next);
-    emit({ timeTabConfig: next });
+    // Guard #0: drop the SDK's on-mount initialization callback. The component
+    // fires onChange immediately on mount; if its normalized value differs from
+    // the envelope's default it would emit and reset the widget's runtime time
+    // selection. timeConfigSettledRef turns true after the first paint cycle.
+    if (!timeConfigSettledRef.current) return;
+    // The SDK's TimeTabConfiguration fires onChange on mount and whenever the
+    // `charts` prop changes (e.g. adding/removing a data source). Guard #1:
+    // bail out if the full value is already identical to avoid a no-op emit.
+    if (JSON.stringify(next) === JSON.stringify(timeTabConfigRef.current)) return;
+    // Guard #2: if the SDK reverted defaultPeriodicity back to a default while
+    // the user had already chosen one, keep the user's choice. This prevents
+    // adding/removing a data source from silently resetting the periodicity.
+    const merged: TimeTabUIConfig =
+      timeTabConfigRef.current?.defaultPeriodicity && next.defaultPeriodicity !== timeTabConfigRef.current.defaultPeriodicity
+        ? { ...next, defaultPeriodicity: timeTabConfigRef.current.defaultPeriodicity }
+        : next;
+    if (JSON.stringify(merged) === JSON.stringify(timeTabConfigRef.current)) return;
+    // Update the ref but NOT the timeTabConfig state — feeding the SDK's own
+    // output back as its `value` prop causes the component to reset its internal
+    // panel state, closing the "Add Shift" / "Add Duration" form mid-edit.
+    // disablePeriodicities rides through unchanged in `merged` and is mirrored
+    // into the host timeConfig by toHostTimeConfig; the widget renderer reads it
+    // to hide its periodicity dropdown at runtime.
+    timeTabConfigRef.current = merged;
+    emit({ timeTabConfig: merged });
   }
 
   function handleDeviationIndicatorChange(next: DeviationIndicatorMode) {
@@ -1275,7 +1681,9 @@ export function LineChartConfiguration({
             deviationIndicator,
             advanceSettings,
           },
-          timeTabConfig,
+          // REF, not the lagging `timeTabConfig` state (see updateActiveChart).
+          timeTabConfigRef.current,
+          globalTimepickers,
         ),
       );
       return next;
@@ -1283,7 +1691,15 @@ export function LineChartConfiguration({
   }
 
   // ---- Styling mutator -----------------------------------------------------
-  function handleStylingChange(next: LineChartStyling) {
+  // Accepts a functional updater so callers always operate on the latest state,
+  // never a stale closure. setStyling(fn) runs fn synchronously, letting us
+  // capture `next` for the emit before React schedules the re-render.
+  function handleStylingChange(updater: StylingUpdater) {
+    // Compute from the ref (always the latest committed value, even across
+    // several updates in one tick) so `next` is reliable — not dependent on
+    // React running the setStyling updater synchronously.
+    const next = updater(stylingRef.current);
+    stylingRef.current = next;
     setStyling(next);
     emit({ styling: next });
   }
@@ -1302,7 +1718,9 @@ export function LineChartConfiguration({
       'Data Source': series.length,
       'Statistical Process Control': spcs.length,
       'Anomaly Highlighting': anomalies.length,
-      Axis: axes.length,
+      // +1 for the always-present, non-deletable default Left axis (rendered
+      // above the custom axes list); `axes` holds only the custom (right) axes.
+      Axis: axes.length + 1,
       'Plot Line': plotLines.length,
       'Plot Band': plotBands.length,
       'Data Table': dataTable.columns.length,
@@ -1381,14 +1799,14 @@ export function LineChartConfiguration({
           {/* Sticky header */}
           <div className="lc-config__col1-header">
             <div className="lc-config__col1-header-title">
-              <IconButton
-                icon={<ArrowLeft size={16} />}
-                size="Small"
-                accessibilityLabel="Back"
-                onClick={() => {
-                  /* Placeholder per spec */
-                }}
-              />
+              <Tooltip bodyText="Close" placement="Bottom">
+                <IconButton
+                  icon={<ArrowLeft size={16} />}
+                  size="Small"
+                  accessibilityLabel="Back"
+                  onClick={onBack}
+                />
+              </Tooltip>
               <span className="lc-config__title BodyMediumSemibold">Line Chart</span>
             </div>
           </div>
@@ -1399,7 +1817,7 @@ export function LineChartConfiguration({
               variant="Bordered"
               size="Medium"
               value={topTab}
-              onChange={(v) => setTopTab(v as TopTab)}
+              onChange={(v) => handleTopTabChange(v as TopTab)}
               isFullWidthTabItem
             >
               <TabItem value="Data" label="Data" />
@@ -1422,12 +1840,17 @@ export function LineChartConfiguration({
                         activeChartId={activeChartId}
                         chartEditMode={chartEditMode}
                         newChartDraft={newChartDraft}
+                        realtimeMode={realtimeMode}
                         onSelectChart={(id) => {
                           setActiveChartId(id);
                           emit({ activeChartId: id });
                         }}
-                        onChangeChartType={(t) =>
-                          updateActiveChart((c) => ({ ...c, chartType: t }))
+                        onChangeChartType={(on) => {
+                          setRealtimeMode(on);
+                          emit({ realtimeMode: on });
+                        }}
+                        onChangeBreakSeriesTimeout={(seconds) =>
+                          updateActiveChart((c) => ({ ...c, breakSeriesTimeout: seconds }))
                         }
                         onCreateFirstChart={handleCreateFirstChart}
                         onSaveNewChart={handleSaveNewChart}
@@ -1455,7 +1878,8 @@ export function LineChartConfiguration({
                   // Empty state should render rows at full opacity with their `+`
                   // visible. Only grey-out when Chart Settings is being edited.
                   const disabled = inEditMode;
-                  const hasItems = hasCounter && count > 0;
+                  // Axis section always has at least the non-deletable Left axis item.
+                  const hasItems = (hasCounter && count > 0) || sectionKey === 'Axis';
                   return (
                     <div
                       key={s}
@@ -1496,6 +1920,31 @@ export function LineChartConfiguration({
                       }}
                     >
                       {/* Body = list of item cards */}
+                      {sectionKey === 'Axis' && (
+                        <p className="lc-config__axis-hint BodyXSmallRegular">
+                          Left axis is used by default. Add a right axis for different values.
+                        </p>
+                      )}
+                      {sectionKey === 'Axis' && (
+                        <div
+                          className="lc-config__default-axis-row"
+                          role="button"
+                          tabIndex={0}
+                          onClick={() => openEditPanel('Axis', '__default_left__')}
+                          onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') openEditPanel('Axis', '__default_left__'); }}
+                        >
+                          <span className="BodySmallMedium lc-config__default-axis-label">
+                            {activeChart?.defaultAxis?.yAxisLabel || 'Left Axis'}
+                          </span>
+                          <span className="lc-config__default-axis-meta BodyXSmallRegular">
+                            {(() => {
+                              const rightSeriesIds = new Set((activeChart?.axes ?? []).flatMap((a) => a.linkedSeriesIds));
+                              const count = (activeChart?.series ?? []).filter((s) => !rightSeriesIds.has(s._id)).length;
+                              return `Left • ${count} Data Source${count !== 1 ? 's' : ''}`;
+                            })()}
+                          </span>
+                        </div>
+                      )}
                       <SectionItemList
                         section={sectionKey}
                         series={series}
@@ -1527,28 +1976,47 @@ export function LineChartConfiguration({
               </div>
             )}
 
-            {topTab === 'Time' && (
-              <div className="lc-config__time-tab" ref={timeTabRef}>
-                <TimeTabConfiguration
-                  value={timeTabConfig}
-                  onChange={handleTimeConfigChange}
-                  globalTimepickers={globalTimepickers}
-                  charts={gtpCharts}
-                />
-                {/* Deviation indicator + per-source "Advance Settings" are owned
-                    by the SDK Time tab natively (`fds-ttc__deviation` cards →
-                    timeTabConfig.deviationPattern / sourceDeviationOverrides),
-                    which the preview reads directly. Our duplicate
-                    `lc-config__deviation-indicator` and "Advance Settings"
-                    portals are removed. */}
-                {/* Replace the per-source chart Tabs with a single-select
-                    "Chart" dropdown (the SDK exposes no prop for this). */}
-                <PerSourceChartDropdownPortal scope={timeTabRef} charts={gtpCharts} />
-              </div>
-            )}
+            {topTab === 'Time' && (() => {
+              // Show the time form ALWAYS. Until a data source exists the form is
+              // rendered but DISABLED (dimmed + pointer-events off via the
+              // `--disabled` modifier), so the user sees what's coming instead of
+              // a bare "add a data source first" message.
+              const hasDataSource = !!(activeChart && activeChart.series.length > 0);
+              return (
+                <div
+                  className={`lc-config__time-tab${hasDataSource ? '' : ' lc-config__time-tab--disabled'}`}
+                  ref={timeTabRef}
+                  aria-disabled={!hasDataSource}
+                >
+                  {/* {!hasDataSource && (
+                    <p className="lc-config__time-tab-hint">
+                      Add a data source in the <strong>Data</strong> tab to configure time.
+                    </p>
+                  )} */}
+                  <TimeTabConfiguration
+                    value={timeTabConfig}
+                    onChange={handleTimeConfigChange}
+                    globalTimepickers={globalTimepickers}
+                    charts={gtpCharts}
+                  />
+                  {/* Deviation indicator + per-source "Advance Settings" are owned
+                      by the SDK Time tab natively (`fds-ttc__deviation` cards →
+                      timeTabConfig.deviationPattern / sourceDeviationOverrides),
+                      which the preview reads directly. Our duplicate
+                      `lc-config__deviation-indicator` and "Advance Settings"
+                      portals are removed. */}
+                  {/* Replace the per-source chart Tabs with a single-select
+                      "Chart" dropdown (the SDK exposes no prop for this). Only
+                      meaningful once sources exist. */}
+                  {hasDataSource && (
+                    <PerSourceChartDropdownPortal scope={timeTabRef} charts={gtpCharts} />
+                  )}
+                </div>
+              );
+            })()}
 
             {topTab === 'Style' && (
-              <StylingSection value={styling} onChange={handleStylingChange} />
+              <StylingSection value={styling} onChange={handleStylingChange} isMultiChart={charts.length > 1} />
             )}
           </div>
         </div>
@@ -1600,10 +2068,13 @@ export function LineChartConfiguration({
                   key={addPanel.mode === 'edit' ? addPanel.itemId : 'new'}
                   initial={(editingItem as LineChartSeries | null) ?? null}
                   existingCount={series.length}
-                  unsTree={unsTree}
-                  isLoadingTree={isLoadingTree}
-                  loadWorkspaces={loadWorkspaces}
-                  resolveUNSValue={resolveUNSValue}
+                  existingNames={series
+                    .filter((s) => !(addPanel.mode === 'edit' && s._id === addPanel.itemId))
+                    .map((s) => s.name)}
+                  unsWorkspaces={unsWorkspaces}
+                  isLoadingWorkspaces={isLoadingWorkspaces}
+                  loadUnsChildren={loadUnsChildren}
+                  searchUnsNodes={searchUnsNodes}
                   onSubmit={(s) => {
                     if (addPanel.mode === 'edit') handleUpdateSeriesItem(s);
                     else handleAddSeries(s);
@@ -1612,16 +2083,28 @@ export function LineChartConfiguration({
                   onReady={setEditorBinding}
                 />
               )}
-              {addPanel.section === 'Axis' && (
+              {addPanel.section === 'Axis' && addPanel.mode === 'edit' && addPanel.itemId === '__default_left__' ? (
+                <DefaultAxisEditor
+                  initial={activeChart?.defaultAxis ?? {}}
+                  onSubmit={(v) => {
+                    updateActiveChart((c) => ({
+                      ...c,
+                      defaultAxis: { ...c.defaultAxis, ...v },
+                    }));
+                    closeAddPanel();
+                  }}
+                  onReady={(b) => setEditorBinding(b)}
+                />
+              ) : addPanel.section === 'Axis' ? (
                 <AxisEditor
                   key={addPanel.mode === 'edit' ? addPanel.itemId : 'new'}
                   initial={(editingItem as LineChartAxis | null) ?? null}
                   series={series}
                   existingCount={axes.length}
-                  unsTree={unsTree}
-                  isLoadingTree={isLoadingTree}
-                  loadWorkspaces={loadWorkspaces}
-                  resolveUNSValue={resolveUNSValue}
+                  unsWorkspaces={unsWorkspaces}
+                  isLoadingWorkspaces={isLoadingWorkspaces}
+                  loadUnsChildren={loadUnsChildren}
+                  searchUnsNodes={searchUnsNodes}
                   onSubmit={(a) => {
                     if (addPanel.mode === 'edit') handleUpdateAxis(a);
                     else handleAddAxis(a);
@@ -1629,17 +2112,19 @@ export function LineChartConfiguration({
                   }}
                   onReady={setEditorBinding}
                 />
-              )}
+              ) : null}
               {addPanel.section === 'Plot Line' && (
                 <PlotLineEditor
                   key={addPanel.mode === 'edit' ? addPanel.itemId : 'new'}
                   initial={(editingItem as LineChartPlotLine | null) ?? null}
                   existingCount={plotLines.length}
-                  unsTree={unsTree}
-                  isLoadingTree={isLoadingTree}
-                  loadWorkspaces={loadWorkspaces}
-                  resolveUNSValue={resolveUNSValue}
-                  isRealtime={(activeChart?.chartType ?? 'Aggregated') === 'Realtime'}
+                  axes={axes}
+                  defaultAxisLabel={activeChart?.defaultAxis?.yAxisLabel || 'Left'}
+                  unsWorkspaces={unsWorkspaces}
+                  isLoadingWorkspaces={isLoadingWorkspaces}
+                  loadUnsChildren={loadUnsChildren}
+                  searchUnsNodes={searchUnsNodes}
+                  isRealtime={realtimeMode}
                   onSubmit={(p) => {
                     if (addPanel.mode === 'edit') handleUpdatePlotLine(p);
                     else handleAddPlotLine(p);
@@ -1653,6 +2138,7 @@ export function LineChartConfiguration({
                   key={addPanel.mode === 'edit' ? addPanel.itemId : 'new'}
                   initial={(editingItem as LineChartPlotBand | null) ?? null}
                   axes={axes}
+                  defaultAxisLabel={activeChart?.defaultAxis?.yAxisLabel || 'Left'}
                   existingCount={plotBands.length}
                   onSubmit={(b) => {
                     if (addPanel.mode === 'edit') handleUpdatePlotBand(b);
@@ -1682,10 +2168,10 @@ export function LineChartConfiguration({
                   initial={(editingItem as LineChartAnomaly | null) ?? null}
                   series={series}
                   existingCount={anomalies.length}
-                  unsTree={unsTree}
-                  isLoadingTree={isLoadingTree}
-                  loadWorkspaces={loadWorkspaces}
-                  resolveUNSValue={resolveUNSValue}
+                  unsWorkspaces={unsWorkspaces}
+                  isLoadingWorkspaces={isLoadingWorkspaces}
+                  loadUnsChildren={loadUnsChildren}
+                  searchUnsNodes={searchUnsNodes}
                   onSubmit={(a) => {
                     if (addPanel.mode === 'edit') handleUpdateAnomaly(a);
                     else handleAddAnomaly(a);
@@ -1700,10 +2186,10 @@ export function LineChartConfiguration({
                   initial={(editingItem as DataTableColumn | null) ?? null}
                   series={series}
                   existingCount={dataTable.columns.length}
-                  unsTree={unsTree}
-                  isLoadingTree={isLoadingTree}
-                  loadWorkspaces={loadWorkspaces}
-                  resolveUNSValue={resolveUNSValue}
+                  unsWorkspaces={unsWorkspaces}
+                  isLoadingWorkspaces={isLoadingWorkspaces}
+                  loadUnsChildren={loadUnsChildren}
+                  searchUnsNodes={searchUnsNodes}
                   onSubmit={(cols) => {
                     if (addPanel.mode === 'edit')
                       handleReplaceDataTableColumn(addPanel.itemId, cols);
@@ -1789,50 +2275,6 @@ export function LineChartConfiguration({
 // Column 1: Chart Settings 4-state block
 // ===========================================================================
 
-const CHART_TYPE_OPTIONS: Array<'Aggregated' | 'Realtime'> = ['Aggregated', 'Realtime'];
-
-// Chart Type single-select — shown in every Chart Settings state (create / edit /
-// display) so it's always available, not just after the first chart exists.
-function ChartTypeSelect({
-  value,
-  onChange,
-  disabled = false,
-}: {
-  value: 'Aggregated' | 'Realtime';
-  onChange: (v: 'Aggregated' | 'Realtime') => void;
-  disabled?: boolean;
-}) {
-  const [open, setOpen] = useState(false);
-  return (
-    <SelectInput
-      label="Chart Type"
-      placeholder="Select chart type"
-      value={value}
-      isDisabled={disabled}
-      isOpen={disabled ? false : open}
-      onOpenChange={setOpen}
-      onClick={() => {
-        if (disabled) return;
-        setOpen((o) => !o);
-      }}
-    >
-      <DropdownMenu>
-        {CHART_TYPE_OPTIONS.map((opt) => (
-          <ActionListItem
-            key={opt}
-            title={opt}
-            selectionType="Single"
-            isSelected={value === opt}
-            onClick={() => {
-              onChange(opt);
-              setOpen(false);
-            }}
-          />
-        ))}
-      </DropdownMenu>
-    </SelectInput>
-  );
-}
 
 interface ChartSettingsBlockProps {
   charts: ChartInstance[];
@@ -1840,23 +2282,13 @@ interface ChartSettingsBlockProps {
   activeChartId: string | null;
   chartEditMode: boolean;
   newChartDraft: boolean;
+  realtimeMode: boolean;
   onSelectChart: (id: string) => void;
-  onChangeChartType: (chartType: 'Aggregated' | 'Realtime') => void;
-  onCreateFirstChart: (
-    title: string,
-    description: string,
-    chartType: 'Aggregated' | 'Realtime',
-  ) => void;
-  onSaveNewChart: (
-    title: string,
-    description: string,
-    chartType: 'Aggregated' | 'Realtime',
-  ) => void;
-  onSaveEdits: (
-    title: string,
-    description: string,
-    chartType: 'Aggregated' | 'Realtime',
-  ) => void;
+  onChangeChartType: (on: boolean) => void;
+  onChangeBreakSeriesTimeout: (seconds: number | undefined) => void;
+  onCreateFirstChart: (title: string, description: string) => void;
+  onSaveNewChart: (title: string, description: string) => void;
+  onSaveEdits: (title: string, description: string) => void;
   onEnterEditMode: () => void;
   onCancelEdit: () => void;
   onStartNewChart: () => void;
@@ -1870,8 +2302,10 @@ function ChartSettingsBlock({
   activeChartId,
   chartEditMode,
   newChartDraft,
+  realtimeMode,
   onSelectChart,
   onChangeChartType,
+  onChangeBreakSeriesTimeout,
   onCreateFirstChart,
   onSaveNewChart,
   onSaveEdits,
@@ -1891,33 +2325,24 @@ function ChartSettingsBlock({
   const [draftTitle, setDraftTitle] = useState<string>('');
   const [draftDescription, setDraftDescription] = useState<string>('');
 
-  // Local draft for State 1 (first chart) chart type.
-  const [draftChartType, setDraftChartType] = useState<'Aggregated' | 'Realtime'>('Aggregated');
-
   // Local draft for edit mode — rehydrate when entering edit OR when active chart switches.
   const [editTitle, setEditTitle] = useState<string>(activeChart?.title ?? '');
   const [editDescription, setEditDescription] = useState<string>(activeChart?.description ?? '');
-  const [editChartType, setEditChartType] = useState<'Aggregated' | 'Realtime'>(
-    activeChart?.chartType ?? 'Aggregated',
-  );
 
   useEffect(() => {
     if (chartEditMode) {
       setEditTitle(activeChart?.title ?? '');
       setEditDescription(activeChart?.description ?? '');
-      setEditChartType(activeChart?.chartType ?? 'Aggregated');
     }
   }, [chartEditMode, activeChartId, activeChart]);
 
   // Local draft for new-chart sub-state.
   const [newTitle, setNewTitle] = useState<string>('');
   const [newDescription, setNewDescription] = useState<string>('');
-  const [newChartType, setNewChartType] = useState<'Aggregated' | 'Realtime'>('Aggregated');
   useEffect(() => {
     if (newChartDraft) {
       setNewTitle('');
       setNewDescription('');
-      setNewChartType('Aggregated');
     }
   }, [newChartDraft]);
 
@@ -1941,7 +2366,6 @@ function ChartSettingsBlock({
             necessityIndicator="required"
             onChange={({ value }: { name: string; value: string }) => setDraftTitle(value)}
           />
-          <ChartTypeSelect value={draftChartType} onChange={setDraftChartType} />
           <TextInput
             label="Chart Description"
             labelPosition="top"
@@ -1961,7 +2385,7 @@ function ChartSettingsBlock({
               isFullWidth
               label="Save"
               onClick={() =>
-                onCreateFirstChart(draftTitle.trim(), draftDescription.trim(), draftChartType)
+                onCreateFirstChart(draftTitle.trim(), draftDescription.trim())
               }
             />
           </div>
@@ -1990,7 +2414,6 @@ function ChartSettingsBlock({
             necessityIndicator="required"
             onChange={({ value }: { name: string; value: string }) => setNewTitle(value)}
           />
-          <ChartTypeSelect value={newChartType} onChange={setNewChartType} />
           <TextInput
             label="Chart Description"
             labelPosition="top"
@@ -2017,7 +2440,7 @@ function ChartSettingsBlock({
             isDisabled={!canSave}
             onClick={() => {
               if (!canSave) return;
-              onSaveNewChart(newTitle.trim(), newDescription.trim(), newChartType);
+              onSaveNewChart(newTitle.trim(), newDescription.trim());
             }}
           />
         </div>
@@ -2037,13 +2460,15 @@ function ChartSettingsBlock({
           <span className="BodySmallSemibold">Chart Settings</span>
           <div className="lc-config__chart-settings-header-actions">
             <span className="lc-config__chart-settings-trash">
-              <IconButton
-                icon={<Trash2 size={16} />}
-                size="Medium"
-                emphasis="Intense"
-                accessibilityLabel="Delete chart"
-                onClick={onRequestDelete}
-              />
+              <Tooltip bodyText="Delete Chart" placement="Top">
+                <IconButton
+                  icon={<Trash2 size={16} />}
+                  size="Medium"
+                  emphasis="Intense"
+                  accessibilityLabel="Delete chart"
+                  onClick={onRequestDelete}
+                />
+              </Tooltip>
             </span>
           </div>
         </div>
@@ -2056,9 +2481,6 @@ function ChartSettingsBlock({
             necessityIndicator="required"
             onChange={({ value }: { name: string; value: string }) => setEditTitle(value)}
           />
-          {/* Chart Type is locked while editing an existing chart — only the
-              title/description can change. */}
-          <ChartTypeSelect value={editChartType} onChange={setEditChartType} disabled />
           <TextInput
             label="Chart Description"
             labelPosition="top"
@@ -2085,7 +2507,7 @@ function ChartSettingsBlock({
             isDisabled={!canSave}
             onClick={() => {
               if (!canSave) return;
-              onSaveEdits(editTitle.trim(), editDescription.trim(), editChartType);
+              onSaveEdits(editTitle.trim(), editDescription.trim());
             }}
           />
         </div>
@@ -2103,8 +2525,10 @@ function ChartSettingsBlock({
       charts={charts}
       activeChart={activeChart}
       isMulti={isMulti}
+      realtimeMode={realtimeMode}
       onSelectChart={onSelectChart}
       onChangeChartType={onChangeChartType}
+      onChangeBreakSeriesTimeout={onChangeBreakSeriesTimeout}
       onStartNewChart={onStartNewChart}
       onEnterEditMode={onEnterEditMode}
     />
@@ -2143,8 +2567,10 @@ interface ChartSettingsDisplayModeProps {
   charts: ChartInstance[];
   activeChart: ChartInstance | null;
   isMulti: boolean;
+  realtimeMode: boolean;
   onSelectChart: (id: string) => void;
-  onChangeChartType: (chartType: 'Aggregated' | 'Realtime') => void;
+  onChangeChartType: (on: boolean) => void;
+  onChangeBreakSeriesTimeout: (seconds: number | undefined) => void;
   onStartNewChart: () => void;
   onEnterEditMode: () => void;
 }
@@ -2153,13 +2579,14 @@ function ChartSettingsDisplayMode({
   charts,
   activeChart,
   isMulti,
+  realtimeMode,
   onSelectChart,
   onChangeChartType,
+  onChangeBreakSeriesTimeout,
   onStartNewChart,
   onEnterEditMode,
 }: ChartSettingsDisplayModeProps) {
   const [chartDropdownOpen, setChartDropdownOpen] = useState(false);
-  const chartType = activeChart?.chartType ?? 'Aggregated';
   return (
     <div className="lc-config__chart-settings">
       <div className="lc-config__chart-settings-header">
@@ -2193,9 +2620,8 @@ function ChartSettingsDisplayMode({
             value={activeChart?.title ?? ''}
             isOpen={chartDropdownOpen}
             onOpenChange={setChartDropdownOpen}
-            onClick={() => setChartDropdownOpen((o) => !o)}
           >
-            <DropdownMenu>
+            <DropdownMenu className="lc-config__chart-list-menu">
               {charts.map((c) => (
                 <ActionListItem
                   key={c._id}
@@ -2217,10 +2643,38 @@ function ChartSettingsDisplayMode({
             required
           />
         )}
-        <ChartTypeSelect value={chartType} onChange={onChangeChartType} />
         <ReadOnlyField
           label="Chart Description"
           value={activeChart?.description ?? ''}
+        />
+        <div className="lc-config__switch-row" style={{ width: '100%' }}>
+          <span className="LabelSmallRegular lc-config__switch-label">
+            Realtime
+          </span>
+          <Switch
+            isChecked={realtimeMode}
+            onChange={({ isChecked }: { isChecked: boolean }) => onChangeChartType(isChecked)}
+            accessibilityLabel="Toggle Realtime chart mode"
+          />
+        </div>
+        <TextInput
+          label="Break Series Timeout"
+          labelPosition="top"
+          type="number"
+          min={0}
+          suffix="sec"
+          placeholder="Leave blank for auto"
+          helpText="Gap larger than this breaks the line. Blank = adaptive."
+          value={
+            typeof activeChart?.breakSeriesTimeout === 'number'
+              ? String(activeChart.breakSeriesTimeout)
+              : ''
+          }
+          onChange={({ value }: { name: string; value: string }) => {
+            const t = value.trim();
+            const n = Number(t);
+            onChangeBreakSeriesTimeout(t === '' || !Number.isFinite(n) || n <= 0 ? undefined : n);
+          }}
         />
       </div>
     </div>
@@ -2315,12 +2769,12 @@ function SectionItemList({
 
         <Checkbox
           label="Transpose Table"
-          isChecked={dataTable.transposeTable}
+          checked={dataTable.transposeTable}
           onChange={(e: React.ChangeEvent<HTMLInputElement>) => onTransposeTable(e.target.checked)}
         />
         <Checkbox
           label="Show Unit"
-          isChecked={dataTable.showUnit ?? true}
+          checked={dataTable.showUnit ?? true}
           onChange={(e: React.ChangeEvent<HTMLInputElement>) => onShowUnitChange(e.target.checked)}
         />
 
@@ -2364,12 +2818,13 @@ function SectionItemList({
     return (
       <>
         {series.map((s) => {
-          const subtitle = s.dataSource
-            ? VARIABLE_REGEX.test(s.dataSource.trim())
+          const topic = s.unsPath || s.dataSource || '';
+          const subtitle = topic
+            ? VARIABLE_REGEX.test(topic.trim())
               ? 'Live data'
-              : s.dataSource.length > 28
-                ? `${s.dataSource.slice(0, 28)}…`
-                : s.dataSource
+              : topic.length > 28
+                ? `${topic.slice(0, 28)}…`
+                : topic
             : 'No topic set';
           return (
             <ItemCard
@@ -2742,10 +3197,10 @@ function PerSourceChartSelect({
     <div className="lc-config__per-source-chart-field">
       <SelectInput
         label="Chart"
+        placeholder="Select chart"
         value={charts.find((c) => c.id === selected)?.name ?? ''}
         isOpen={open}
         onOpenChange={setOpen}
-        onClick={() => setOpen((o) => !o)}
       >
         <DropdownMenu>
           {charts.map((c) => (
@@ -2999,16 +3454,18 @@ function ItemCard({
         <ListCardTrailingItem
           trailing="Icon"
           icon={
-            <IconButton
-              icon={<Trash2 size={14} />}
-              size="Medium"
-              emphasis="Subtle"
-              accessibilityLabel={`Remove ${title}`}
-              onClick={(e) => {
-                e.stopPropagation();
-                onRemove();
-              }}
-            />
+            <Tooltip bodyText="Remove" placement="Top">
+              <IconButton
+                icon={<Trash2 size={14} />}
+                size="Medium"
+                emphasis="Subtle"
+                accessibilityLabel={`Remove ${title}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onRemove();
+                }}
+              />
+            </Tooltip>
           }
         />
       }
@@ -3039,10 +3496,13 @@ function useEditorBinding(
 interface DataSourceEditorProps {
   initial: LineChartSeries | null;
   existingCount: number;
-  unsTree: import('@faclon-labs/design-sdk/UNSPathInput').UNSTree;
-  isLoadingTree: boolean;
-  loadWorkspaces: () => void;
-  resolveUNSValue: (raw: string) => string;
+  // Names already taken by OTHER series on this chart (the one being edited is
+  // excluded) — used to block adding two data sources with the same name.
+  existingNames: string[];
+  unsWorkspaces: UNSWorkspace[];
+  isLoadingWorkspaces: boolean;
+  loadUnsChildren: (wsId: string, parentId?: string) => Promise<UNSNode[]>;
+  searchUnsNodes: (wsId: string, query: string, limit?: number) => Promise<UNSNode[]>;
   onSubmit: (s: LineChartSeries) => void;
   onReady: (b: EditorBinding) => void;
 }
@@ -3050,10 +3510,11 @@ interface DataSourceEditorProps {
 function DataSourceEditor({
   initial,
   existingCount,
-  unsTree,
-  isLoadingTree,
-  loadWorkspaces,
-  resolveUNSValue,
+  existingNames,
+  unsWorkspaces,
+  isLoadingWorkspaces,
+  loadUnsChildren,
+  searchUnsNodes,
   onSubmit,
   onReady,
 }: DataSourceEditorProps) {
@@ -3061,18 +3522,25 @@ function DataSourceEditor({
   const [color, setColor] = useState(
     initial?.color ?? DEFAULT_COLORS[existingCount % DEFAULT_COLORS.length],
   );
-  const [dataSource, setDataSource] = useState(initial?.dataSource ?? '');
+  const [unsPath, setUnsPath] = useState(initial?.unsPath ?? initial?.dataSource ?? '');
   const [dataPrecision, setDataPrecision] = useState(
     initial?.dataPrecision !== undefined ? String(initial.dataPrecision) : '2',
   );
   const [limit, setLimit] = useState(initial?.limit ?? '');
   const [addAsTooltip, setAddAsTooltip] = useState(initial?.addAsTooltip ?? false);
 
-  // Name, Color and UNS Path are mandatory.
+  // A data source name must be unique within the chart (case-insensitive) —
+  // two series with the same name are indistinguishable in the legend/table.
+  const nameTaken =
+    name.trim().length > 0 &&
+    existingNames.some((n) => n.trim().toLowerCase() === name.trim().toLowerCase());
+
+  // Name, Color and UNS Path are mandatory; the name must also be unique.
   const isValid =
     name.trim().length > 0 &&
+    !nameTaken &&
     color.trim().length > 0 &&
-    dataSource.trim().length > 0;
+    unsPath.trim().length > 0;
 
   const submit = useCallback(() => {
     if (!isValid) return;
@@ -3080,13 +3548,13 @@ function DataSourceEditor({
       _id: initial?._id ?? `series_${Date.now()}_${existingCount}`,
       name: name.trim(),
       color: color || DEFAULT_COLORS[existingCount % DEFAULT_COLORS.length],
-      dataSource,
+      unsPath,
       dataPrecision: dataPrecision ? Number(dataPrecision) : undefined,
       limit: limit || undefined,
       addAsTooltip: addAsTooltip || undefined,
     });
   }, [
-    isValid, initial, existingCount, name, color, dataSource,
+    isValid, initial, existingCount, name, color, unsPath,
     dataPrecision, limit, addAsTooltip, onSubmit,
   ]);
 
@@ -3101,6 +3569,10 @@ function DataSourceEditor({
         placeholder="Enter source name"
         value={name}
         necessityIndicator="required"
+        // Duplicate-name feedback via the SDK's own field error support
+        // (compact errorText under the field) instead of a custom hint span.
+        validationState={nameTaken ? 'error' : 'none'}
+        errorText={nameTaken ? 'A data source with this name already exists.' : undefined}
         onChange={({ value }: { name: string; value: string }) => setName(value)}
       />
 
@@ -3113,15 +3585,16 @@ function DataSourceEditor({
       />
 
       {/* UNS Path */}
-      <UNSPathInput
+      <UNSTreePicker
         label="UNS Path"
         necessityIndicator="required"
         placeholder="Enter UNS Path"
-        value={dataSource}
-        tree={unsTree}
-        isLoading={isLoadingTree}
-        onOpen={loadWorkspaces}
-        onChange={(value) => setDataSource(resolveUNSValue(value))}
+        value={unsPath}
+        workspaces={unsWorkspaces}
+        isLoadingWorkspaces={isLoadingWorkspaces}
+        loadChildren={loadUnsChildren}
+        searchNodes={searchUnsNodes}
+        onChange={(value: string) => setUnsPath(value)}
       />
 
       {/* Data Precision + Unit */}
@@ -3130,14 +3603,15 @@ function DataSourceEditor({
           label="Data Precision"
           labelPosition="top"
           type="number"
-          placeholder="Enter value"
+          min={0}
+          placeholder="e.g. 2"
           value={dataPrecision}
           onChange={({ value }: { name: string; value: string }) => setDataPrecision(value)}
         />
         <TextInput
           label="Unit"
           labelPosition="top"
-          placeholder="Enter value"
+          placeholder="e.g. kWh"
           value={limit}
           onChange={({ value }: { name: string; value: string }) => setLimit(value)}
         />
@@ -3146,11 +3620,43 @@ function DataSourceEditor({
       {/* Add Source as Tooltip */}
       <Checkbox
         size="Medium"
-        isChecked={addAsTooltip}
+        checked={addAsTooltip}
         onChange={(e) => setAddAsTooltip(e.target.checked)}
       >
         Add Source as Tooltip
       </Checkbox>
+    </div>
+  );
+}
+
+// ===========================================================================
+// Editor: Default Left Axis (always present, maps to activeChart.defaultAxis)
+// ===========================================================================
+
+interface DefaultAxisEditorProps {
+  initial: { yAxisLabel?: string };
+  onSubmit: (v: { yAxisLabel: string; yAxisMin: number | null; yAxisMax: number | null }) => void;
+  onReady: (b: EditorBinding) => void;
+}
+
+function DefaultAxisEditor({ initial, onSubmit, onReady }: DefaultAxisEditorProps) {
+  const [label, setLabel] = useState(initial?.yAxisLabel ?? '');
+
+  const submit = useCallback(() => {
+    onSubmit({ yAxisLabel: label.trim(), yAxisMin: null, yAxisMax: null });
+  }, [label, onSubmit]);
+
+  useEditorBinding(true, submit, onReady);
+
+  return (
+    <div className="lc-config__editor">
+      <TextInput
+        label="Y Axis Label"
+        labelPosition="top"
+        placeholder="e.g. Flow Rate"
+        value={label}
+        onChange={({ value }: { name: string; value: string }) => setLabel(value)}
+      />
     </div>
   );
 }
@@ -3163,10 +3669,10 @@ interface AxisEditorProps {
   initial: LineChartAxis | null;
   series: LineChartSeries[];
   existingCount: number;
-  unsTree: import('@faclon-labs/design-sdk/UNSPathInput').UNSTree;
-  isLoadingTree: boolean;
-  loadWorkspaces: () => void;
-  resolveUNSValue: (raw: string) => string;
+  unsWorkspaces: UNSWorkspace[];
+  isLoadingWorkspaces: boolean;
+  loadUnsChildren: (wsId: string, parentId?: string) => Promise<UNSNode[]>;
+  searchUnsNodes: (wsId: string, query: string, limit?: number) => Promise<UNSNode[]>;
   onSubmit: (a: LineChartAxis) => void;
   onReady: (b: EditorBinding) => void;
 }
@@ -3220,7 +3726,7 @@ function AxisEditor({
       position,
       // Bindable UNS path is preserved from the existing axis; the Data Source
       // field now drives which series feed this axis.
-      dataSource: initial?.dataSource ?? '',
+      unsPath: initial?.unsPath ?? initial?.dataSource ?? '',
       linkedSeriesIds,
     });
   }, [isValid, initial, existingCount, name, position, linkedSeriesIds, onSubmit]);
@@ -3286,147 +3792,136 @@ function AxisEditor({
 // Editor: Plot Line
 // ===========================================================================
 
-const PERIODICITY_OPTIONS = ['Hourly', 'Daily', 'Weekly', 'Monthly', 'Quarterly'];
-const LINE_STYLE_OPTIONS: PlotLineStyle[] = ['Solid', 'Dashed'];
-const DURATION_TYPE_OPTIONS = ['Fixed', 'Custom'];
+// Full Highcharts dash-style set, matching the ColumnChart / CombinedBarLine
+// plot line "Dash style" dropdown. (Legacy 'Dashed' is normalized to 'Dash'.)
+const LINE_STYLE_OPTIONS: PlotLineStyle[] = ['Solid', 'Dash', 'Dot', 'DashDot', 'LongDash', 'ShortDash'];
+// The full set of selectable periodicities, matching the widget renderer's
+// PERIODICITY_ORDER (Minute is intentionally excluded — not user-selectable).
+// A dependent plot line can be scoped to any of these.
+const PLOT_LINE_PERIODICITIES = ['hourly', 'daily', 'weekly', 'monthly', 'quarterly', 'yearly'] as const;
 
 interface PlotLineEditorProps {
   initial: LineChartPlotLine | null;
   existingCount: number;
-  unsTree: import('@faclon-labs/design-sdk/UNSPathInput').UNSTree;
-  isLoadingTree: boolean;
-  loadWorkspaces: () => void;
-  resolveUNSValue: (raw: string) => string;
+  axes: LineChartAxis[];
+  defaultAxisLabel?: string;
+  unsWorkspaces: UNSWorkspace[];
+  isLoadingWorkspaces: boolean;
+  loadUnsChildren: (wsId: string, parentId?: string) => Promise<UNSNode[]>;
+  searchUnsNodes: (wsId: string, query: string, limit?: number) => Promise<UNSNode[]>;
   onSubmit: (line: LineChartPlotLine) => void;
   onReady: (b: EditorBinding) => void;
-  // When the chart is Realtime, periodicity-dependent plotlines are unavailable.
   isRealtime?: boolean;
 }
 
 function PlotLineEditor({
   initial,
   existingCount,
-  unsTree,
-  isLoadingTree,
-  loadWorkspaces,
-  resolveUNSValue,
+  axes,
+  defaultAxisLabel = 'Left',
+  unsWorkspaces,
+  isLoadingWorkspaces,
+  loadUnsChildren,
+  searchUnsNodes,
   onSubmit,
   onReady,
   isRealtime = false,
 }: PlotLineEditorProps) {
   const [name, setName] = useState(initial?.name ?? '');
   const [color, setColor] = useState(initial?.color ?? '#3b82f6');
-  // In Realtime, only Independent plotlines exist — force the editor to that
-  // type so a previously-Dependent line edited here doesn't expose periodicity.
-  const [type, setType] = useState<PlotLineType>(
-    isRealtime ? 'Independent' : initial?.type ?? 'Independent',
-  );
-  const [valueType, setValueType] = useState<PlotLineValueType>(
-    initial?.valueType ?? 'Fixed',
-  );
-  const [valueTypeOpen, setValueTypeOpen] = useState(false);
-  const [fixedValue, setFixedValue] = useState(initial?.fixedValue ?? '');
-  const [dynamicTopic, setDynamicTopic] = useState(initial?.dynamicTopic ?? '');
-  const [dataPrecision, setDataPrecision] = useState<string>(
-    typeof initial?.dataPrecision === 'number' ? String(initial.dataPrecision) : '',
-  );
-  const [unit, setUnit] = useState(initial?.unit ?? '');
-  const [periodicities, setPeriodicities] = useState<PlotLinePeriodicityEntry[]>(
-    initial?.periodicities ?? [],
-  );
-  const [durationType, setDurationType] = useState(initial?.durationType ?? 'Custom');
-  const [durationTypeOpen, setDurationTypeOpen] = useState(false);
-  const [startDate, setStartDate] = useState<Date | null>(
-    initial?.startDate ? new Date(initial.startDate) : null,
-  );
-  const [endDate, setEndDate] = useState<Date | null>(
-    initial?.endDate ? new Date(initial.endDate) : null,
-  );
+  // Migrate from legacy fixedValue/dynamicTopic fields
+  const [value, setValue] = useState<string>(() => {
+    if (initial?.value !== undefined) return initial.value;
+    if (initial?.dynamicTopic) return initial.dynamicTopic;
+    if (initial?.fixedValue !== undefined) return initial.fixedValue;
+    return '';
+  });
+  const [axisId, setAxisId] = useState<string>(initial?.axisId ?? '');
+  const [axisDropdownOpen, setAxisDropdownOpen] = useState(false);
   const [lineWidth, setLineWidth] = useState<string>(
     typeof initial?.lineWidth === 'number' ? String(initial.lineWidth) : '1',
   );
-  const [lineStyle, setLineStyle] = useState<PlotLineStyle>(initial?.lineStyle ?? 'Solid');
-  const [styleOpen, setStyleOpen] = useState(true);
+  const [lineStyle, setLineStyle] = useState<PlotLineStyle>(
+    // Normalize the legacy 'Dashed' value to 'Dash' so it maps to a real option.
+    initial?.lineStyle === 'Dashed' ? 'Dash' : (initial?.lineStyle ?? 'Solid'),
+  );
   const [styleDropdownOpen, setStyleDropdownOpen] = useState(false);
-  const [openPeriodicityRow, setOpenPeriodicityRow] = useState<number | null>(null);
+  // Migrate from legacy type field
+  const [periodicityType, setPeriodicityType] = useState<PlotLinePeriodicityType>(
+    isRealtime
+      ? 'independent'
+      : initial?.periodicityType ??
+        (initial?.type === 'Dependent' ? 'dependent' : 'independent'),
+  );
+  const [periodicities, setPeriodicities] = useState<string[]>(
+    Array.isArray(initial?.periodicities)
+      ? initial!.periodicities.map((p) => (typeof p === 'string' ? p : (p as { periodicity: string }).periodicity))
+      : [],
+  );
+  const [periodicityDropdownOpen, setPeriodicityDropdownOpen] = useState(false);
+  const [currentPeriodicity, setCurrentPeriodicity] = useState('');
 
-  const isValid = name.trim().length > 0;
-
-  function addPeriodicityRow() {
-    setPeriodicities((rows) => {
-      // Default the new row to the first periodicity not already chosen.
-      const used = new Set(rows.map((r) => r.periodicity));
-      const next = PERIODICITY_OPTIONS.find((p) => !used.has(p)) ?? PERIODICITY_OPTIONS[0];
-      return [...rows, { periodicity: next, value: 0 }];
-    });
-  }
-  function updatePeriodicityRow(idx: number, patch: Partial<PlotLinePeriodicityEntry>) {
-    setPeriodicities((rows) => rows.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
-  }
-  function removePeriodicityRow(idx: number) {
-    setPeriodicities((rows) => rows.filter((_, i) => i !== idx));
-  }
+  // When "Dependent" is selected, a line width AND at least one periodicity must
+  // be chosen — a dependent line without periodicities can never render, and its
+  // width drives the (now periodicity-gated) rendering. Independent lines only
+  // need a name.
+  const widthNum = Number(lineWidth);
+  const widthValid = lineWidth.trim() !== '' && Number.isFinite(widthNum) && widthNum > 0;
+  const isDependent = periodicityType === 'dependent';
+  const isValid =
+    name.trim().length > 0 &&
+    (!isDependent || (widthValid && periodicities.length > 0));
 
   const submit = useCallback(() => {
     if (!isValid) return;
     const widthNum = Number(lineWidth);
-    const isDynamic = valueType === 'Dynamic';
     onSubmit({
       _id: initial?._id ?? `plotline_${Date.now()}_${existingCount}`,
       name: name.trim(),
       color: color.trim() || '#3b82f6',
-      type,
-      valueType,
-      fixedValue:
-        type === 'Independent' && valueType === 'Fixed' && fixedValue !== ''
-          ? fixedValue
-          : undefined,
-      dynamicTopic: isDynamic ? dynamicTopic : undefined,
-      dataPrecision:
-        isDynamic && dataPrecision !== '' && !Number.isNaN(Number(dataPrecision))
-          ? Number(dataPrecision)
-          : undefined,
-      unit: isDynamic && unit ? unit : undefined,
-      periodicities: type === 'Dependent' && valueType === 'Fixed' ? periodicities : undefined,
-      durationType: type === 'Independent' && isDynamic ? durationType || undefined : undefined,
-      startDate: type === 'Independent' && isDynamic && startDate ? startDate.toISOString() : undefined,
-      endDate: type === 'Independent' && isDynamic && endDate ? endDate.toISOString() : undefined,
+      value,
+      axisId: axisId || undefined,
       lineWidth: Number.isFinite(widthNum) && widthNum > 0 ? widthNum : 1,
       lineStyle,
+      periodicityType,
+      periodicities: periodicityType === 'dependent' && periodicities.length > 0 ? periodicities : undefined,
     });
-  }, [
-    isValid,
-    initial,
-    existingCount,
-    name,
-    color,
-    type,
-    valueType,
-    fixedValue,
-    dynamicTopic,
-    dataPrecision,
-    unit,
-    periodicities,
-    durationType,
-    startDate,
-    endDate,
-    lineWidth,
-    lineStyle,
-    onSubmit,
-  ]);
+  }, [isValid, initial, existingCount, name, color, value, axisId, lineWidth, lineStyle, periodicityType, periodicities, onSubmit]);
 
   useEditorBinding(isValid, submit, onReady);
 
   return (
     <div className="lc-config__editor">
       <TextInput
-        label="Name"
+        label="Label"
         labelPosition="top"
-        placeholder="Enter line name"
+        placeholder="e.g. Target"
         value={name}
         necessityIndicator="required"
-        onChange={({ value }: { name: string; value: string }) => setName(value)}
+        onChange={({ value: v }: { name: string; value: string }) => setName(v)}
       />
+
+      <UNSTreePicker
+        label="Value"
+        placeholder="Type a number or / to bind"
+        value={value}
+        allowFreeValue
+        workspaces={unsWorkspaces}
+        isLoadingWorkspaces={isLoadingWorkspaces}
+        loadChildren={loadUnsChildren}
+        searchNodes={searchUnsNodes}
+        onChange={(v: string) => {
+          // Dual-mode (allowFreeValue): v is either a raw free value or a
+          // {{uns:...}} topic. For a raw value, restrict to decimal numbers
+          // (a plot line's static value); topics pass through untouched.
+          const isBinding = /^\{\{.+\}\}$/.test(v);
+          if (!isBinding && v !== '' && v !== '-' && v !== '.') {
+            if (!/^-?\d*\.?\d*$/.test(v)) return;
+          }
+          setValue(v);
+        }}
+      />
+
       <ColorInput
         label="Color *"
         placeholder="Select color"
@@ -3434,257 +3929,139 @@ function PlotLineEditor({
         onChange={(hex: string) => setColor(hex)}
       />
 
-      {/* Realtime charts have no periodicity, so the "Periodicity Dependent"
-          option is hidden — only Independent plotlines are available. */}
-      {!isRealtime && (
-        <RadioGroup
-          label="Plotline Type"
-          name="plotline-type"
-          size="Medium"
-          value={type}
-          onChange={({ value }) => setType(value as PlotLineType)}
-          orientation="Vertical"
-        >
-          <Radio
-            label="Periodicity Independent"
-            helpText="Plotline uses a static value, unaffected by periodic intervals."
-            value="Independent"
-          />
-          <Radio
-            label="Periodicity Dependent"
-            helpText="Plotline values dynamically derived from the selected periodic dataset."
-            value="Dependent"
-          />
-        </RadioGroup>
-      )}
-
       <SelectInput
-        label="Value Type *"
-        placeholder="Select"
-        value={valueType}
-        isOpen={valueTypeOpen}
-        onOpenChange={setValueTypeOpen}
-        onClick={() => setValueTypeOpen((o) => !o)}
+        label="Axis"
+        placeholder="Select axis"
+        value={axisId ? (axes.find((a) => a._id === axisId)?.name ?? defaultAxisLabel) : defaultAxisLabel}
+        isOpen={axisDropdownOpen}
+        onOpenChange={setAxisDropdownOpen}
       >
         <DropdownMenu>
-          {(['Fixed', 'Dynamic'] as PlotLineValueType[]).map((opt) => (
+          <ActionListItem
+            title={defaultAxisLabel}
+            selectionType="Single"
+            isSelected={!axisId}
+            onClick={() => { setAxisId(''); setAxisDropdownOpen(false); }}
+          />
+          {axes.map((a) => (
             <ActionListItem
-              key={opt}
-              title={opt}
+              key={a._id}
+              title={a.name}
               selectionType="Single"
-              isSelected={valueType === opt}
-              onClick={() => {
-                setValueType(opt);
-                setValueTypeOpen(false);
-              }}
+              isSelected={axisId === a._id}
+              onClick={() => { setAxisId(a._id); setAxisDropdownOpen(false); }}
             />
           ))}
         </DropdownMenu>
       </SelectInput>
 
-      {type === 'Independent' && valueType === 'Fixed' && (
+      <div className="lc-config__date-row">
         <TextInput
-          label="Value"
+          label="Width"
           labelPosition="top"
           type="number"
-          necessityIndicator="required"
-          placeholder="Enter value"
-          value={fixedValue}
-          onChange={({ value }: { name: string; value: string }) => setFixedValue(value)}
+          min={0}
+          placeholder="e.g. 2"
+          value={lineWidth}
+          necessityIndicator={isDependent ? 'required' : undefined}
+          onChange={({ value: v }: { name: string; value: string }) => setLineWidth(v)}
         />
-      )}
-
-      {valueType === 'Dynamic' && (
-        <>
-          <UNSPathInput
-            label="UNS Path"
-            placeholder="Enter UNS Path"
-            value={dynamicTopic}
-            tree={unsTree}
-            isLoading={isLoadingTree}
-            onOpen={loadWorkspaces}
-            onChange={(v: string) => setDynamicTopic(resolveUNSValue(v))}
-          />
-          <div className="lc-config__date-row">
-            <TextInput
-              label="Data Precision *"
-              labelPosition="top"
-              placeholder="Enter value"
-              value={dataPrecision}
-              onChange={({ value }: { name: string; value: string }) =>
-                setDataPrecision(value)
-              }
-            />
-            <TextInput
-              label="Unit *"
-              labelPosition="top"
-              placeholder="Enter value"
-              value={unit}
-              onChange={({ value }: { name: string; value: string }) => setUnit(value)}
-            />
-          </div>
-        </>
-      )}
-
-      {type === 'Dependent' && valueType === 'Fixed' && (
-        <div className="lc-config__sub-block">
-          <p className="lc-config__sub-block-title LabelSmallRegular">
-            Periodicity Settings
-          </p>
-          {periodicities.length === 0 && (
-            <p className="lc-config__hint BodySmallRegular">
-              No periodicities added. Click "Add Periodicity" to add one.
-            </p>
-          )}
-          {periodicities.map((row, idx) => (
-            <div className="lc-config__periodicity-row" key={idx}>
-              <SelectInput
-                label="Periodicity"
-                placeholder="Select"
-                value={row.periodicity}
-                isOpen={openPeriodicityRow === idx}
-                onOpenChange={(o) => setOpenPeriodicityRow(o ? idx : null)}
-                onClick={() =>
-                  setOpenPeriodicityRow((cur) => (cur === idx ? null : idx))
-                }
-              >
-                <DropdownMenu>
-                  {PERIODICITY_OPTIONS.filter(
-                    // Hide periodicities already chosen in other rows; keep the
-                    // current row's own selection so it stays visible/selected.
-                    (p) =>
-                      p === row.periodicity ||
-                      !periodicities.some((r, i) => i !== idx && r.periodicity === p),
-                  ).map((p) => (
-                    <ActionListItem
-                      key={p}
-                      title={p}
-                      selectionType="Single"
-                      isSelected={row.periodicity === p}
-                      onClick={() => {
-                        updatePeriodicityRow(idx, { periodicity: p });
-                        setOpenPeriodicityRow(null);
-                      }}
-                    />
-                  ))}
-                </DropdownMenu>
-              </SelectInput>
-              <TextInput
-                label="Value"
-                labelPosition="top"
-                placeholder="0"
-                value={String(row.value ?? '')}
-                onChange={({ value }: { name: string; value: string }) => {
-                  const num = Number(value);
-                  updatePeriodicityRow(idx, {
-                    value: Number.isFinite(num) ? num : 0,
-                  });
-                }}
-              />
-              <IconButton
-                icon={<Trash2 size={14} />}
-                size="Small"
-                emphasis="Intense"
-                accessibilityLabel="Remove periodicity"
-                onClick={() => removePeriodicityRow(idx)}
-              />
-            </div>
-          ))}
-          <Button
-            variant="Gray"
-            color="Primary"
-            size="Small"
-            leadingIcon={<Plus size={14} />}
-            label="Add Periodicity"
-            isDisabled={periodicities.length >= PERIODICITY_OPTIONS.length}
-            onClick={addPeriodicityRow}
-          />
-        </div>
-      )}
-
-      {type === 'Independent' && valueType === 'Dynamic' && (
-      <div className="lc-config__flat-section">
-        <p className="lc-config__flat-section-title LabelSmallSemiBold">Duration Settings</p>
         <SelectInput
-          label="Duration Type *"
-          placeholder="Select"
-          value={durationType}
-          isOpen={durationTypeOpen}
-          onOpenChange={setDurationTypeOpen}
-          onClick={() => setDurationTypeOpen((o) => !o)}
+          label="Dash style"
+          placeholder="Solid"
+          value={lineStyle}
+          isOpen={styleDropdownOpen}
+          onOpenChange={setStyleDropdownOpen}
         >
           <DropdownMenu>
-            {DURATION_TYPE_OPTIONS.map((opt) => (
+            {LINE_STYLE_OPTIONS.map((opt) => (
               <ActionListItem
                 key={opt}
                 title={opt}
                 selectionType="Single"
-                isSelected={durationType === opt}
+                isSelected={lineStyle === opt}
                 onClick={() => {
-                  setDurationType(opt);
-                  setDurationTypeOpen(false);
+                  setLineStyle(opt);
+                  setStyleDropdownOpen(false);
                 }}
               />
             ))}
           </DropdownMenu>
         </SelectInput>
-        <div className="lc-config__duration-group__fields">
-          <DatePicker
-            mode="single"
-            label="Start Date *"
-            value={startDate}
-            onChange={(d) => setStartDate(d)}
-          />
-          <DatePicker
-            mode="single"
-            label="End Date *"
-            value={endDate}
-            onChange={(d) => setEndDate(d)}
-          />
-        </div>
       </div>
+
+      {!isRealtime && (
+        <RadioGroup
+          label="Periodicity"
+          name="plotline-periodicity"
+          size="Medium"
+          value={periodicityType}
+          onChange={({ value: v }) => {
+            setPeriodicityType(v as PlotLinePeriodicityType);
+            if (v === 'independent') {
+              setPeriodicities([]);
+              setCurrentPeriodicity('');
+              setPeriodicityDropdownOpen(false);
+            }
+          }}
+          orientation="Horizontal"
+        >
+          <Radio label="Independent" value="independent" />
+          <Radio label="Dependent" value="dependent" />
+        </RadioGroup>
       )}
 
-      <ProductAccordionItem
-        title="Style"
-        className="lc-config__plotline-style"
-        isExpanded={styleOpen}
-        isActive
-        onToggle={() => setStyleOpen((o) => !o)}
-      >
-        <div className="lc-config__editor-accordion-body">
-          <TextInput
-            label="Line Width"
-            labelPosition="top"
-            placeholder="1"
-            value={lineWidth}
-            onChange={({ value }: { name: string; value: string }) => setLineWidth(value)}
-          />
-          <SelectInput
-            label="Line Style"
-            placeholder="Select"
-            value={lineStyle}
-            isOpen={styleDropdownOpen}
-            onOpenChange={setStyleDropdownOpen}
-            onClick={() => setStyleDropdownOpen((o) => !o)}
-          >
-            <DropdownMenu>
-              {LINE_STYLE_OPTIONS.map((opt) => (
-                <ActionListItem
-                  key={opt}
-                  title={opt}
-                  selectionType="Single"
-                  isSelected={lineStyle === opt}
-                  onClick={() => {
-                    setLineStyle(opt);
-                    setStyleDropdownOpen(false);
-                  }}
+      {periodicityType === 'dependent' && !isRealtime && (
+        <>
+          <div className="lc-config__date-row lc-config__date-row--add-periodicity">
+            <SelectInput
+              label="Add periodicity"
+              placeholder="Select…"
+              value={currentPeriodicity ? currentPeriodicity.charAt(0).toUpperCase() + currentPeriodicity.slice(1) : ''}
+              isOpen={periodicityDropdownOpen}
+              onOpenChange={setPeriodicityDropdownOpen}
+            >
+              <DropdownMenu>
+                {PLOT_LINE_PERIODICITIES.filter((p) => !periodicities.includes(p)).map((p) => (
+                  <ActionListItem
+                    key={p}
+                    title={p.charAt(0).toUpperCase() + p.slice(1)}
+                    selectionType="Single"
+                    isSelected={currentPeriodicity === p}
+                    onClick={() => {
+                      setCurrentPeriodicity(p);
+                      setPeriodicityDropdownOpen(false);
+                    }}
+                  />
+                ))}
+              </DropdownMenu>
+            </SelectInput>
+            <Button
+              variant="Secondary"
+              label="Add"
+              size="Small"
+              isDisabled={!currentPeriodicity}
+              onClick={() => {
+                if (currentPeriodicity) {
+                  setPeriodicities((prev) => [...prev, currentPeriodicity]);
+                  setCurrentPeriodicity('');
+                }
+              }}
+            />
+          </div>
+          {periodicities.length > 0 && (
+            <div className="lc-config__periodicity-tags">
+              {periodicities.map((p) => (
+                <Tag
+                  key={p}
+                  label={p.charAt(0).toUpperCase() + p.slice(1)}
+                  onDismiss={() => setPeriodicities((prev) => prev.filter((x) => x !== p))}
                 />
               ))}
-            </DropdownMenu>
-          </SelectInput>
-        </div>
-      </ProductAccordionItem>
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 }
@@ -3696,6 +4073,7 @@ function PlotLineEditor({
 interface PlotBandEditorProps {
   initial: LineChartPlotBand | null;
   axes: LineChartAxis[];
+  defaultAxisLabel?: string;
   existingCount: number;
   onSubmit: (band: LineChartPlotBand) => void;
   onReady: (b: EditorBinding) => void;
@@ -3704,6 +4082,7 @@ interface PlotBandEditorProps {
 function PlotBandEditor({
   initial,
   axes,
+  defaultAxisLabel = 'Left',
   existingCount,
   onSubmit,
   onReady,
@@ -3732,7 +4111,7 @@ function PlotBandEditor({
     return m;
   }, [axes]);
 
-  const axisLabel = axisId ? axesById.get(axisId)?.name ?? 'Default' : 'Default';
+  const axisLabel = axisId ? axesById.get(axisId)?.name ?? defaultAxisLabel : defaultAxisLabel;
 
   const submit = useCallback(() => {
     if (!isValid) return;
@@ -3770,11 +4149,10 @@ function PlotBandEditor({
         value={axisLabel}
         isOpen={axisDropdownOpen}
         onOpenChange={setAxisDropdownOpen}
-        onClick={() => setAxisDropdownOpen((o) => !o)}
       >
         <DropdownMenu>
           <ActionListItem
-            title="Default"
+            title={defaultAxisLabel}
             selectionType="Single"
             isSelected={!axisId}
             onClick={() => {
@@ -3803,7 +4181,10 @@ function PlotBandEditor({
           placeholder="e.g. 10"
           value={startValue}
           necessityIndicator="required"
-          onChange={({ value }: { name: string; value: string }) => setStartValue(value)}
+          onChange={({ value: v }: { name: string; value: string }) => {
+            if (v !== '' && !/^-?\d*\.?\d*$/.test(v)) return;
+            setStartValue(v);
+          }}
         />
         <TextInput
           label="End Value"
@@ -3811,7 +4192,10 @@ function PlotBandEditor({
           placeholder="e.g. 20"
           value={endValue}
           necessityIndicator="required"
-          onChange={({ value }: { name: string; value: string }) => setEndValue(value)}
+          onChange={({ value: v }: { name: string; value: string }) => {
+            if (v !== '' && !/^-?\d*\.?\d*$/.test(v)) return;
+            setEndValue(v);
+          }}
         />
       </div>
     </div>
@@ -4034,7 +4418,6 @@ function SPCEditor({
         tags={dataSourceTags}
         isOpen={dataSourceDropdownOpen}
         onOpenChange={setDataSourceDropdownOpen}
-        onClick={() => setDataSourceDropdownOpen((o) => !o)}
         isDisabled={series.length === 0}
       >
         <DropdownMenu>
@@ -4076,7 +4459,6 @@ function SPCEditor({
         value={processTypeValue}
         isOpen={processTypeDropdownOpen}
         onOpenChange={setProcessTypeDropdownOpen}
-        onClick={() => setProcessTypeDropdownOpen((o) => !o)}
       >
         <DropdownMenu>
           {PROCESS_TYPE_OPTIONS.map((t) => (
@@ -4116,6 +4498,7 @@ function SPCEditor({
                   labelPosition="top"
                   necessityIndicator="required"
                   type="number"
+                  min={0}
                   placeholder="1"
                   value={avgLineWidth}
                   onChange={({ value }: { name: string; value: string }) =>
@@ -4154,6 +4537,7 @@ function SPCEditor({
                   labelPosition="top"
                   necessityIndicator="required"
                   type="number"
+                  min={0}
                   placeholder="1"
                   value={medLineWidth}
                   onChange={({ value }: { name: string; value: string }) =>
@@ -4191,8 +4575,8 @@ function SPCEditor({
                   {SIGMA_LEVEL_OPTIONS.map((lvl) => (
                     <label className="lc-config__sigma-item" key={lvl}>
                       <Checkbox
-                        isChecked={sigmaLevels.includes(lvl)}
-                        onClick={() => toggleSigmaLevel(lvl)}
+                        checked={sigmaLevels.includes(lvl)}
+                        onChange={() => toggleSigmaLevel(lvl)}
                       >
                         {SIGMA_LEVEL_LABELS[lvl]}
                       </Checkbox>
@@ -4204,6 +4588,7 @@ function SPCEditor({
                   labelPosition="top"
                   necessityIndicator="required"
                   type="number"
+                  min={0}
                   placeholder="1"
                   value={sdLineWidth}
                   onChange={({ value }: { name: string; value: string }) =>
@@ -4235,10 +4620,10 @@ interface AnomalyEditorProps {
   initial: LineChartAnomaly | null;
   series: LineChartSeries[];
   existingCount: number;
-  unsTree: import('@faclon-labs/design-sdk/UNSPathInput').UNSTree;
-  isLoadingTree: boolean;
-  loadWorkspaces: () => void;
-  resolveUNSValue: (raw: string) => string;
+  unsWorkspaces: UNSWorkspace[];
+  isLoadingWorkspaces: boolean;
+  loadUnsChildren: (wsId: string, parentId?: string) => Promise<UNSNode[]>;
+  searchUnsNodes: (wsId: string, query: string, limit?: number) => Promise<UNSNode[]>;
   onSubmit: (a: LineChartAnomaly) => void;
   onReady: (b: EditorBinding) => void;
 }
@@ -4247,10 +4632,10 @@ function AnomalyEditor({
   initial,
   series,
   existingCount,
-  unsTree,
-  isLoadingTree,
-  loadWorkspaces,
-  resolveUNSValue,
+  unsWorkspaces,
+  isLoadingWorkspaces,
+  loadUnsChildren,
+  searchUnsNodes,
   onSubmit,
   onReady,
 }: AnomalyEditorProps) {
@@ -4350,7 +4735,6 @@ function AnomalyEditor({
         value={applyToLabel}
         isOpen={applyToDropdownOpen}
         onOpenChange={setApplyToDropdownOpen}
-        onClick={() => setApplyToDropdownOpen((o) => !o)}
         isDisabled={series.length === 0}
       >
         <DropdownMenu>
@@ -4375,7 +4759,6 @@ function AnomalyEditor({
         value={operator}
         isOpen={operatorDropdownOpen}
         onOpenChange={setOperatorDropdownOpen}
-        onClick={() => setOperatorDropdownOpen((o) => !o)}
       >
         <DropdownMenu>
           {OPERATOR_OPTIONS.map((op) => (
@@ -4394,7 +4777,7 @@ function AnomalyEditor({
       </SelectInput>
 
       <RadioGroup
-        label="Label"
+        label="Source Type"
         name="anomaly-label-mode"
         size="Medium"
         value={labelMode}
@@ -4413,7 +4796,6 @@ function AnomalyEditor({
           value={existingLabel}
           isOpen={existingDropdownOpen}
           onOpenChange={setExistingDropdownOpen}
-          onClick={() => setExistingDropdownOpen((o) => !o)}
           isDisabled={series.length === 0}
         >
           <DropdownMenu>
@@ -4434,14 +4816,15 @@ function AnomalyEditor({
       )}
 
       {labelMode === 'NewSource' && (
-        <UNSPathInput
-          label="Topic"
+        <UNSTreePicker
+          label="UNS Path"
           placeholder="Type / to browse UNS or paste {{topic}} directly"
           value={newSourceTopic}
-          tree={unsTree}
-          isLoading={isLoadingTree}
-          onOpen={loadWorkspaces}
-          onChange={(v: string) => setNewSourceTopic(resolveUNSValue(v))}
+          workspaces={unsWorkspaces}
+          isLoadingWorkspaces={isLoadingWorkspaces}
+          loadChildren={loadUnsChildren}
+          searchNodes={searchUnsNodes}
+          onChange={(v: string) => setNewSourceTopic(v)}
         />
       )}
 
@@ -4452,7 +4835,10 @@ function AnomalyEditor({
           placeholder="e.g. 50"
           value={thresholdValue}
           necessityIndicator="required"
-          onChange={({ value }: { name: string; value: string }) => setThresholdValue(value)}
+          onChange={({ value: v }: { name: string; value: string }) => {
+            if (v !== '' && v !== '-' && v !== '.' && !/^-?\d*\.?\d*$/.test(v)) return;
+            setThresholdValue(v);
+          }}
         />
       )}
     </div>
@@ -4471,6 +4857,7 @@ const DATA_TABLE_OPERATOR_OPTIONS: DataTableOperator[] = [
   'median',
   'first',
   'last',
+  'std',
 ];
 const DATA_TABLE_OPERATOR_LABELS: Record<DataTableOperator, string> = {
   sum: 'Sum',
@@ -4480,16 +4867,17 @@ const DATA_TABLE_OPERATOR_LABELS: Record<DataTableOperator, string> = {
   median: 'Median',
   first: 'First',
   last: 'Last',
+  std: 'Std Dev',
 };
 
 interface DataTableColumnEditorProps {
   initial: DataTableColumn | null;
   series: LineChartSeries[];
   existingCount: number;
-  unsTree?: UNSTree;
-  isLoadingTree?: boolean;
-  loadWorkspaces: () => void;
-  resolveUNSValue: (v: string) => string;
+  unsWorkspaces: UNSWorkspace[];
+  isLoadingWorkspaces: boolean;
+  loadUnsChildren: (wsId: string, parentId?: string) => Promise<UNSNode[]>;
+  searchUnsNodes: (wsId: string, query: string, limit?: number) => Promise<UNSNode[]>;
   // Multi-select Existing mode can emit several columns at once.
   onSubmit: (cols: DataTableColumn[]) => void;
   onReady: (b: EditorBinding) => void;
@@ -4499,10 +4887,10 @@ function DataTableColumnEditor({
   initial,
   series,
   existingCount,
-  unsTree,
-  isLoadingTree,
-  loadWorkspaces,
-  resolveUNSValue,
+  unsWorkspaces,
+  isLoadingWorkspaces,
+  loadUnsChildren,
+  searchUnsNodes,
   onSubmit,
   onReady,
 }: DataTableColumnEditorProps) {
@@ -4644,28 +5032,29 @@ function DataTableColumnEditor({
             necessityIndicator="required"
             onChange={({ value }: { name: string; value: string }) => setName(value)}
           />
-          <UNSPathInput
+          <UNSTreePicker
             label="UNS Path *"
             placeholder="Enter UNS Path"
             value={topic}
-            tree={unsTree}
-            isLoading={isLoadingTree}
-            onOpen={loadWorkspaces}
-            onChange={(v: string) => setTopic(resolveUNSValue(v))}
+            workspaces={unsWorkspaces}
+            isLoadingWorkspaces={isLoadingWorkspaces}
+            loadChildren={loadUnsChildren}
+            searchNodes={searchUnsNodes}
+            onChange={(v: string) => setTopic(v)}
           />
 
           <div className="lc-config__date-row">
             <TextInput
               label="Data Precision"
               labelPosition="top"
-              placeholder="2"
+              placeholder="e.g. 2"
               value={dataPrecision}
               onChange={({ value }: { name: string; value: string }) => setDataPrecision(value)}
             />
             <TextInput
               label="Unit"
               labelPosition="top"
-              placeholder="Enter value"
+              placeholder="e.g. kWh"
               value={unit}
               onChange={({ value }: { name: string; value: string }) => setUnit(value)}
             />
@@ -4795,9 +5184,15 @@ function DeleteChartModal({
 // Styling Section (re-used as-is from prior dispatch)
 // ===========================================================================
 
+type StylingUpdater = (prev: LineChartStyling) => LineChartStyling;
+
 interface StylingSectionProps {
   value: LineChartStyling;
-  onChange: (next: LineChartStyling) => void;
+  onChange: (updater: StylingUpdater) => void;
+  /** True when the widget has more than one chart. The chart title then doubles
+   *  as the chart switcher, so "Hide → Chart Title" is disabled (can't hide the
+   *  only way to switch charts). */
+  isMultiChart?: boolean;
 }
 
 interface FontWeightSelectProps {
@@ -4811,10 +5206,10 @@ function FontWeightSelect({ label, value, onChange }: FontWeightSelectProps) {
   return (
     <SelectInput
       label={label}
+      placeholder="Select weight"
       value={value}
       isOpen={isOpen}
       onOpenChange={setIsOpen}
-      onClick={() => setIsOpen((o) => !o)}
     >
       <DropdownMenu>
         {FONT_WEIGHTS.map((w) => (
@@ -4834,17 +5229,20 @@ function FontWeightSelect({ label, value, onChange }: FontWeightSelectProps) {
   );
 }
 
-function StylingSection({ value, onChange }: StylingSectionProps) {
+function StylingSection({ value, onChange, isMultiChart }: StylingSectionProps) {
+  // Always reads from the latest state (prev), never from the render-closure `value`.
   function update<K extends keyof LineChartStyling>(
     key: K,
     patch: Partial<LineChartStyling[K]> | LineChartStyling[K],
   ) {
-    const prev = value[key];
-    const merged =
-      prev && typeof prev === 'object' && !Array.isArray(prev)
-        ? { ...(prev as object), ...(patch as object) }
-        : patch;
-    onChange({ ...value, [key]: merged } as LineChartStyling);
+    onChange(prev => {
+      const field = prev[key];
+      const merged =
+        field && typeof field === 'object' && !Array.isArray(field)
+          ? { ...(field as object), ...(patch as object) }
+          : patch;
+      return { ...prev, [key]: merged } as LineChartStyling;
+    });
   }
 
   return (
@@ -4876,9 +5274,11 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
         label="Border Width"
         labelPosition="top"
         type="number"
+        min={0}
+        placeholder="e.g. 1"
         value={String(value.card.borderWidth)}
         onChange={({ value: v }: { name: string; value: string }) =>
-          update('card', { borderWidth: v === '' ? 0 : Number(v) })
+          update('card', { borderWidth: Math.max(0, Number(v) || 0) })
         }
         suffix="px"
       />
@@ -4886,43 +5286,71 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
         label="Border Radius"
         labelPosition="top"
         type="number"
+        min={0}
+        placeholder="e.g. 8"
         value={String(value.card.borderRadius)}
         onChange={({ value: v }: { name: string; value: string }) =>
-          update('card', { borderRadius: v === '' ? 0 : Number(v) })
+          update('card', { borderRadius: Math.max(0, Number(v) || 0) })
         }
         suffix="px"
       />
 
       <div className="lc-config__style-tab__block">
         <Divider />
-        <p className="LabelMediumSemibold lc-config__style-tab__block-title">
+        <p className="BodySmallSemibold cc-config__style-section-heading">
           Hide Widget Element
         </p>
         <div className="lc-config__style-tab__checkbox-col">
           <Checkbox
             label="Setting Icon"
             size="Medium"
-            isChecked={value.hideElements.settingsIcon}
-            onClick={() =>
-              update('hideElements', { settingsIcon: !value.hideElements.settingsIcon })
+            checked={value.hideElements.settingsIcon}
+            onChange={() =>
+              onChange(prev => ({ ...prev, hideElements: { ...prev.hideElements, settingsIcon: !prev.hideElements.settingsIcon } }))
             }
           />
           <Checkbox
             label="Export Icon"
             size="Medium"
-            isChecked={value.hideElements.exportIcon}
-            onClick={() =>
-              update('hideElements', { exportIcon: !value.hideElements.exportIcon })
+            checked={value.hideElements.exportIcon}
+            onChange={() =>
+              onChange(prev => ({ ...prev, hideElements: { ...prev.hideElements, exportIcon: !prev.hideElements.exportIcon } }))
             }
           />
-          <Checkbox
-            label="Chart Title"
-            size="Medium"
-            isChecked={value.hideElements.chartTitle}
-            onClick={() =>
-              update('hideElements', { chartTitle: !value.hideElements.chartTitle })
-            }
-          />
+          {(() => {
+            const chartTitleCheckbox = (
+              <Checkbox
+                label="Chart Title"
+                size="Medium"
+                // With multiple charts the title IS the chart switcher — hiding it
+                // would remove the only way to switch charts, so the option is
+                // disabled and shown unchecked (title stays visible).
+                isDisabled={isMultiChart}
+                checked={isMultiChart ? false : value.hideElements.chartTitle}
+                onChange={() =>
+                  onChange(prev => ({ ...prev, hideElements: { ...prev.hideElements, chartTitle: !prev.hideElements.chartTitle } }))
+                }
+              />
+            );
+            // Only when disabled: explain WHY via a tooltip. Placement 'Right'
+            // points into the open area beside the config panel (the tooltip
+            // portals to <body> and auto-flips, so it's never clipped by the
+            // panel's overflow). The inline-block span gives a solid hover
+            // target even though the checkbox itself is disabled (a disabled
+            // control alone may not surface the tooltip on hover).
+            return isMultiChart ? (
+              <Tooltip
+                bodyText="Can't hide the chart title while more than one chart is added — the title row is the chart switcher used to move between charts."
+                placement="Right"
+              >
+                <span style={{ display: 'inline-block', width: 'fit-content' }}>
+                  {chartTitleCheckbox}
+                </span>
+              </Tooltip>
+            ) : (
+              chartTitleCheckbox
+            );
+          })()}
         </div>
       </div>
 
@@ -4933,7 +5361,7 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
         <Switch
           isChecked={value.advancedEnabled}
           onChange={({ isChecked }) =>
-            onChange({ ...value, advancedEnabled: isChecked })
+            onChange(prev => ({ ...prev, advancedEnabled: isChecked }))
           }
           accessibilityLabel="Advanced styling"
         />
@@ -4941,23 +5369,126 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
 
       {value.advancedEnabled && (
         <>
+          <div className="lc-config__style-tab__block lc-config__style-tab__block--full">
+            <Divider />
+            <p className="BodySmallSemibold cc-config__style-section-heading">
+              Chart Controls
+            </p>
+            <div className="lc-config__style-tab__switch-row">
+              <span className="LabelMediumRegular lc-config__style-tab__switch-label">
+                Legends
+              </span>
+              <Switch
+                isChecked={value.defaultChartDisplay?.legends ?? true}
+                onChange={({ isChecked }: { isChecked: boolean }) =>
+                  onChange(prev => ({ ...prev, defaultChartDisplay: { ...(prev.defaultChartDisplay ?? {}), legends: isChecked } }))
+                }
+                accessibilityLabel="Default legends visibility"
+              />
+            </div>
+            <div className="lc-config__style-tab__switch-row">
+              <span className="LabelMediumRegular lc-config__style-tab__switch-label">
+                Data Labels
+              </span>
+              <Switch
+                isChecked={value.defaultChartDisplay?.dataLabel ?? false}
+                onChange={({ isChecked }: { isChecked: boolean }) =>
+                  onChange(prev => ({ ...prev, defaultChartDisplay: { ...(prev.defaultChartDisplay ?? {}), dataLabel: isChecked } }))
+                }
+                accessibilityLabel="Default data labels visibility"
+              />
+            </div>
+            <div className="lc-config__style-tab__switch-row">
+              <span className="LabelMediumRegular lc-config__style-tab__switch-label">
+                Clipping
+              </span>
+              <Switch
+                isChecked={value.defaultChartDisplay?.clipping ?? false}
+                onChange={({ isChecked }: { isChecked: boolean }) =>
+                  onChange(prev => ({ ...prev, defaultChartDisplay: { ...(prev.defaultChartDisplay ?? {}), clipping: isChecked } }))
+                }
+                accessibilityLabel="Default clipping enabled"
+              />
+            </div>
+            <div className="lc-config__style-tab__switch-row">
+              <span className="LabelMediumRegular lc-config__style-tab__switch-label">
+                Zoom
+              </span>
+              <Switch
+                isChecked={value.defaultChartDisplay?.zoom ?? true}
+                onChange={({ isChecked }: { isChecked: boolean }) =>
+                  onChange(prev => ({ ...prev, defaultChartDisplay: { ...(prev.defaultChartDisplay ?? {}), zoom: isChecked } }))
+                }
+                accessibilityLabel="Default zoom enabled"
+              />
+            </div>
+            <div className="lc-config__style-tab__switch-row">
+              <span className="LabelMediumRegular lc-config__style-tab__switch-label">
+                Scroll
+              </span>
+              <Switch
+                isChecked={value.defaultChartDisplay?.scroll ?? false}
+                onChange={({ isChecked }: { isChecked: boolean }) =>
+                  onChange(prev => ({ ...prev, defaultChartDisplay: { ...(prev.defaultChartDisplay ?? {}), scroll: isChecked } }))
+                }
+                accessibilityLabel="Default horizontal scroll enabled"
+              />
+            </div>
+          </div>
+
+          <div className="lc-config__style-tab__block lc-config__style-tab__block--full">
+            <Divider />
+            <p className="BodySmallSemibold cc-config__style-section-heading">
+              Line Style
+            </p>
+            <div className="lc-config__style-tab__switch-row">
+              <span className="LabelMediumRegular lc-config__style-tab__switch-label">
+                Area Fill
+              </span>
+
+              <Switch
+                isChecked={value.enableAreaFill ?? false}
+                onChange={({ isChecked }: { isChecked: boolean }) =>
+                  onChange(prev => ({ ...prev, enableAreaFill: isChecked }))
+                }
+                accessibilityLabel="Enable area fill gradient below line"
+              />
+            </div>
+            <div className="lc-config__style-tab__switch-row">
+              <span className="LabelMediumRegular lc-config__style-tab__switch-label">
+                Show Data Points
+              </span>
+              <Switch
+                isChecked={value.showDataPoints ?? false}
+                onChange={({ isChecked }: { isChecked: boolean }) =>
+                  onChange(prev => ({ ...prev, showDataPoints: isChecked }))
+                }
+                accessibilityLabel="Show square markers at each data point"
+              />
+            </div>
+          </div>
+
+          {!value.hideElements.chartTitle && (
           <div className="lc-config__style-tab__block">
             <Divider />
-            <p className="LabelMediumSemibold lc-config__style-tab__block-title">
+            <p className="BodySmallSemibold cc-config__style-section-heading">
               Chart Title
             </p>
             <TextInput
               label="Title Font Size"
               labelPosition="top"
               type="number"
+              min={0}
+              placeholder="e.g. 18"
               value={String(value.chartTitle.fontSize)}
               onChange={({ value: v }: { name: string; value: string }) =>
-                update('chartTitle', { fontSize: v === '' ? 0 : Number(v) })
+                update('chartTitle', { fontSize: Math.max(0, Number(v) || 0) })
               }
               suffix="px"
             />
             <ColorInput
               label="Title Font Color"
+              placeholder="Select color"
               value={value.chartTitle.fontColor}
               onChange={(v) => update('chartTitle', { fontColor: v })}
             />
@@ -4967,24 +5498,28 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
               onChange={(v) => update('chartTitle', { fontWeight: v })}
             />
           </div>
+          )}
 
           <div className="lc-config__style-tab__block">
             <Divider />
-            <p className="LabelMediumSemibold lc-config__style-tab__block-title">
+            <p className="BodySmallSemibold cc-config__style-section-heading">
               X Axis
             </p>
             <ColorInput
               label="Axis Text Color"
+              placeholder="Select color"
               value={value.xAxisLabel.textColor ?? '#050505'}
               onChange={(v) => update('xAxisLabel', { textColor: v })}
             />
             <ColorInput
               label="Axis Data Points"
+              placeholder="Select color"
               value={value.xAxisLabel.dataPointColor ?? '#050505'}
               onChange={(v) => update('xAxisLabel', { dataPointColor: v })}
             />
             <ColorInput
               label="X Axis Line"
+              placeholder="Select color"
               value={value.xAxisLabel.lineColor ?? '#DEE1E3'}
               onChange={(v) => update('xAxisLabel', { lineColor: v })}
             />
@@ -4992,16 +5527,18 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
 
           <div className="lc-config__style-tab__block">
             <Divider />
-            <p className="LabelMediumSemibold lc-config__style-tab__block-title">
+            <p className="BodySmallSemibold cc-config__style-section-heading">
               Y Axis
             </p>
             <ColorInput
               label="Axis Text Color"
+              placeholder="Select color"
               value={value.yAxisLabel.textColor ?? '#050505'}
               onChange={(v) => update('yAxisLabel', { textColor: v })}
             />
             <ColorInput
               label="Axis Data Points"
+              placeholder="Select color"
               value={value.yAxisLabel.dataPointColor ?? '#050505'}
               onChange={(v) => update('yAxisLabel', { dataPointColor: v })}
             />
@@ -5009,16 +5546,18 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
 
           <div className="lc-config__style-tab__block">
             <Divider />
-            <p className="LabelMediumSemibold lc-config__style-tab__block-title">
+            <p className="BodySmallSemibold cc-config__style-section-heading">
               Data Table
             </p>
             <ColorInput
               label="Header Background Color"
+              placeholder="Select color"
               value={value.dataTable.headerBackgroundColor}
               onChange={(v) => update('dataTable', { headerBackgroundColor: v })}
             />
             <ColorInput
               label="Header Text Color"
+              placeholder="Select color"
               value={value.dataTable.headerTextColor}
               onChange={(v) => update('dataTable', { headerTextColor: v })}
             />
@@ -5026,9 +5565,11 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
               label="Header Text Size"
               labelPosition="top"
               type="number"
+              min={0}
+              placeholder="e.g. 14"
               value={String(value.dataTable.headerTextSize)}
               onChange={({ value: v }: { name: string; value: string }) =>
-                update('dataTable', { headerTextSize: v === '' ? 0 : Number(v) })
+                update('dataTable', { headerTextSize: Math.max(0, Number(v) || 0) })
               }
               suffix="px"
             />
@@ -5041,9 +5582,11 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
               label="Data Point Text Size"
               labelPosition="top"
               type="number"
+              min={0}
+              placeholder="e.g. 12"
               value={String(value.dataTable.dataPointTextSize)}
               onChange={({ value: v }: { name: string; value: string }) =>
-                update('dataTable', { dataPointTextSize: v === '' ? 0 : Number(v) })
+                update('dataTable', { dataPointTextSize: Math.max(0, Number(v) || 0) })
               }
               suffix="px"
             />
@@ -5054,6 +5597,7 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
             />
             <ColorInput
               label="Data Point Text Color"
+              placeholder="Select color"
               value={value.dataTable.dataPointTextColor}
               onChange={(v) => update('dataTable', { dataPointTextColor: v })}
             />
@@ -5061,16 +5605,18 @@ function StylingSection({ value, onChange }: StylingSectionProps) {
 
           <div className="lc-config__style-tab__block">
             <Divider />
-            <p className="LabelMediumSemibold lc-config__style-tab__block-title">
+            <p className="BodySmallSemibold cc-config__style-section-heading">
               Others
             </p>
             <ColorInput
               label="Grid Line Color"
+              placeholder="Select color"
               value={value.misc.gridLineColor}
               onChange={(v) => update('misc', { gridLineColor: v })}
             />
             <ColorInput
               label="Legend Text Color"
+              placeholder="Select color"
               value={value.misc.legendTextColor}
               onChange={(v) => update('misc', { legendTextColor: v })}
             />
