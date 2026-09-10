@@ -95,8 +95,10 @@ interface LineChartWidgetProps {
   // including GTP-driven refetches the widget itself never emitted (the GTP
   // broadcasts the new window, so `beginPendingFetch` never fires). Without
   // reading it, a GTP time change leaves the stale chart on screen with no
-  // loader. Drives the refetch overlay; mirrors CombinedBarLineChart.
-  loading?: boolean;
+  // loader. MUST be named `loader` (not `loading`) — that is the exact prop the
+  // host injects; ColumnChart uses this name and its loader works. OR-ed with
+  // the widget's own loading states so it never hides a loader we'd show anyway.
+  loader?: boolean;
   // Full TimeTabConfiguration UI state — Lens passes this as a separate
   // envelope-level prop so the widget can read defaultDisplayMode on mount.
   timeTabConfig?: import('../../iosense-sdk/types').TimeTabUIConfig;
@@ -601,7 +603,7 @@ export function LineChart({
   timeConfig,
   timeTabConfig,
   onEvent,
-  loading,
+  loader = false,
 }: LineChartWidgetProps) {
   const onEventRef = useRef(onEvent);
   onEventRef.current = onEvent;
@@ -1191,11 +1193,35 @@ export function LineChart({
   // spinner: a user time/periodicity change is in flight. Either way, cap the
   // spinner at LOADING_TIMEOUT_MS so a response that never reaches this widget
   // (binding/routing issue, or an in-place data mutation) falls back gracefully.
-  // `loading` is the host's flag — true while Lens re-resolves, INCLUDING
-  // GTP-driven refetches the widget never emitted (so `awaitingData` stays
-  // false). Fold it in so those still surface a loader.
-  const firstLoadPending = !everResolved && dataEmpty && (hasBoundSeries || !!loading);
-  const loaderActive = firstLoadPending || awaitingData || !!loading;
+  // Host-loader settle (mirrors ColumnChart): the host can drop `loader` to
+  // false a beat BEFORE the fresh `data` prop lands (flag and data travel on
+  // separate update paths). Keep the loader up ("settling") from when the host
+  // RAISED it until the `data` reference actually moves, so we never flash the
+  // stale chart between "loader off" and the new data. Computed synchronously in
+  // render so there's no painted frame in the gap.
+  const dataAtLoaderRaiseRef = useRef<DataEntry[] | null>(null);
+  const prevLoaderRef = useRef(false);
+  if (loader && !prevLoaderRef.current) dataAtLoaderRaiseRef.current = data;
+  prevLoaderRef.current = loader;
+  const loaderSettling =
+    !loader && dataAtLoaderRaiseRef.current !== null && data === dataAtLoaderRaiseRef.current;
+  const [, forceLoaderSettleRerender] = useState(0);
+  useEffect(() => {
+    if (!loaderSettling) return;
+    // Safety net: loader pulse that never changes the data — release after 5s.
+    const timer = setTimeout(() => {
+      dataAtLoaderRaiseRef.current = null;
+      forceLoaderSettleRerender((n) => n + 1);
+    }, 5000);
+    return () => clearTimeout(timer);
+  }, [loaderSettling]);
+
+  // `hostLoading` is the host's flag (+ its settle tail) — true while Lens
+  // re-resolves, INCLUDING GTP-driven refetches the widget never emitted (so
+  // `awaitingData` stays false). Fold it in so those still surface a loader.
+  const hostLoading = loader || loaderSettling;
+  const firstLoadPending = !everResolved && dataEmpty && (hasBoundSeries || hostLoading);
+  const loaderActive = firstLoadPending || awaitingData || hostLoading;
   const [loadingExpired, setLoadingExpired] = useState(false);
   useEffect(() => {
     if (!loaderActive) {
@@ -1209,10 +1235,10 @@ export function LineChart({
   // Two-tier loader (mirrors CombinedBarLineChart):
   //  • FIRST load — no data yet — replaces the empty canvas with a spinner.
   //  • REFETCH — data already on screen (time/periodicity/compare/shift change,
-  //    or a GTP-driven requery) — an overlay over the chart so the header +
-  //    controls stay visible instead of blanking the widget.
+  //    or a GTP-driven requery via `hostLoading`) — an overlay over the chart so
+  //    the header + controls stay visible instead of blanking the widget.
   const isLoadingData = firstLoadPending && !loadingExpired;
-  const isRefetching = (!!loading || awaitingData) && !dataEmpty && !loadingExpired;
+  const isRefetching = (hostLoading || awaitingData) && !dataEmpty && !loadingExpired;
 
   // "Add Source as Tooltip" — these series stay in the dataset (shared tooltip)
   // but render no line and no legend chip. Index-aligned with `series`.

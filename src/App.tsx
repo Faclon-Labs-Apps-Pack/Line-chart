@@ -52,6 +52,11 @@ export default function App() {
     }
   });
   const [resolvedData, setResolvedData] = useState<DataEntry[]>([]);
+  // Dev-harness stand-in for the host's `loader` flag: true while a resolve is
+  // in flight. Passed to the widget as `loader` so the loading overlay is
+  // exercisable on localhost (in prod, Lens drives this — including GTP-driven
+  // refetches the widget never emits).
+  const [resolving, setResolving] = useState(false);
   const [override, setOverride] = useState<{
     startTime: number;
     endTime: number;
@@ -73,6 +78,7 @@ export default function App() {
   const runResolve = useCallback(
     async (env: LineChartEnvelope, ovr: typeof override, tok: string) => {
       const seq = ++resolveSeqRef.current;
+      setResolving(true);
       try {
         const result = await resolve(env, {
           authentication: tok,
@@ -102,6 +108,10 @@ export default function App() {
         // Without a valid token the API 401s — keep the widget rendered with no
         // data rather than crashing the harness.
         console.warn('[dev-harness] resolve failed:', err);
+      } finally {
+        // Only the latest dispatch clears the flag, so a slow earlier resolve
+        // can't drop the loader while a newer one is still in flight.
+        if (seq === resolveSeqRef.current) setResolving(false);
       }
     },
     [],
@@ -187,6 +197,7 @@ export default function App() {
               timeTabConfig={envelope?.timeTabConfig}
               onEvent={handleWidgetEvent}
               authentication={token}
+              loader={resolving}
             />
           </div>
         </section>
